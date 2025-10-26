@@ -1,0 +1,21 @@
+app = "wireguard-shy-firefly-4959"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# WireGuard Service (UDP)
+[[services]]
+  internal_port = 51820
+  protocol = "udp"
+
+  [[services.ports]]
+    port = 51820
+
+# API Service (TCP)
+[[services]]
+  internal_port = 5000
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 5000

@@ -1,0 +1,46 @@
+# flyctl launch added from docker-wireguard/.gitignore
+# Windows image file caches
+docker-wireguard/**/Thumbs.db
+docker-wireguard/**/ehthumbs.db
+
+# Folder config file
+docker-wireguard/**/Desktop.ini
+
+# Recycle Bin used on file shares
+docker-wireguard/**/$RECYCLE.BIN
+
+# Windows Installer files
+docker-wireguard/**/*.cab
+docker-wireguard/**/*.msi
+docker-wireguard/**/*.msm
+docker-wireguard/**/*.msp
+
+# Windows shortcuts
+docker-wireguard/**/*.lnk
+
+# =========================
+# Operating System Files
+# =========================
+
+# OSX
+# =========================
+
+docker-wireguard/**/.DS_Store
+docker-wireguard/**/.AppleDouble
+docker-wireguard/**/.LSOverride
+
+# Thumbnails
+docker-wireguard/**/._*
+
+# Files that might appear on external disk
+docker-wireguard/**/.Spotlight-V100
+docker-wireguard/**/.Trashes
+
+# Directories potentially created on remote AFP share
+docker-wireguard/**/.AppleDB
+docker-wireguard/**/.AppleDesktop
+docker-wireguard/**/Network Trash Folder
+docker-wireguard/**/Temporary Items
+docker-wireguard/**/.apdisk
+docker-wireguard/**/.jenkins-external
+fly.toml
