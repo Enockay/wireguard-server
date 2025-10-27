@@ -27,11 +27,13 @@ RUN chmod +x /run.sh
 # Set working directory for API
 WORKDIR /app
 
-# Copy the API script
+# Copy the API script and database files
 COPY wireguard-api.js /app/
+COPY db.js /app/
+COPY models /app/models/
 
-# Install API dependencies
-RUN npm init -y && npm install express body-parser child_process cors
+# Install API dependencies including mongoose for MongoDB
+RUN npm init -y && npm install express body-parser child_process cors mongoose
 
 # Expose ports (UDP for WireGuard, TCP for API)
 EXPOSE 51820/udp

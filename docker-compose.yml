@@ -15,4 +15,28 @@ services:
       - "5000:5000/tcp"
     env_file:
       - .env
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/wireguard
+    depends_on:
+      - mongo
+    networks:
+      - wireguard-net
+
+  mongo:
+    image: mongo:latest
+    container_name: wireguard-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - wireguard-net
+
+networks:
+  wireguard-net:
+    driver: bridge
+
+volumes:
+  mongo_data:
 

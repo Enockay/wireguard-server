@@ -2,6 +2,8 @@
 
 This project runs a WireGuard VPN server with a REST API for managing peers dynamically.
 
+**🆕 Now with MongoDB!** Professional database integration with persistent client storage, enable/disable functionality, and automatic recovery on restart. See [MONGODB_USAGE.md](MONGODB_USAGE.md) for details.
+
 ## Prerequisites
 
 - Docker installed on your system
@@ -101,20 +103,35 @@ The management API runs on port `5000` and provides endpoints to manage WireGuar
 
 ### Generate New Client (Easy Method)
 
-Generate a complete WireGuard client configuration automatically:
+Generate a complete WireGuard client configuration with a custom name:
 
 ```bash
-curl -X POST http://YOUR_SERVER:5000/generate-client
+# With a name (required)
+curl -X POST http://YOUR_SERVER:5000/generate-client \
+  -H "Content-Type: application/json" \
+  -d '{"name": "john-laptop"}'
 ```
 
-This returns a complete configuration file that users can save and import into their WireGuard app. See `API_USAGE.md` for detailed documentation.
+This returns a complete configuration file that users can save and import into their WireGuard app. 
+
+**Client data is stored in MongoDB and persists across restarts!**
 
 ### Available Endpoints
 
-- `POST /generate-client` - Auto-generate complete client config (like `fly wireguard create`)
-- `POST /add-peer` - Manually add a peer with your own keys
-- `GET /list-peers` - View all connected peers
+**Client Management:**
+- `POST /generate-client` - Generate new client (requires name)
+- `GET /clients` - List all saved clients
+- `GET /clients/:name` - Download client config by name
+- `PATCH /clients/:name` - Update client (enable/disable, notes)
+- `DELETE /clients/:name` - Delete client
+
+**Utilities:**
+- `POST /reload` - Reload all clients from database
+- `POST /add-peer` - Manually add a peer
+- `GET /list-peers` - View active connections
 - `GET /` - Health check and endpoint list
+
+See [MONGODB_USAGE.md](MONGODB_USAGE.md) and [API_USAGE.md](API_USAGE.md) for detailed documentation.
 
 ## Check Status
 
