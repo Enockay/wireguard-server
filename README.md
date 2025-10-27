@@ -97,18 +97,24 @@ docker-compose up -d
 
 ## API Usage
 
-The management API runs on port `5000` and allows you to add peers dynamically without restarting the server.
+The management API runs on port `5000` and provides endpoints to manage WireGuard clients.
 
-### Add a Peer
+### Generate New Client (Easy Method)
+
+Generate a complete WireGuard client configuration automatically:
 
 ```bash
-curl -X POST http://localhost:5000/add-peer \
-  -H "Content-Type: application/json" \
-  -d '{
-    "publicKey": "PEER_PUBLIC_KEY",
-    "allowedIPs": "10.0.0.6/32"
-  }'
+curl -X POST http://YOUR_SERVER:5000/generate-client
 ```
+
+This returns a complete configuration file that users can save and import into their WireGuard app. See `API_USAGE.md` for detailed documentation.
+
+### Available Endpoints
+
+- `POST /generate-client` - Auto-generate complete client config (like `fly wireguard create`)
+- `POST /add-peer` - Manually add a peer with your own keys
+- `GET /list-peers` - View all connected peers
+- `GET /` - Health check and endpoint list
 
 ## Check Status
 
