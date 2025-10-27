@@ -1,0 +1,18 @@
+# Coolify-specific configuration
+services:
+  wireguard:
+    image: your-registry/wireguard-vpn
+    container_name: wireguard
+    network_mode: host  # Use host network for better WireGuard compatibility
+    privileged: true  # Required for WireGuard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.forwarding=1
+      - net.ipv6.conf.all.forwarding=1
+    environment:
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+    restart: unless-stopped
+

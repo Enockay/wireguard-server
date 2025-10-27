@@ -30,16 +30,18 @@ echo "WireGuard private key has been set from environment variable"
 
 # Start WireGuard interface
 echo "Starting WireGuard interface..."
-if wg-quick up wg0; then
-    echo "WireGuard interface started successfully"
+if wg-quick up wg0 2>&1; then
+    echo "✅ WireGuard interface started successfully"
 else
-    echo "Error: Failed to start WireGuard interface"
+    echo "⚠️  WARNING: Failed to start WireGuard interface"
     echo "This may require:"
     echo "  1. Running container with --privileged flag"
     echo "  2. Or wireguard kernel module loaded on host (modprobe wireguard)"
     echo "  3. Or network mode capabilities"
-    echo "Exiting..."
-    exit 1
+    echo ""
+    echo "💡 Starting API anyway - you can add peers later when WireGuard is properly configured"
+    echo ""
+    # Don't exit - start the API anyway
 fi
 
 # Start the Express API in the background
@@ -47,19 +49,22 @@ echo "Starting WireGuard API..."
 node /app/wireguard-api.js &
 
 # Keep container running and monitor WireGuard status
+echo "Container is now running. API available on port 5000"
+echo "WireGuard status will be checked periodically"
+
 while true; do
+    sleep 60
     if wg show wg0 &>/dev/null; then
         if ! wg show wg0 | grep -q "peer"; then
-            echo "Warning: WireGuard interface is up but no peers connected"
+            echo "⚠️  WireGuard interface is up but no peers connected"
         fi
     else
-        echo "Error: WireGuard interface is down!"
-        wg-quick down wg0 || true
-        if wg-quick up wg0; then
-            echo "WireGuard interface restarted successfully"
+        echo "⚠️  WireGuard interface is down - attempting restart..."
+        wg-quick down wg0 2>/dev/null || true
+        if wg-quick up wg0 2>/dev/null; then
+            echo "✅ WireGuard interface restarted successfully"
         else
-            echo "Failed to restart WireGuard interface"
+            echo "❌ Failed to restart WireGuard interface - will retry later"
         fi
     fi
-    sleep 60
 done
