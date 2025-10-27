@@ -37,6 +37,9 @@ docker run -d \
   --name wireguard \
   --cap-add=NET_ADMIN \
   --cap-add=SYS_MODULE \
+  --sysctl net.ipv4.ip_forward=1 \
+  --sysctl net.ipv4.conf.all.forwarding=1 \
+  --sysctl net.ipv6.conf.all.forwarding=1 \
   -p 51820:51820/udp \
   -p 5000:5000/tcp \
   --env-file .env \
@@ -61,6 +64,7 @@ services:
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.forwarding=1
+      - net.ipv6.conf.all.forwarding=1
     ports:
       - "51820:51820/udp"
       - "5000:5000/tcp"

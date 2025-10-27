@@ -9,16 +9,22 @@ if [ -z "$WIREGUARD_PRIVATE_KEY" ]; then
 fi
 
 # Apply sysctl settings for IP forwarding
-cat << EOF > /etc/sysctl.d/forward.conf
+# Note: These may fail in non-privileged containers - that's ok, Docker handles IP forwarding
+echo "Attempting to configure IP forwarding..."
+if cat << EOF > /etc/sysctl.d/forward.conf
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-
-sysctl -p /etc/sysctl.d/forward.conf
+then
+    sysctl -p /etc/sysctl.d/forward.conf 2>/dev/null || echo "IP forwarding will be handled by Docker"
+else
+    echo "Warning: Could not write to /etc/sysctl.d/forward.conf"
+fi
 
 # Replace placeholder in the template with the secret from environment variable
-sed -i "s/{{WIREGUARD_PRIVATE_KEY}}/$WIREGUARD_PRIVATE_KEY/" /etc/wireguard/wg0.conf
+# Use @ as delimiter to avoid conflicts with / or special characters in the key
+sed -i "s@{{WIREGUARD_PRIVATE_KEY}}@$WIREGUARD_PRIVATE_KEY@" /etc/wireguard/wg0.conf
 
 echo "WireGuard private key has been set from environment variable"
 
