@@ -33,6 +33,21 @@ wg genkey > private.key
 docker build -t wireguard-vpn .
 
 # Run the container (loads environment from .env file)
+# Option 1: With --privileged flag (Recommended for VPS)
+docker run -d \
+  --name wireguard \
+  --privileged \
+  --sysctl net.ipv4.ip_forward=1 \
+  --sysctl net.ipv4.conf.all.forwarding=1 \
+  --sysctl net.ipv6.conf.all.forwarding=1 \
+  -p 51820:51820/udp \
+  -p 5000:5000/tcp \
+  --env-file .env \
+  wireguard-vpn
+
+# Option 2: Without --privileged (requires WireGuard kernel module on host)
+# First on your VPS, run: sudo modprobe wireguard
+# Then:
 docker run -d \
   --name wireguard \
   --cap-add=NET_ADMIN \
@@ -58,9 +73,7 @@ services:
     build: .
     container_name: wireguard
     restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
+    privileged: true  # Required for WireGuard on most VPS systems
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.forwarding=1

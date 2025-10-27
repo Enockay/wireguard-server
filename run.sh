@@ -29,17 +29,37 @@ sed -i "s@{{WIREGUARD_PRIVATE_KEY}}@$WIREGUARD_PRIVATE_KEY@" /etc/wireguard/wg0.
 echo "WireGuard private key has been set from environment variable"
 
 # Start WireGuard interface
-wg-quick up wg0
+echo "Starting WireGuard interface..."
+if wg-quick up wg0; then
+    echo "WireGuard interface started successfully"
+else
+    echo "Error: Failed to start WireGuard interface"
+    echo "This may require:"
+    echo "  1. Running container with --privileged flag"
+    echo "  2. Or wireguard kernel module loaded on host (modprobe wireguard)"
+    echo "  3. Or network mode capabilities"
+    echo "Exiting..."
+    exit 1
+fi
 
 # Start the Express API in the background
+echo "Starting WireGuard API..."
 node /app/wireguard-api.js &
 
-# Monitor and ensure WireGuard stays active
+# Keep container running and monitor WireGuard status
 while true; do
-    if ! wg show | grep -q "peer"; then
-        echo "WireGuard interface down. Restarting..."
-        wg-quick down wg0
-        wg-quick up wg0
+    if wg show wg0 &>/dev/null; then
+        if ! wg show wg0 | grep -q "peer"; then
+            echo "Warning: WireGuard interface is up but no peers connected"
+        fi
+    else
+        echo "Error: WireGuard interface is down!"
+        wg-quick down wg0 || true
+        if wg-quick up wg0; then
+            echo "WireGuard interface restarted successfully"
+        else
+            echo "Failed to restart WireGuard interface"
+        fi
     fi
     sleep 60
 done
