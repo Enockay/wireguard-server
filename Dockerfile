@@ -1,10 +1,15 @@
 # Use Alpine as the base image
 FROM alpine:latest
 
+# IMPORTANT: This container MUST be run with --privileged flag for WireGuard to work
+# Example: docker run --privileged --env-file .env wireguard-vpn
+# Or use docker-compose.yml which has privileged: true configured
+
 # Update package list and install necessary tools, including WireGuard, iptables, and Node.js
 RUN apk update && \
     apk add --no-cache \
         wireguard-tools \
+        wireguard-linux-compat \
         iproute2 \
         bash \
         curl \
@@ -35,3 +40,9 @@ EXPOSE 5000/tcp
 
 # Set entrypoint to run.sh
 ENTRYPOINT ["/run.sh"]
+
+# Required runtime capabilities for this container:
+# --privileged: Required for WireGuard to create network interfaces
+# --env-file .env: To load WIREGUARD_PRIVATE_KEY
+# -p 51820:51820/udp: WireGuard port
+# -p 5000:5000/tcp: API port

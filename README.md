@@ -26,32 +26,37 @@ wg genkey > private.key
 
 ### 2. Build and Run with Docker
 
-**Option A: Using --env-file** (Recommended)
+**EASIEST: Run the helper script** (Auto-configures everything)
+
+On **Windows**:
+```bash
+docker-run.bat
+```
+
+On **Linux/Mac**:
+```bash
+chmod +x docker-run.sh
+./docker-run.sh
+```
+
+This script will automatically:
+- Build the image if needed
+- Stop any existing container
+- Start with correct privileged mode and all sysctl settings
+- Show you the logs
+
+---
+
+**Option A: Manual Docker Run** (Recommended for VPS)
 
 ```bash
 # Build the Docker image
 docker build -t wireguard-vpn .
 
-# Run the container (loads environment from .env file)
-# Option 1: With --privileged flag (Recommended for VPS)
+# Run the container with --privileged flag (Required!)
 docker run -d \
   --name wireguard \
   --privileged \
-  --sysctl net.ipv4.ip_forward=1 \
-  --sysctl net.ipv4.conf.all.forwarding=1 \
-  --sysctl net.ipv6.conf.all.forwarding=1 \
-  -p 51820:51820/udp \
-  -p 5000:5000/tcp \
-  --env-file .env \
-  wireguard-vpn
-
-# Option 2: Without --privileged (requires WireGuard kernel module on host)
-# First on your VPS, run: sudo modprobe wireguard
-# Then:
-docker run -d \
-  --name wireguard \
-  --cap-add=NET_ADMIN \
-  --cap-add=SYS_MODULE \
   --sysctl net.ipv4.ip_forward=1 \
   --sysctl net.ipv4.conf.all.forwarding=1 \
   --sysctl net.ipv6.conf.all.forwarding=1 \
