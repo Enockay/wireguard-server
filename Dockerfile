@@ -9,7 +9,6 @@ FROM alpine:latest
 RUN apk update && \
     apk add --no-cache \
         wireguard-tools \
-        wireguard-linux-compat \
         iproute2 \
         bash \
         curl \
