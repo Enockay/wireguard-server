@@ -114,22 +114,17 @@ Address = ${allowedIPs}
 [Peer]
 PublicKey = ${serverPublicKey}
 Endpoint = ${serverEndpoint}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = ${KEEPALIVE_TIME}`;
         
         console.log(`✅ Client configuration generated successfully`);
         
-        res.json({ 
-            success: true,
-            message: "Client generated successfully",
-            config: clientConfig,
-            peerDetails: {
-                publicKey: publicKey,
-                allowedIPs: allowedIPs,
-                serverPublicKey: serverPublicKey,
-                serverEndpoint: serverEndpoint
-            }
-        });
+        // Set content type for WireGuard config file
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('Content-Disposition', 'attachment; filename="wg0-client.conf"');
+        
+        // Send the config file directly
+        res.send(clientConfig);
         
     } catch (error) {
         console.error("❌ Error generating client:", error);
