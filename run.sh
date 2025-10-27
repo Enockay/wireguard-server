@@ -2,6 +2,12 @@
 
 set -ex
 
+# Check if WIREGUARD_PRIVATE_KEY is set
+if [ -z "$WIREGUARD_PRIVATE_KEY" ]; then
+    echo "Error: WIREGUARD_PRIVATE_KEY environment variable is not set"
+    exit 1
+fi
+
 # Apply sysctl settings for IP forwarding
 cat << EOF > /etc/sysctl.d/forward.conf
 net.ipv4.ip_forward = 1
@@ -11,8 +17,10 @@ EOF
 
 sysctl -p /etc/sysctl.d/forward.conf
 
-# Replace placeholder in the template with the secret
+# Replace placeholder in the template with the secret from environment variable
 sed -i "s/{{WIREGUARD_PRIVATE_KEY}}/$WIREGUARD_PRIVATE_KEY/" /etc/wireguard/wg0.conf
+
+echo "WireGuard private key has been set from environment variable"
 
 # Start WireGuard interface
 wg-quick up wg0
