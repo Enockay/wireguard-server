@@ -1,8 +1,6 @@
-# WireGuard VPN Server with Management API
+# WireGuard VPN Server + Management API (Single-File Docs)
 
-This project runs a WireGuard VPN server with a REST API for managing peers dynamically.
-
-**🆕 Now with MongoDB!** Professional database integration with persistent client storage, enable/disable functionality, and automatic recovery on restart. See [MONGODB_USAGE.md](MONGODB_USAGE.md) for details.
+Self-hosted WireGuard server with a REST API, MongoDB persistence, and MikroTik auto-provisioning.
 
 ## Prerequisites
 
@@ -97,41 +95,30 @@ Then run:
 docker-compose up -d
 ```
 
-## API Usage
+## API (Essential Endpoints)
 
-The management API runs on port `5000` and provides endpoints to manage WireGuard clients.
-
-### Generate New Client (Easy Method)
-
-Generate a complete WireGuard client configuration with a custom name:
-
+- Generate and store client config:
 ```bash
-# With a name (required)
-curl -X POST http://YOUR_SERVER:5000/generate-client \
+curl -sS -X POST http://YOUR_SERVER:5000/generate-client \
   -H "Content-Type: application/json" \
-  -d '{"name": "john-laptop"}'
+  -d '{"name":"device-1","notes":"purpose"}' \
+  -o device-1.conf
 ```
 
-This returns a complete configuration file that users can save and import into their WireGuard app. 
+- Download existing client config:
+```bash
+curl -sS http://YOUR_SERVER:5000/clients/device-1 -o device-1.conf
+```
 
-**Client data is stored in MongoDB and persists across restarts!**
+- List peers:
+```bash
+curl -sS http://YOUR_SERVER:5000/list-peers
+```
 
-### Available Endpoints
-
-**Client Management:**
-- `POST /generate-client` - Generate new client (requires name)
-- `GET /clients` - List all saved clients
-- `GET /clients/:name` - Download client config by name
-- `PATCH /clients/:name` - Update client (enable/disable, notes)
-- `DELETE /clients/:name` - Delete client
-
-**Utilities:**
-- `POST /reload` - Reload all clients from database
-- `POST /add-peer` - Manually add a peer
-- `GET /list-peers` - View active connections
-- `GET /` - Health check and endpoint list
-
-See [MONGODB_USAGE.md](MONGODB_USAGE.md) and [API_USAGE.md](API_USAGE.md) for detailed documentation.
+- MikroTik short script:
+```bash
+curl -sS "http://YOUR_SERVER:5000/mt/device-1" -o mt.rsc
+```
 
 ## Check Status
 
@@ -180,4 +167,9 @@ wg show
 ```bash
 docker logs wireguard
 ```
+
+### VPS/Coolify Notes
+- If running on a VPS or via Coolify, ensure the container is privileged or the host has the WireGuard module loaded.
+- Typical run flags: `--privileged` and `--sysctl net.ipv4.ip_forward=1`.
+- Coolify: expose ports 51820/udp and 5000/tcp, and add the privileged/cap capabilities in settings.
 

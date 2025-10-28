@@ -43,6 +43,14 @@ const clientSchema = new mongoose.Schema({
     notes: {
         type: String,
         trim: true
+    },
+    interfaceName: {
+        type: String,
+        trim: true
+    },
+    endpoint: {
+        type: String,
+        trim: true
     }
 }, {
     timestamps: true, // Adds createdAt and updatedAt

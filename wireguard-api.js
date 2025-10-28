@@ -344,6 +344,75 @@ app.post("/generate-mikrotik", async (req, res) => {
     }
 });
 
+// Ensure a client exists (create if missing) and return its record
+async function ensureClientRecord({ name, notes, interfaceName }) {
+    const clientName = name.toLowerCase().trim();
+    let client = await Client.findOne({ name: clientName });
+    if (client) {
+        // Backfill optional fields
+        const updates = {};
+        if (interfaceName && client.interfaceName !== interfaceName) updates.interfaceName = interfaceName;
+        if (notes && client.notes !== notes) updates.notes = notes;
+        if (Object.keys(updates).length) {
+            client = await Client.findOneAndUpdate({ _id: client._id }, updates, { new: true });
+        }
+        return client;
+    }
+
+    const { privateKey, publicKey } = await generateKeys();
+    const allocatedIpWithCidr = await getNextAvailableIP();
+    const record = new Client({
+        name: clientName,
+        ip: allocatedIpWithCidr,
+        publicKey,
+        privateKey,
+        enabled: true,
+        notes: notes || '',
+        interfaceName: interfaceName || `wireguard-${clientName}`,
+        endpoint: getServerEndpoint()
+    });
+    await record.save();
+    try {
+        await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIpWithCidr} persistent-keepalive ${KEEPALIVE_TIME}`);
+    } catch (e) {
+        console.warn("⚠️  wg set failed (ensureClientRecord):", e?.message || e);
+    }
+    return record;
+}
+
+// Compact MikroTik script via short URL: GET /mt/:name
+// - Finds or creates client, then returns a minified RouterOS script
+// - Script auto-picks an available listen-port starting at 51810
+app.get("/mt/:name", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const { notes, iface, subnet } = req.query;
+
+        if (!name) {
+            return res.status(400).json({ success: false, error: "Missing name" });
+        }
+
+        const client = await ensureClientRecord({ name, notes, interfaceName: iface });
+        const serverPublicKey = (await getServerPublicKey()).trim();
+        const serverEndpoint = client.endpoint || getServerEndpoint();
+
+        const ifaceName = (client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+        const allowed = (subnet || "10.0.0.0/24").toString();
+        const addr = client.ip; // /32
+        const pKey = client.privateKey;
+
+        // Minified RouterOS script (no comments)
+        const s = `:local IFACE "${ifaceName}";:local PRIV "${pKey}";:local IP "${addr}";:local SPK "${serverPublicKey}";:local END "${serverEndpoint}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local C [:find $END ":"];:local HOST [:pick $END 0 $C];:local PORT [:pick $END ($C+1) [:len $END]];:local PID [/interface wireguard peers print as-value where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25} else={/interface wireguard peers set [find where interface=$IFACE public-key=$SPK] endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25};:if ([/ip route print count-only where dst-address=$ALLOW and gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3 timeout=1s;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${name} $IFACE $IP $LP"} else={:put "FAIL ${name}"}`;
+
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('Cache-Control', 'no-store');
+        return res.send(s);
+    } catch (error) {
+        console.error("❌ /mt/:name error", error);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Get all connected peers
 app.get("/list-peers", async (req, res) => {
     try {
