@@ -1,18 +1,26 @@
 # Coolify-specific configuration
+# Note: Coolify may not read this file automatically
+# Configure these settings in Coolify UI under your application settings
+
 services:
   wireguard:
     image: your-registry/wireguard-vpn
     container_name: wireguard
-    network_mode: host  # Use host network for better WireGuard compatibility
-    privileged: true  # Required for WireGuard
+    # network_mode: host  # Uncomment if host network mode is available in Coolify
+    privileged: true  # REQUIRED: Enable in Coolify UI → Settings → Advanced → Privileged Mode
     cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
+      - NET_ADMIN      # REQUIRED: Add in Coolify UI → Settings → Advanced → Capabilities
+      - SYS_MODULE     # REQUIRED: Add in Coolify UI → Settings → Advanced → Capabilities
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.forwarding=1
       - net.ipv6.conf.all.forwarding=1
+    ports:
+      - "51820:51820/udp"  # WireGuard port
+      - "5000:5000/tcp"    # API port
     environment:
       - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - MONGO_URI=${MONGO_URI}
+      - SERVER_ENDPOINT=${SERVER_ENDPOINT}
     restart: unless-stopped
 
