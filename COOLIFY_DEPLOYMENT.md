@@ -91,6 +91,43 @@ If you still see "Operation not permitted" errors, the privileged mode or capabi
 2. Check `MONGO_URI` environment variable format
 3. If using Coolify's MongoDB service, use the internal service name
 
+### Error: "Bind for 0.0.0.0:51820 failed: port is already allocated"
+
+**Solution:** This error occurs when port 51820 is already in use by another container or process. To fix:
+
+1. **SSH into your Coolify server** and run:
+   ```bash
+   # Find containers using port 51820
+   docker ps --filter "publish=51820"
+   
+   # Or check all containers
+   docker ps -a
+   ```
+
+2. **Stop and remove orphan containers:**
+   ```bash
+   # Stop any containers using the port
+   docker stop $(docker ps -q --filter "publish=51820")
+   
+   # Remove orphan containers (Coolify may create these)
+   docker container prune -f
+   
+   # Or remove specific orphan containers mentioned in logs
+   docker rm -f <container-id-from-logs>
+   ```
+
+3. **If using Coolify's web interface:**
+   - Go to your application in Coolify
+   - Check for any stopped/old containers
+   - Manually stop and remove them
+   - Try deploying again
+
+4. **Alternative: Use a different port temporarily:**
+   - In Coolify UI → Settings → Ports
+   - Change 51820 to a different port (e.g., 51821)
+   - Update `SERVER_ENDPOINT` environment variable accordingly
+   - Update firewall rules if needed
+
 ## Quick Checklist
 
 - [ ] Privileged mode enabled
