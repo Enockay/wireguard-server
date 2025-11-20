@@ -6,6 +6,18 @@ const db = require("./db");
 const Client = require("./models/Client");
 
 const app = express();
+
+// Enable CORS for all routes
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
+
 app.use(bodyParser.json());
 
 const KEEPALIVE_TIME = 25; // Keepalive interval (in seconds)
@@ -354,7 +366,7 @@ app.post("/generate-mikrotik", async (req, res) => {
 `:delay 2;\r\n` +
 `:local success 0;\r\n` +
 `:do {\r\n` +
-`  /ping $SERVER_WG_IP count=3 timeout=2s;\r\n` +
+`  /ping $SERVER_WG_IP count=3;\r\n` +
 `  :set success 1;\r\n` +
 `} on-error={ :set success 0; };\r\n` +
 `# 8) Report\r\n` +
@@ -434,7 +446,7 @@ app.get("/mt/:name", async (req, res) => {
         const serverEndpointParts = serverEndpoint.split(':');
         const serverHost = serverEndpointParts[0];
         const serverPort = serverEndpointParts[1] || '51820';
-        const s = `:local IFACE "${ifaceName}";:local PRIV "${pKey}";:local IP "${addr}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3 timeout=2s;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${name} $IFACE $IP $LP"} else={:put "FAIL ${name}"}`;
+        const s = `:local IFACE "${ifaceName}";:local PRIV "${pKey}";:local IP "${addr}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${name} $IFACE $IP $LP"} else={:put "FAIL ${name}"}`;
 
         res.setHeader('Content-Type', 'text/plain');
         res.setHeader('Cache-Control', 'no-store');
@@ -487,7 +499,74 @@ app.post("/add-peer", async (req, res) => {
 
 // ==================== Client Management Endpoints ====================
 
-// Get all clients from database
+// Get all clients from database with filtering, pagination, and search
+app.get("/api/clients", async (req, res) => {
+    try {
+        if (!dbInitialized) {
+            return res.status(503).json({
+                success: false,
+                error: "Database not initialized"
+            });
+        }
+        
+        const { 
+            page = 1, 
+            limit = 50, 
+            enabled, 
+            search,
+            sortBy = 'createdAt',
+            sortOrder = 'desc'
+        } = req.query;
+        
+        // Build query
+        const query = {};
+        if (enabled !== undefined) {
+            query.enabled = enabled === 'true';
+        }
+        if (search) {
+            query.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { notes: { $regex: search, $options: 'i' } },
+                { ip: { $regex: search, $options: 'i' } }
+            ];
+        }
+        
+        // Calculate pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const sort = { [sortBy]: sortOrder === 'asc' ? 1 : -1 };
+        
+        // Get clients and total count
+        const [clients, total] = await Promise.all([
+            Client.find(query)
+                .sort(sort)
+                .skip(skip)
+                .limit(parseInt(limit)),
+            Client.countDocuments(query)
+        ]);
+        
+        const safeClients = clients.map(c => c.toSafeJSON());
+        
+        res.json({
+            success: true,
+            clients: safeClients,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / parseInt(limit))
+            }
+        });
+    } catch (error) {
+        console.error("❌ Error listing clients:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to list clients",
+            details: error.message
+        });
+    }
+});
+
+// Legacy endpoint for backward compatibility
 app.get("/clients", async (req, res) => {
     try {
         if (!dbInitialized) {
@@ -515,7 +594,120 @@ app.get("/clients", async (req, res) => {
     }
 });
 
-// Get client by name
+// Get client details by name (admin - includes private key)
+app.get("/api/clients/:name", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const { includePrivateKey = 'false' } = req.query;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                error: `Client "${name}" not found`
+            });
+        }
+        
+        // Return full details if requested, otherwise safe version
+        const clientData = includePrivateKey === 'true' 
+            ? client.toObject() 
+            : client.toSafeJSON();
+        
+        res.json({
+            success: true,
+            client: clientData
+        });
+    } catch (error) {
+        console.error("❌ Error getting client:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to get client",
+            details: error.message
+        });
+    }
+});
+
+// Get client WireGuard config file (.conf)
+app.get("/api/clients/:name/config", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                error: `Client "${name}" not found`
+            });
+        }
+        
+        // Get server's public key and endpoint
+        const serverPublicKey = (await getServerPublicKey()).trim();
+        const serverEndpoint = getServerEndpoint();
+        
+        // Generate complete client configuration
+        const clientConfig = `[Interface]
+PrivateKey = ${client.privateKey}
+Address = ${client.ip}
+
+[Peer]
+PublicKey = ${serverPublicKey}
+Endpoint = ${serverEndpoint}
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = ${KEEPALIVE_TIME}`;
+        
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('Content-Disposition', `attachment; filename="${client.name}.conf"`);
+        res.send(clientConfig);
+    } catch (error) {
+        console.error("❌ Error getting client config:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to get client config",
+            details: error.message
+        });
+    }
+});
+
+// Get client MikroTik script
+app.get("/api/clients/:name/mikrotik", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const { iface, subnet } = req.query;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                error: `Client "${name}" not found`
+            });
+        }
+        
+        const serverPublicKey = (await getServerPublicKey()).trim();
+        const serverEndpoint = client.endpoint || getServerEndpoint();
+        const serverEndpointParts = serverEndpoint.split(':');
+        const serverHost = serverEndpointParts[0];
+        const serverPort = serverEndpointParts[1] || '51820';
+        
+        const ifaceName = (iface || client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+        const allowed = (subnet || "10.0.0.0/24").toString();
+        
+        // Generate MikroTik script
+        const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
+        
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('Content-Disposition', `attachment; filename="${client.name}.rsc"`);
+        res.send(mikrotikScript);
+    } catch (error) {
+        console.error("❌ Error getting MikroTik script:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to get MikroTik script",
+            details: error.message
+        });
+    }
+});
+
+// Legacy endpoint for backward compatibility
 app.get("/clients/:name", async (req, res) => {
     try {
         const { name } = req.params;
@@ -556,7 +748,381 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
     }
 });
 
-// Update client (enable/disable, notes)
+// Create new client (admin)
+app.post("/api/clients", async (req, res) => {
+    try {
+        const { name, notes, interfaceName, allowedSubnet, enabled = true } = req.body;
+        
+        if (!name) {
+            return res.status(400).json({
+                success: false,
+                error: "Name is required"
+            });
+        }
+        
+        const clientName = name.toLowerCase().trim();
+        
+        // Check if client already exists
+        const existing = await Client.findOne({ name: clientName });
+        if (existing) {
+            return res.status(409).json({
+                success: false,
+                error: `Client "${clientName}" already exists`
+            });
+        }
+        
+        // Generate keys
+        const { privateKey, publicKey } = await generateKeys();
+        const allocatedIp = await getNextAvailableIP();
+        
+        // Create client
+        const client = new Client({
+            name: clientName,
+            ip: allocatedIp,
+            publicKey,
+            privateKey,
+            enabled,
+            notes: notes || '',
+            interfaceName: interfaceName || `wireguard-${clientName}`,
+            endpoint: getServerEndpoint()
+        });
+        
+        await client.save();
+        
+        // Add to WireGuard if enabled
+        if (enabled) {
+            try {
+                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIp} persistent-keepalive ${KEEPALIVE_TIME}`);
+                console.log(`✅ Added client ${clientName} to WireGuard`);
+            } catch (error) {
+                console.warn(`⚠️  Could not add client to WireGuard: ${error.message}`);
+            }
+        }
+        
+        res.status(201).json({
+            success: true,
+            message: `Client "${clientName}" created successfully`,
+            client: client.toSafeJSON()
+        });
+    } catch (error) {
+        console.error("❌ Error creating client:", error);
+        
+        if (error.code === 11000) {
+            return res.status(409).json({
+                success: false,
+                error: "Client with this name or IP already exists",
+                field: Object.keys(error.keyPattern || {})[0]
+            });
+        }
+        
+        res.status(500).json({
+            success: false,
+            error: "Failed to create client",
+            details: error.message
+        });
+    }
+});
+
+// Full update client (admin)
+app.put("/api/clients/:name", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const { notes, interfaceName, enabled } = req.body;
+        
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                error: `Client "${name}" not found`
+            });
+        }
+        
+        // Update fields
+        const updateData = {};
+        if (notes !== undefined) updateData.notes = notes;
+        if (interfaceName !== undefined) updateData.interfaceName = interfaceName;
+        if (typeof enabled === 'boolean') updateData.enabled = enabled;
+        
+        const updatedClient = await Client.findOneAndUpdate(
+            { name: name.toLowerCase() },
+            updateData,
+            { new: true }
+        );
+        
+        // Update WireGuard if enabled status changed
+        if (typeof enabled === 'boolean') {
+            if (enabled) {
+                try {
+                    await runCommand(`wg set wg0 peer ${updatedClient.publicKey} allowed-ips ${updatedClient.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
+                    console.log(`✅ Enabled client ${name} in WireGuard`);
+                } catch (error) {
+                    console.warn(`⚠️  Could not enable client in WireGuard: ${error.message}`);
+                }
+            } else {
+                try {
+                    await runCommand(`wg set wg0 peer ${updatedClient.publicKey} remove`);
+                    console.log(`✅ Disabled client ${name} in WireGuard`);
+                } catch (error) {
+                    console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
+                }
+            }
+        }
+        
+        res.json({
+            success: true,
+            message: `Client "${name}" updated successfully`,
+            client: updatedClient.toSafeJSON()
+        });
+    } catch (error) {
+        console.error("❌ Error updating client:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to update client",
+            details: error.message
+        });
+    }
+});
+
+// Regenerate client keys (admin)
+app.post("/api/clients/:name/regenerate", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                error: `Client "${name}" not found`
+            });
+        }
+        
+        // Remove old peer from WireGuard
+        try {
+            await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
+        } catch (error) {
+            console.warn(`⚠️  Could not remove old peer: ${error.message}`);
+        }
+        
+        // Generate new keys
+        const { privateKey, publicKey } = await generateKeys();
+        
+        // Update client
+        client.privateKey = privateKey;
+        client.publicKey = publicKey;
+        await client.save();
+        
+        // Add new peer to WireGuard if enabled
+        if (client.enabled) {
+            try {
+                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${client.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
+                console.log(`✅ Added regenerated client ${name} to WireGuard`);
+            } catch (error) {
+                console.warn(`⚠️  Could not add regenerated client to WireGuard: ${error.message}`);
+            }
+        }
+        
+        res.json({
+            success: true,
+            message: `Client "${name}" keys regenerated successfully`,
+            client: client.toSafeJSON()
+        });
+    } catch (error) {
+        console.error("❌ Error regenerating client keys:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to regenerate client keys",
+            details: error.message
+        });
+    }
+});
+
+// Enable client
+app.post("/api/clients/:name/enable", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOneAndUpdate(
+            { name: name.toLowerCase() },
+            { enabled: true },
+            { new: true }
+        );
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                error: `Client "${name}" not found`
+            });
+        }
+        
+        // Add to WireGuard
+        try {
+            await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
+            console.log(`✅ Enabled client ${name} in WireGuard`);
+        } catch (error) {
+            console.warn(`⚠️  Could not enable client in WireGuard: ${error.message}`);
+        }
+        
+        res.json({
+            success: true,
+            message: `Client "${name}" enabled successfully`,
+            client: client.toSafeJSON()
+        });
+    } catch (error) {
+        console.error("❌ Error enabling client:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to enable client",
+            details: error.message
+        });
+    }
+});
+
+// Disable client
+app.post("/api/clients/:name/disable", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOneAndUpdate(
+            { name: name.toLowerCase() },
+            { enabled: false },
+            { new: true }
+        );
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                error: `Client "${name}" not found`
+            });
+        }
+        
+        // Remove from WireGuard
+        try {
+            await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
+            console.log(`✅ Disabled client ${name} in WireGuard`);
+        } catch (error) {
+            console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
+        }
+        
+        res.json({
+            success: true,
+            message: `Client "${name}" disabled successfully`,
+            client: client.toSafeJSON()
+        });
+    } catch (error) {
+        console.error("❌ Error disabling client:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to disable client",
+            details: error.message
+        });
+    }
+});
+
+// Bulk delete clients
+app.post("/api/clients/bulk-delete", async (req, res) => {
+    try {
+        const { names } = req.body;
+        
+        if (!Array.isArray(names) || names.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: "Names array is required and must not be empty"
+            });
+        }
+        
+        const lowerNames = names.map(n => n.toLowerCase());
+        const clients = await Client.find({ name: { $in: lowerNames } });
+        
+        if (clients.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: "No clients found to delete"
+            });
+        }
+        
+        // Remove from WireGuard
+        for (const client of clients) {
+            try {
+                await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
+            } catch (error) {
+                console.warn(`⚠️  Could not remove peer ${client.name} from WireGuard`);
+            }
+        }
+        
+        // Delete from database
+        const result = await Client.deleteMany({ name: { $in: lowerNames } });
+        
+        res.json({
+            success: true,
+            message: `Deleted ${result.deletedCount} client(s) successfully`,
+            deleted: result.deletedCount,
+            clients: clients.map(c => ({ name: c.name, ip: c.ip }))
+        });
+    } catch (error) {
+        console.error("❌ Error bulk deleting clients:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to delete clients",
+            details: error.message
+        });
+    }
+});
+
+// Get admin statistics
+app.get("/api/admin/stats", async (req, res) => {
+    try {
+        if (!dbInitialized) {
+            return res.status(503).json({
+                success: false,
+                error: "Database not initialized"
+            });
+        }
+        
+        const [totalClients, enabledClients, disabledClients, recentClients] = await Promise.all([
+            Client.countDocuments(),
+            Client.countDocuments({ enabled: true }),
+            Client.countDocuments({ enabled: false }),
+            Client.find().sort({ createdAt: -1 }).limit(5)
+        ]);
+        
+        // Get WireGuard status
+        let wgStatus = null;
+        try {
+            const wgShow = await runCommand("wg show wg0 dump");
+            const peers = wgShow.trim().split('\n').filter(line => line.trim());
+            wgStatus = {
+                connected: peers.length,
+                details: peers
+            };
+        } catch (error) {
+            wgStatus = {
+                connected: 0,
+                error: "WireGuard interface not available"
+            };
+        }
+        
+        res.json({
+            success: true,
+            stats: {
+                clients: {
+                    total: totalClients,
+                    enabled: enabledClients,
+                    disabled: disabledClients
+                },
+                wireguard: wgStatus,
+                recent: recentClients.map(c => c.toSafeJSON())
+            }
+        });
+    } catch (error) {
+        console.error("❌ Error getting stats:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to get statistics",
+            details: error.message
+        });
+    }
+});
+
+// Update client (enable/disable, notes) - Legacy
 app.patch("/clients/:name", async (req, res) => {
     try {
         const { name } = req.params;
@@ -681,17 +1247,56 @@ app.get("/", (req, res) => {
         status: "running",
         service: "WireGuard VPN Management API",
         database: dbInitialized ? "connected" : "not connected",
+        version: "2.0.0",
         endpoints: {
-            "POST /generate-client": "Generate new client (requires name in body)",
-            "GET /clients": "List all clients",
-            "GET /clients/:name": "Get client config by name",
-            "PATCH /clients/:name": "Update client (enable/disable, notes)",
-            "DELETE /clients/:name": "Delete client",
-            "POST /reload": "Reload all clients from database",
-            "POST /add-peer": "Add peer manually",
-            "GET /list-peers": "List active connections"
+            "GET /api/clients": "List all clients (with filtering, pagination)",
+            "GET /api/clients/:name": "Get client details",
+            "GET /api/clients/:name/config": "Get WireGuard config file",
+            "GET /api/clients/:name/mikrotik": "Get MikroTik script",
+            "POST /api/clients": "Create new client",
+            "PUT /api/clients/:name": "Update client",
+            "DELETE /api/clients/:name": "Delete client",
+            "POST /api/clients/:name/regenerate": "Regenerate client keys",
+            "POST /api/clients/:name/enable": "Enable client",
+            "POST /api/clients/:name/disable": "Disable client",
+            "POST /api/clients/bulk-delete": "Bulk delete clients",
+            "GET /api/admin/stats": "Get statistics",
+            "POST /generate-client": "Generate new client (legacy)",
+            "POST /generate-mikrotik": "Generate MikroTik script (legacy)",
+            "GET /mt/:name": "Get MikroTik script (short URL)",
+            "GET /list-peers": "List active WireGuard connections"
         }
     });
+});
+
+// Enhanced health check
+app.get("/api/health", async (req, res) => {
+    try {
+        const health = {
+            status: "healthy",
+            timestamp: new Date().toISOString(),
+            service: "WireGuard VPN Management API",
+            database: dbInitialized ? "connected" : "disconnected",
+            wireguard: null
+        };
+        
+        // Check WireGuard status
+        try {
+            await runCommand("wg show wg0");
+            health.wireguard = "running";
+        } catch (error) {
+            health.wireguard = "not running";
+            health.wireguardError = error.message;
+        }
+        
+        const statusCode = (dbInitialized && health.wireguard === "running") ? 200 : 503;
+        res.status(statusCode).json(health);
+    } catch (error) {
+        res.status(503).json({
+            status: "unhealthy",
+            error: error.message
+        });
+    }
 });
 
 // Run API on TCP Port 5000

@@ -88,7 +88,72 @@ curl.exe -X POST http://157.245.40.199:5000/generate-mikrotik `
 Invoke-WebRequest -Uri "http://157.245.40.199:5000/generate-mikrotik" -Method POST -ContentType "application/json" -Body '{"name":"mikrotik","notes":"Enock Mikrotik"}' -OutFile "mikrotik.rsc"
 ```
 
-## How to Use the Generated Script
+## How to Pull Configuration Directly in MikroTik RouterOS
+
+You can fetch and apply the configuration **directly from MikroTik Terminal** without downloading manually:
+
+### Method 1: Fetch, Save as Script, Then Run (Recommended) ⚡
+
+```routeros
+# Step 1: Download the script
+/tool fetch url="http://157.245.40.199:5000/mt/mikrotik" dst-path=wg-config.rsc
+
+# Step 2: Add it as a script and run it
+/system script add name=wg-setup source=[/file get wg-config.rsc contents];
+/system script run wg-setup
+```
+
+### Method 2: One-Liner (Fetch and Execute)
+
+```routeros
+:do { /tool fetch url="http://157.245.40.199:5000/mt/mikrotik" dst-path=wg-config.rsc; /system script add name=wg-setup source=[/file get wg-config.rsc contents]; /system script run wg-setup } on-error={ :put "Failed to fetch or execute config" }
+```
+
+### Method 3: Create a Reusable Update Script
+
+Create a script in MikroTik that you can run anytime to update the config:
+
+**In Winbox/WebFig:**
+1. Go to **System → Scripts**
+2. Click **Add New**
+3. Name: `update-wireguard`
+4. Source:
+```routeros
+/tool fetch url="http://157.245.40.199:5000/mt/mikrotik" dst-path=wg-config.rsc;
+/system script add name=wg-setup source=[/file get wg-config.rsc contents] policy=read,write,test;
+/system script run wg-setup;
+:put "WireGuard configuration updated"
+```
+
+Then run it anytime with:
+```routeros
+/system script run update-wireguard
+```
+
+### Method 4: Direct Execution (Copy-Paste Method)
+
+1. **Fetch the script content:**
+```routeros
+/tool fetch url="http://157.245.40.199:5000/mt/mikrotik" dst-path=wg-config.rsc
+```
+
+2. **View the script:**
+```routeros
+/file print file=wg-config.rsc
+```
+
+3. **Copy the output and paste directly into Terminal** - it will execute immediately
+
+### Method 5: Using Script Repository (RouterOS v7.3+)
+
+If you have script repository enabled:
+```routeros
+/tool fetch url="http://157.245.40.199:5000/mt/mikrotik" dst-path=wg-config.rsc;
+:local scriptContent [/file get wg-config.rsc contents];
+:execute script=$scriptContent
+```
+
+## How to Use the Generated Script (Manual Method)
 
 1. **Download the script** using one of the methods above
 2. **Open MikroTik RouterOS** (Winbox or WebFig)
