@@ -1,5 +1,19 @@
 # Coolify Deployment Guide for WireGuard VPN
 
+## 🚨 QUICK FIX: "Operation not permitted" Error
+
+**If you're seeing `RTNETLINK answers: Operation not permitted`:**
+
+1. **Coolify UI** → Your App → **Settings** → **Advanced**
+2. ✅ Enable **"Privileged Mode"** (toggle ON)
+3. ✅ Add capability: `NET_ADMIN`
+4. ✅ Add capability: `SYS_MODULE`
+5. **Save** → **Redeploy**
+
+**That's it!** See detailed steps below if needed.
+
+---
+
 ## ⚠️ Important: Required Coolify Settings
 
 WireGuard requires special privileges to create network interfaces. You **MUST** configure these in the Coolify UI:
@@ -47,13 +61,26 @@ net.ipv6.conf.all.forwarding=1
 
 ## Alternative: Host Network Mode
 
-If privileged mode is not available, you can try using **Host Network Mode**:
+If privileged mode is **not available** or **still doesn't work**, try **Host Network Mode**:
 
-1. In Coolify UI → **Settings** → **Network**
-2. Enable **"Host Network Mode"**
-3. This allows the container to use the host's network stack directly
+**Step-by-Step:**
 
-**Note:** Host network mode may have security implications and may not work in all Coolify deployments.
+1. In Coolify UI → Go to your application → **Settings**
+2. Find **"Network"** section
+3. Enable **"Host Network Mode"** toggle
+4. **Save** the settings
+5. **Redeploy** the application
+
+**What this does:**
+- Container uses the host's network stack directly
+- Bypasses Docker's network isolation
+- May allow WireGuard to work without privileged mode
+
+**Important Notes:**
+- Host network mode has security implications (container shares host network)
+- Port conflicts are more likely (can't map ports)
+- May not work in all Coolify deployments
+- If this doesn't work, you may need to deploy on a VPS with Docker directly
 
 ## Verification
 
@@ -69,9 +96,51 @@ If you still see "Operation not permitted" errors, the privileged mode or capabi
 
 ## Troubleshooting
 
-### Error: "Operation not permitted"
+### Error: "Operation not permitted" or "RTNETLINK answers: Operation not permitted"
 
-**Solution:** Enable privileged mode in Coolify UI settings
+**This is the most common error!** It means the container doesn't have the required permissions to create network interfaces.
+
+**Step-by-Step Fix:**
+
+1. **Go to your application in Coolify UI**
+   - Navigate to your WireGuard application
+   - Click on the application name
+
+2. **Open Settings**
+   - Click on **"Settings"** tab (usually at the top or in a sidebar)
+   - Scroll down to **"Advanced"** section
+
+3. **Enable Privileged Mode** (CRITICAL)
+   - Find **"Privileged Mode"** or **"Run as Privileged"** toggle
+   - **Turn it ON** ✅
+   - This gives the container full access to the host system (required for WireGuard)
+
+4. **Add Required Capabilities**
+   - In the same Advanced section, find **"Capabilities"** or **"Add Capabilities"**
+   - Click **"Add Capability"** or the **"+"** button
+   - Add these **exact** capabilities (one at a time):
+     - `NET_ADMIN` - Click Add
+     - `SYS_MODULE` - Click Add
+   - Make sure both are listed in the capabilities section
+
+5. **Save Settings**
+   - Click **"Save"** or **"Update"** button
+   - Wait for the settings to be saved
+
+6. **Redeploy the Application**
+   - Go back to the main application page
+   - Click **"Deploy"** or **"Redeploy"** button
+   - Wait for the deployment to complete
+
+7. **Verify It Works**
+   - Check the logs after deployment
+   - You should see: `✅ WireGuard interface started successfully`
+   - Instead of: `RTNETLINK answers: Operation not permitted`
+
+**If you still see the error after these steps:**
+- Some Coolify instances don't support privileged mode
+- Try **Host Network Mode** as an alternative (see below)
+- Or deploy directly on a VPS with Docker
 
 ### Error: "Cannot find device wg0"
 
