@@ -33,7 +33,8 @@ COPY db.js /app/
 COPY models /app/models/
 
 # Install API dependencies including mongoose for MongoDB
-RUN npm init -y && npm install express body-parser child_process cors mongoose
+# Note: child_process is a built-in Node.js module, no need to install it
+RUN npm init -y && npm install --no-audit --no-fund express body-parser cors mongoose
 
 # Expose ports (UDP for WireGuard, TCP for API)
 EXPOSE 51820/udp
