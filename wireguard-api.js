@@ -172,6 +172,11 @@ async function updateClientStatistics() {
         const wgShow = await runCommand("wg show wg0 dump");
         const lines = wgShow.trim().split('\n').filter(line => line.trim());
         
+        // Get all enabled clients to update
+        const enabledClients = await Client.find({ enabled: true });
+        const enabledPublicKeys = new Set(enabledClients.map(c => c.publicKey.trim()));
+        
+        // Process active peers from WireGuard
         for (const line of lines) {
             const parts = line.split('\t');
             if (parts.length < 7) continue;
@@ -186,24 +191,46 @@ async function updateClientStatistics() {
                 persistentKeepalive
             ] = parts;
             
+            const publicKeyTrimmed = publicKey.trim();
+            
+            // Only update statistics for enabled clients
+            if (!enabledPublicKeys.has(publicKeyTrimmed)) {
+                continue;
+            }
+            
             // Find client by public key
-            const client = await Client.findOne({ publicKey: publicKey.trim() });
+            const client = await Client.findOne({ publicKey: publicKeyTrimmed, enabled: true });
             if (!client) continue;
             
             // Parse endpoint to get IP
-            const endpointIp = endpoint && endpoint !== '(none)' 
-                ? endpoint.split(':')[0] 
+            const endpointIp = endpoint && endpoint !== '(none)' && endpoint.trim() !== ''
+                ? endpoint.split(':')[0].trim()
                 : null;
             
-            // Parse handshake time (Unix timestamp in seconds)
-            const handshakeTime = lastHandshake && lastHandshake !== '0' 
-                ? new Date(parseInt(lastHandshake) * 1000)
-                : null;
+            // Parse handshake time (Unix timestamp in seconds) with proper validation
+            let handshakeTime = null;
+            if (lastHandshake && lastHandshake.trim() !== '' && lastHandshake.trim() !== '0') {
+                const handshakeSeconds = parseInt(lastHandshake.trim());
+                // Validate: must be a valid number and within reasonable range (not before 2020, not in future)
+                if (!isNaN(handshakeSeconds) && handshakeSeconds > 0) {
+                    const date = new Date(handshakeSeconds * 1000);
+                    const now = new Date();
+                    const minDate = new Date('2020-01-01');
+                    // Only accept if date is valid, after 2020, and not in the future
+                    if (date instanceof Date && !isNaN(date.getTime()) && date >= minDate && date <= now) {
+                        handshakeTime = date;
+                    }
+                }
+            }
+            
+            // Parse transfer values (they're in bytes)
+            const rxBytes = parseInt(transferRx && transferRx.trim() !== '' ? transferRx.trim() : '0') || 0;
+            const txBytes = parseInt(transferTx && transferTx.trim() !== '' ? transferTx.trim() : '0') || 0;
             
             // Update client statistics
             const updateData = {
-                transferRx: parseInt(transferRx) || 0,
-                transferTx: parseInt(transferTx) || 0,
+                transferRx: rxBytes,
+                transferTx: txBytes,
                 updatedAt: new Date()
             };
             
@@ -217,8 +244,44 @@ async function updateClientStatistics() {
             }
             
             await Client.updateOne(
-                { publicKey: publicKey.trim() },
+                { publicKey: publicKeyTrimmed },
                 { $set: updateData }
+            );
+        }
+        
+        // Clear statistics for disabled clients that might still be in WireGuard
+        // (in case they weren't properly removed)
+        const allClients = await Client.find({ enabled: false });
+        for (const disabledClient of allClients) {
+            // Check if this client is still in WireGuard
+            const stillInWg = lines.some(line => {
+                const parts = line.split('\t');
+                return parts.length > 0 && parts[0].trim() === disabledClient.publicKey.trim();
+            });
+            
+            // If still in WireGuard, try to remove it
+            if (stillInWg) {
+                try {
+                    await runCommand(`wg set wg0 peer ${disabledClient.publicKey} remove`);
+                    console.log(`✅ Removed disabled client ${disabledClient.name} from WireGuard`);
+                } catch (error) {
+                    // Ignore errors - peer might already be removed
+                }
+            }
+            
+            // Clear statistics for disabled clients
+            await Client.updateOne(
+                { _id: disabledClient._id },
+                { 
+                    $set: {
+                        lastHandshake: null,
+                        lastConnectionTime: null,
+                        lastConnectionIp: null,
+                        transferRx: 0,
+                        transferTx: 0,
+                        updatedAt: new Date()
+                    }
+                }
             );
         }
     } catch (error) {
@@ -1160,6 +1223,20 @@ app.put("/api/clients/:name", async (req, res) => {
                 } catch (error) {
                     console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
                 }
+                
+                // Clear statistics for disabled client
+                await Client.updateOne(
+                    { _id: updatedClient._id },
+                    {
+                        $set: {
+                            lastHandshake: null,
+                            lastConnectionTime: null,
+                            lastConnectionIp: null,
+                            transferRx: 0,
+                            transferTx: 0
+                        }
+                    }
+                );
             }
         }
         
@@ -1301,6 +1378,20 @@ app.post("/api/clients/:name/disable", async (req, res) => {
             console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
         }
         
+        // Clear statistics for disabled client
+        await Client.updateOne(
+            { _id: client._id },
+            {
+                $set: {
+                    lastHandshake: null,
+                    lastConnectionTime: null,
+                    lastConnectionIp: null,
+                    transferRx: 0,
+                    transferTx: 0
+                }
+            }
+        );
+        
         res.json({
             success: true,
             message: "Client disabled successfully"
@@ -1441,12 +1532,21 @@ app.get("/api/admin/stats", async (req, res) => {
                     const endpoint = parts[1];
                     const lastHandshake = parts[3];
                     
-                    // Find matching client
-                    const client = await Client.findOne({ publicKey });
+                    // Find matching client (only enabled ones)
+                    const client = await Client.findOne({ publicKey: publicKey.trim(), enabled: true });
                     if (client) {
-                        const handshakeTime = lastHandshake && lastHandshake !== '0' 
-                            ? new Date(parseInt(lastHandshake) * 1000)
-                            : null;
+                        let handshakeTime = null;
+                        if (lastHandshake && lastHandshake.trim() !== '' && lastHandshake.trim() !== '0') {
+                            const handshakeSeconds = parseInt(lastHandshake.trim());
+                            if (!isNaN(handshakeSeconds) && handshakeSeconds > 0) {
+                                const date = new Date(handshakeSeconds * 1000);
+                                const now = new Date();
+                                const minDate = new Date('2020-01-01');
+                                if (date instanceof Date && !isNaN(date.getTime()) && date >= minDate && date <= now) {
+                                    handshakeTime = date;
+                                }
+                            }
+                        }
                         
                         const timeAgo = handshakeTime 
                             ? getTimeAgo(handshakeTime)
@@ -1555,6 +1655,20 @@ app.patch("/clients/:name", async (req, res) => {
                 } catch (error) {
                     console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
                 }
+                
+                // Clear statistics for disabled client
+                await Client.updateOne(
+                    { _id: client._id },
+                    {
+                        $set: {
+                            lastHandshake: null,
+                            lastConnectionTime: null,
+                            lastConnectionIp: null,
+                            transferRx: 0,
+                            transferTx: 0
+                        }
+                    }
+                );
             }
         }
         
