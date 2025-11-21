@@ -51,6 +51,38 @@ const clientSchema = new mongoose.Schema({
     endpoint: {
         type: String,
         trim: true
+    },
+    allowedIPs: {
+        type: String,
+        default: '0.0.0.0/0',
+        trim: true
+    },
+    dns: {
+        type: String,
+        trim: true
+    },
+    persistentKeepalive: {
+        type: Number,
+        default: 25
+    },
+    // Real-time connection statistics (updated from WireGuard interface)
+    lastHandshake: {
+        type: Date
+    },
+    transferRx: {
+        type: Number,
+        default: 0
+    },
+    transferTx: {
+        type: Number,
+        default: 0
+    },
+    lastConnectionTime: {
+        type: Date
+    },
+    lastConnectionIp: {
+        type: String,
+        trim: true
     }
 }, {
     timestamps: true, // Adds createdAt and updatedAt
@@ -60,6 +92,7 @@ const clientSchema = new mongoose.Schema({
 // Index for faster queries
 clientSchema.index({ enabled: 1, name: 1 });
 clientSchema.index({ createdAt: -1 });
+clientSchema.index({ publicKey: 1 }); // For statistics matching
 
 // Ensure name is lowercase
 clientSchema.pre('save', function(next) {
