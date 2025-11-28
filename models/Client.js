@@ -94,12 +94,11 @@ clientSchema.index({ enabled: 1, name: 1 });
 clientSchema.index({ createdAt: -1 });
 clientSchema.index({ publicKey: 1 }); // For statistics matching
 
-// Ensure name is lowercase
-clientSchema.pre('save', function(next) {
+// Ensure name is lowercase (Mongoose 7+ uses promise-based middleware, no next callback)
+clientSchema.pre('save', function() {
     if (this.name) {
         this.name = this.name.toLowerCase();
     }
-    next();
 });
 
 // Method to get safe version (without private key)
