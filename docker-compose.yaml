@@ -3,7 +3,7 @@ version: '3.8'
 services:
   wireguard:
     build: .
-    container_name: ${COOLIFY_CONTAINER_NAME:-blackie-wireguard}
+    container_name: ${COOLIFY_CONTAINER_NAME:-wireguard}
     restart: unless-stopped
     privileged: true  # REQUIRED: Enable in Coolify UI → Settings → Advanced → Privileged Mode
     cap_add:
