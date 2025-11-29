@@ -7,12 +7,22 @@ const Client = require("./models/Client");
 
 const app = express();
 
-// Enable CORS for all routes
+// Enable CORS for all routes with explicit allowed origins
+const allowedOrigins = [
+    "https://admin.blackie-networks.com",
+    "https://blackie-softwareadmin-enockays-projects.vercel.app",
+];
+
 app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.includes(origin)) {
+        res.header("Access-Control-Allow-Origin", origin);
+    }
+    res.header("Vary", "Origin");
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    
+    if (req.method === "OPTIONS") {
         return res.sendStatus(200);
     }
     next();
@@ -22,6 +32,7 @@ app.use(bodyParser.json());
 
 const KEEPALIVE_TIME = 25; // Keepalive interval (in seconds)
 const STARTING_CLIENT_IP = 6; // Start assigning IPs from 10.0.0.6 (1=server, 2-5=preconfigured)
+const STATS_UPDATE_INTERVAL = 30000; // Update statistics every 30 seconds
 
 // Initialize MongoDB connection
 let dbInitialized = false;
@@ -32,6 +43,8 @@ let dbInitialized = false;
         console.log("✅ Database initialized, loading clients...");
         // Load and apply all enabled clients from database
         await loadClientsFromDatabase();
+        // Start background statistics update job
+        startStatisticsUpdateJob();
     } catch (error) {
         console.error("❌ Failed to initialize database:", error.message);
         dbInitialized = false;
@@ -74,7 +87,8 @@ async function loadClientsFromDatabase() {
         
         for (const client of clients) {
             try {
-                await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
+                const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+                await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
                 console.log(`✅ Loaded client: ${client.name} (${client.ip})`);
             } catch (error) {
                 console.warn(`⚠️  Could not load client ${client.name}: ${error.message}`);
@@ -155,6 +169,147 @@ async function getServerPublicKey() {
 // Get server endpoint (IP or domain)
 function getServerEndpoint() {
     return process.env.SERVER_ENDPOINT || "YOUR_SERVER_IP:51820";
+}
+
+// Update client statistics from WireGuard interface
+async function updateClientStatistics() {
+    if (!dbInitialized) {
+        return;
+    }
+    
+    try {
+        // Get WireGuard interface dump
+        const wgShow = await runCommand("wg show wg0 dump");
+        const lines = wgShow.trim().split('\n').filter(line => line.trim());
+        
+        // Get all enabled clients to update
+        const enabledClients = await Client.find({ enabled: true });
+        const enabledPublicKeys = new Set(enabledClients.map(c => c.publicKey.trim()));
+        
+        // Process active peers from WireGuard
+        for (const line of lines) {
+            const parts = line.split('\t');
+            if (parts.length < 7) continue;
+            
+            const [
+                publicKey,
+                endpoint,
+                allowedIPs,
+                lastHandshake,
+                transferRx,
+                transferTx,
+                persistentKeepalive
+            ] = parts;
+            
+            const publicKeyTrimmed = publicKey.trim();
+            
+            // Only update statistics for enabled clients
+            if (!enabledPublicKeys.has(publicKeyTrimmed)) {
+                continue;
+            }
+            
+            // Find client by public key
+            const client = await Client.findOne({ publicKey: publicKeyTrimmed, enabled: true });
+            if (!client) continue;
+            
+            // Parse endpoint to get IP
+            const endpointIp = endpoint && endpoint !== '(none)' && endpoint.trim() !== ''
+                ? endpoint.split(':')[0].trim()
+                : null;
+            
+            // Parse handshake time (Unix timestamp in seconds) with proper validation
+            let handshakeTime = null;
+            if (lastHandshake && lastHandshake.trim() !== '' && lastHandshake.trim() !== '0') {
+                const handshakeSeconds = parseInt(lastHandshake.trim());
+                // Validate: must be a valid number and within reasonable range (not before 2020, not in future)
+                if (!isNaN(handshakeSeconds) && handshakeSeconds > 0) {
+                    const date = new Date(handshakeSeconds * 1000);
+                    const now = new Date();
+                    const minDate = new Date('2020-01-01');
+                    // Only accept if date is valid, after 2020, and not in the future
+                    if (date instanceof Date && !isNaN(date.getTime()) && date >= minDate && date <= now) {
+                        handshakeTime = date;
+                    }
+                }
+            }
+            
+            // Parse transfer values (they're in bytes)
+            const rxBytes = parseInt(transferRx && transferRx.trim() !== '' ? transferRx.trim() : '0') || 0;
+            const txBytes = parseInt(transferTx && transferTx.trim() !== '' ? transferTx.trim() : '0') || 0;
+            
+            // Update client statistics
+            const updateData = {
+                transferRx: rxBytes,
+                transferTx: txBytes,
+                updatedAt: new Date()
+            };
+            
+            if (handshakeTime) {
+                updateData.lastHandshake = handshakeTime;
+                updateData.lastConnectionTime = handshakeTime;
+            }
+            
+            if (endpointIp) {
+                updateData.lastConnectionIp = endpointIp;
+            }
+            
+            await Client.updateOne(
+                { publicKey: publicKeyTrimmed },
+                { $set: updateData }
+            );
+        }
+        
+        // Clear statistics for disabled clients that might still be in WireGuard
+        // (in case they weren't properly removed)
+        const allClients = await Client.find({ enabled: false });
+        for (const disabledClient of allClients) {
+            // Check if this client is still in WireGuard
+            const stillInWg = lines.some(line => {
+                const parts = line.split('\t');
+                return parts.length > 0 && parts[0].trim() === disabledClient.publicKey.trim();
+            });
+            
+            // If still in WireGuard, try to remove it
+            if (stillInWg) {
+                try {
+                    await runCommand(`wg set wg0 peer ${disabledClient.publicKey} remove`);
+                    console.log(`✅ Removed disabled client ${disabledClient.name} from WireGuard`);
+                } catch (error) {
+                    // Ignore errors - peer might already be removed
+                }
+            }
+            
+            // Clear statistics for disabled clients
+            await Client.updateOne(
+                { _id: disabledClient._id },
+                { 
+                    $set: {
+                        lastHandshake: null,
+                        lastConnectionTime: null,
+                        lastConnectionIp: null,
+                        transferRx: 0,
+                        transferTx: 0,
+                        updatedAt: new Date()
+                    }
+                }
+            );
+        }
+    } catch (error) {
+        // Silently fail - WireGuard might not be running
+        if (error.message && !error.message.includes('No such device')) {
+            console.error('Error updating statistics:', error.message);
+        }
+    }
+}
+
+// Start background job to update statistics
+function startStatisticsUpdateJob() {
+    // Run immediately
+    updateClientStatistics();
+    
+    // Then run every 30 seconds
+    setInterval(updateClientStatistics, STATS_UPDATE_INTERVAL);
+    console.log(`✅ Statistics update job started (runs every ${STATS_UPDATE_INTERVAL/1000}s)`);
 }
 
 // Generate a new client configuration
@@ -410,7 +565,9 @@ async function ensureClientRecord({ name, notes, interfaceName }) {
         enabled: true,
         notes: notes || '',
         interfaceName: interfaceName || `wireguard-${clientName}`,
-        endpoint: getServerEndpoint()
+        endpoint: getServerEndpoint(),
+        allowedIPs: "0.0.0.0/0",
+        persistentKeepalive: KEEPALIVE_TIME
     });
     await record.save();
     try {
@@ -604,7 +761,8 @@ app.get("/api/clients/:name", async (req, res) => {
         if (!client) {
             return res.status(404).json({
                 success: false,
-                error: `Client "${name}" not found`
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
             });
         }
         
@@ -615,13 +773,14 @@ app.get("/api/clients/:name", async (req, res) => {
         
         res.json({
             success: true,
-            client: clientData
+            data: clientData
         });
     } catch (error) {
         console.error("❌ Error getting client:", error);
         res.status(500).json({
             success: false,
-            error: "Failed to get client",
+            message: "Failed to get client",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
@@ -636,24 +795,34 @@ app.get("/api/clients/:name/config", async (req, res) => {
         if (!client) {
             return res.status(404).json({
                 success: false,
-                error: `Client "${name}" not found`
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
             });
         }
         
         // Get server's public key and endpoint
         const serverPublicKey = (await getServerPublicKey()).trim();
-        const serverEndpoint = getServerEndpoint();
+        const serverEndpoint = client.endpoint || getServerEndpoint();
         
         // Generate complete client configuration
-        const clientConfig = `[Interface]
+        const dns = client.dns || "";
+        const allowedIPs = client.allowedIPs || "0.0.0.0/0";
+        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        
+        let clientConfig = `[Interface]
 PrivateKey = ${client.privateKey}
-Address = ${client.ip}
-
+Address = ${client.ip}`;
+        
+        if (dns) {
+            clientConfig += `\nDNS = ${dns}`;
+        }
+        
+        clientConfig += `\n
 [Peer]
 PublicKey = ${serverPublicKey}
 Endpoint = ${serverEndpoint}
-AllowedIPs = 10.0.0.0/24
-PersistentKeepalive = ${KEEPALIVE_TIME}`;
+AllowedIPs = ${allowedIPs}
+PersistentKeepalive = ${keepalive}`;
         
         res.setHeader('Content-Type', 'text/plain');
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}.conf"`);
@@ -662,7 +831,136 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
         console.error("❌ Error getting client config:", error);
         res.status(500).json({
             success: false,
-            error: "Failed to get client config",
+            message: "Failed to get client config",
+            error: "WIREGUARD_ERROR",
+            details: error.message
+        });
+    }
+});
+
+// Auto-Configure MikroTik (Single URL) - Enhanced version
+app.get("/api/clients/:name/autoconfig", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
+            });
+        }
+        
+        const serverPublicKey = (await getServerPublicKey()).trim();
+        const serverEndpoint = client.endpoint || getServerEndpoint();
+        const serverEndpointParts = serverEndpoint.split(':');
+        const serverHost = serverEndpointParts[0];
+        const serverPort = serverEndpointParts[1] || '51820';
+        
+        const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+        const allowed = client.allowedIPs || "0.0.0.0/0";
+        const dns = client.dns || "8.8.8.8, 1.1.1.1";
+        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const serverWgIp = "10.0.0.1";
+        
+        // Generate comprehensive MikroTik auto-config script
+        const autoconfigScript = `# WireGuard Auto-Configuration Script
+# Generated: ${new Date().toISOString()}
+# Client: ${client.name}
+
+# Remove existing interface if present
+/interface/wireguard/remove [find name="${ifaceName}"]
+
+# Create WireGuard interface
+/interface/wireguard/add name=${ifaceName} listen-port=51820 mtu=1420 private-key="${client.privateKey}"
+
+# Add peer configuration
+/interface/wireguard/peers/add interface=${ifaceName} public-key="${serverPublicKey}" endpoint-address=${serverHost} endpoint-port=${serverPort} allowed-address=${allowed} persistent-keepalive=${keepalive}s
+
+# Assign IP address
+/ip/address/add address=${client.ip} interface=${ifaceName}
+
+# Configure DNS
+/ip/dns/set servers=${dns.replace(/,/g, ',')}
+
+# Enable interface
+/interface/wireguard/set ${ifaceName} disabled=no
+
+# Add routing if needed
+/ip/route/add dst-address=${allowed} gateway=${ifaceName} comment="WireGuard VPN Route"
+
+# Test connectivity
+:delay 2
+:local success 0
+:do {
+  /ping ${serverWgIp} count=3 timeout=2s
+  :set success 1
+} on-error={ :set success 0 }
+
+# Success message
+:if ($success = 1) do={ 
+  :put "WireGuard client '${client.name}' configured successfully! Ping to ${serverWgIp} succeeded."
+} else={ 
+  :put "WireGuard client '${client.name}' configured but ping to ${serverWgIp} failed. Check firewall/connectivity."
+}`;
+        
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);
+        res.send(autoconfigScript);
+    } catch (error) {
+        console.error("❌ Error generating auto-config:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to generate auto-config script",
+            error: "WIREGUARD_ERROR",
+            details: error.message
+        });
+    }
+});
+
+// Ping remote server endpoint
+app.post("/api/clients/:name/ping", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const { target = "10.0.0.1", count = 3 } = req.body;
+        
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
+            });
+        }
+        
+        // Ping the target
+        try {
+            const pingResult = await runCommand(`ping -c ${count} -W 2 ${target}`);
+            res.json({
+                success: true,
+                message: `Ping to ${target} successful`,
+                client: client.name,
+                target: target,
+                result: pingResult
+            });
+        } catch (error) {
+            res.status(500).json({
+                success: false,
+                message: `Ping to ${target} failed`,
+                client: client.name,
+                target: target,
+                error: "PING_FAILED",
+                details: error.message
+            });
+        }
+    } catch (error) {
+        console.error("❌ Error pinging:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to ping remote server",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
@@ -678,7 +976,8 @@ app.get("/api/clients/:name/mikrotik", async (req, res) => {
         if (!client) {
             return res.status(404).json({
                 success: false,
-                error: `Client "${name}" not found`
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
             });
         }
         
@@ -689,10 +988,11 @@ app.get("/api/clients/:name/mikrotik", async (req, res) => {
         const serverPort = serverEndpointParts[1] || '51820';
         
         const ifaceName = (iface || client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
-        const allowed = (subnet || "10.0.0.0/24").toString();
+        const allowed = (subnet || client.allowedIPs || "0.0.0.0/0").toString();
+        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
         
         // Generate MikroTik script
-        const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
+        const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
         
         res.setHeader('Content-Type', 'text/plain');
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}.rsc"`);
@@ -701,7 +1001,8 @@ app.get("/api/clients/:name/mikrotik", async (req, res) => {
         console.error("❌ Error getting MikroTik script:", error);
         res.status(500).json({
             success: false,
-            error: "Failed to get MikroTik script",
+            message: "Failed to get MikroTik script",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
@@ -751,23 +1052,43 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
 // Create new client (admin)
 app.post("/api/clients", async (req, res) => {
     try {
-        const { name, notes, interfaceName, allowedSubnet, enabled = true } = req.body;
+        const { 
+            name, 
+            notes, 
+            interfaceName, 
+            allowedIPs = "0.0.0.0/0",
+            endpoint,
+            dns,
+            persistentKeepalive = KEEPALIVE_TIME,
+            enabled = true 
+        } = req.body;
         
         if (!name) {
             return res.status(400).json({
                 success: false,
-                error: "Name is required"
+                message: "Name is required",
+                error: "VALIDATION_ERROR"
             });
         }
         
         const clientName = name.toLowerCase().trim();
+        
+        // Validate IP format if provided
+        if (allowedIPs && !/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(allowedIPs) && allowedIPs !== "0.0.0.0/0") {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid allowedIPs format",
+                error: "INVALID_IP"
+            });
+        }
         
         // Check if client already exists
         const existing = await Client.findOne({ name: clientName });
         if (existing) {
             return res.status(409).json({
                 success: false,
-                error: `Client "${clientName}" already exists`
+                message: `Client "${clientName}" already exists`,
+                error: "CLIENT_EXISTS"
             });
         }
         
@@ -784,7 +1105,10 @@ app.post("/api/clients", async (req, res) => {
             enabled,
             notes: notes || '',
             interfaceName: interfaceName || `wireguard-${clientName}`,
-            endpoint: getServerEndpoint()
+            endpoint: endpoint || getServerEndpoint(),
+            allowedIPs: allowedIPs,
+            dns: dns,
+            persistentKeepalive: persistentKeepalive
         });
         
         await client.save();
@@ -792,7 +1116,7 @@ app.post("/api/clients", async (req, res) => {
         // Add to WireGuard if enabled
         if (enabled) {
             try {
-                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIp} persistent-keepalive ${KEEPALIVE_TIME}`);
+                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIp} persistent-keepalive ${persistentKeepalive}`);
                 console.log(`✅ Added client ${clientName} to WireGuard`);
             } catch (error) {
                 console.warn(`⚠️  Could not add client to WireGuard: ${error.message}`);
@@ -801,8 +1125,16 @@ app.post("/api/clients", async (req, res) => {
         
         res.status(201).json({
             success: true,
-            message: `Client "${clientName}" created successfully`,
-            client: client.toSafeJSON()
+            message: "Client created successfully",
+            data: {
+                _id: client._id,
+                name: client.name,
+                publicKey: client.publicKey,
+                privateKey: client.privateKey,
+                ip: client.ip,
+                enabled: client.enabled,
+                createdAt: client.createdAt
+            }
         });
     } catch (error) {
         console.error("❌ Error creating client:", error);
@@ -810,14 +1142,16 @@ app.post("/api/clients", async (req, res) => {
         if (error.code === 11000) {
             return res.status(409).json({
                 success: false,
-                error: "Client with this name or IP already exists",
+                message: "Client with this name or IP already exists",
+                error: "CLIENT_EXISTS",
                 field: Object.keys(error.keyPattern || {})[0]
             });
         }
         
         res.status(500).json({
             success: false,
-            error: "Failed to create client",
+            message: "Failed to create client",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
@@ -827,14 +1161,41 @@ app.post("/api/clients", async (req, res) => {
 app.put("/api/clients/:name", async (req, res) => {
     try {
         const { name } = req.params;
-        const { notes, interfaceName, enabled } = req.body;
+        const { 
+            notes, 
+            interfaceName, 
+            enabled,
+            ip,
+            allowedIPs,
+            endpoint,
+            dns,
+            persistentKeepalive
+        } = req.body;
         
         const client = await Client.findOne({ name: name.toLowerCase() });
         
         if (!client) {
             return res.status(404).json({
                 success: false,
-                error: `Client "${name}" not found`
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
+            });
+        }
+        
+        // Validate IP format if provided
+        if (ip && !/^10\.0\.0\.\d{1,3}\/32$/.test(ip)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid IP format. Must be in format 10.0.0.X/32",
+                error: "INVALID_IP"
+            });
+        }
+        
+        if (allowedIPs && !/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(allowedIPs) && allowedIPs !== "0.0.0.0/0") {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid allowedIPs format",
+                error: "INVALID_IP"
             });
         }
         
@@ -843,6 +1204,11 @@ app.put("/api/clients/:name", async (req, res) => {
         if (notes !== undefined) updateData.notes = notes;
         if (interfaceName !== undefined) updateData.interfaceName = interfaceName;
         if (typeof enabled === 'boolean') updateData.enabled = enabled;
+        if (ip !== undefined) updateData.ip = ip;
+        if (allowedIPs !== undefined) updateData.allowedIPs = allowedIPs;
+        if (endpoint !== undefined) updateData.endpoint = endpoint;
+        if (dns !== undefined) updateData.dns = dns;
+        if (persistentKeepalive !== undefined) updateData.persistentKeepalive = persistentKeepalive;
         
         const updatedClient = await Client.findOneAndUpdate(
             { name: name.toLowerCase() },
@@ -850,35 +1216,50 @@ app.put("/api/clients/:name", async (req, res) => {
             { new: true }
         );
         
-        // Update WireGuard if enabled status changed
-        if (typeof enabled === 'boolean') {
-            if (enabled) {
+        // Update WireGuard if enabled status changed or IP changed
+        if (typeof enabled === 'boolean' || ip !== undefined) {
+            if (enabled !== false && updatedClient.enabled) {
                 try {
-                    await runCommand(`wg set wg0 peer ${updatedClient.publicKey} allowed-ips ${updatedClient.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
-                    console.log(`✅ Enabled client ${name} in WireGuard`);
+                    const keepalive = updatedClient.persistentKeepalive || KEEPALIVE_TIME;
+                    await runCommand(`wg set wg0 peer ${updatedClient.publicKey} allowed-ips ${updatedClient.ip} persistent-keepalive ${keepalive}`);
+                    console.log(`✅ Updated client ${name} in WireGuard`);
                 } catch (error) {
-                    console.warn(`⚠️  Could not enable client in WireGuard: ${error.message}`);
+                    console.warn(`⚠️  Could not update client in WireGuard: ${error.message}`);
                 }
-            } else {
+            } else if (enabled === false) {
                 try {
                     await runCommand(`wg set wg0 peer ${updatedClient.publicKey} remove`);
                     console.log(`✅ Disabled client ${name} in WireGuard`);
                 } catch (error) {
                     console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
                 }
+                
+                // Clear statistics for disabled client
+                await Client.updateOne(
+                    { _id: updatedClient._id },
+                    {
+                        $set: {
+                            lastHandshake: null,
+                            lastConnectionTime: null,
+                            lastConnectionIp: null,
+                            transferRx: 0,
+                            transferTx: 0
+                        }
+                    }
+                );
             }
         }
         
         res.json({
             success: true,
-            message: `Client "${name}" updated successfully`,
-            client: updatedClient.toSafeJSON()
+            message: "Client updated successfully"
         });
     } catch (error) {
         console.error("❌ Error updating client:", error);
         res.status(500).json({
             success: false,
-            error: "Failed to update client",
+            message: "Failed to update client",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
@@ -915,7 +1296,8 @@ app.post("/api/clients/:name/regenerate", async (req, res) => {
         // Add new peer to WireGuard if enabled
         if (client.enabled) {
             try {
-                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${client.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
+                const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
                 console.log(`✅ Added regenerated client ${name} to WireGuard`);
             } catch (error) {
                 console.warn(`⚠️  Could not add regenerated client to WireGuard: ${error.message}`);
@@ -924,8 +1306,11 @@ app.post("/api/clients/:name/regenerate", async (req, res) => {
         
         res.json({
             success: true,
-            message: `Client "${name}" keys regenerated successfully`,
-            client: client.toSafeJSON()
+            message: "Keys regenerated successfully",
+            data: {
+                publicKey: client.publicKey,
+                privateKey: client.privateKey
+            }
         });
     } catch (error) {
         console.error("❌ Error regenerating client keys:", error);
@@ -956,7 +1341,8 @@ app.post("/api/clients/:name/enable", async (req, res) => {
         
         // Add to WireGuard
         try {
-            await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
+            const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+            await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
             console.log(`✅ Enabled client ${name} in WireGuard`);
         } catch (error) {
             console.warn(`⚠️  Could not enable client in WireGuard: ${error.message}`);
@@ -964,8 +1350,7 @@ app.post("/api/clients/:name/enable", async (req, res) => {
         
         res.json({
             success: true,
-            message: `Client "${name}" enabled successfully`,
-            client: client.toSafeJSON()
+            message: "Client enabled successfully"
         });
     } catch (error) {
         console.error("❌ Error enabling client:", error);
@@ -990,7 +1375,8 @@ app.post("/api/clients/:name/disable", async (req, res) => {
         if (!client) {
             return res.status(404).json({
                 success: false,
-                error: `Client "${name}" not found`
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
             });
         }
         
@@ -1002,16 +1388,69 @@ app.post("/api/clients/:name/disable", async (req, res) => {
             console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
         }
         
+        // Clear statistics for disabled client
+        await Client.updateOne(
+            { _id: client._id },
+            {
+                $set: {
+                    lastHandshake: null,
+                    lastConnectionTime: null,
+                    lastConnectionIp: null,
+                    transferRx: 0,
+                    transferTx: 0
+                }
+            }
+        );
+        
         res.json({
             success: true,
-            message: `Client "${name}" disabled successfully`,
-            client: client.toSafeJSON()
+            message: "Client disabled successfully"
         });
     } catch (error) {
         console.error("❌ Error disabling client:", error);
         res.status(500).json({
             success: false,
             error: "Failed to disable client",
+            details: error.message
+        });
+    }
+});
+
+// Delete client
+app.delete("/api/clients/:name", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
+            });
+        }
+        
+        // Remove from WireGuard
+        try {
+            await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
+            console.log(`✅ Removed peer from WireGuard`);
+        } catch (error) {
+            console.warn("⚠️  Could not remove peer from WireGuard");
+        }
+        
+        // Delete from database
+        await Client.deleteOne({ name: name.toLowerCase() });
+        
+        res.json({
+            success: true,
+            message: "Client deleted successfully"
+        });
+    } catch (error) {
+        console.error("❌ Error deleting client:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to delete client",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
@@ -1025,7 +1464,8 @@ app.post("/api/clients/bulk-delete", async (req, res) => {
         if (!Array.isArray(names) || names.length === 0) {
             return res.status(400).json({
                 success: false,
-                error: "Names array is required and must not be empty"
+                message: "Names array is required and must not be empty",
+                error: "VALIDATION_ERROR"
             });
         }
         
@@ -1035,7 +1475,8 @@ app.post("/api/clients/bulk-delete", async (req, res) => {
         if (clients.length === 0) {
             return res.status(404).json({
                 success: false,
-                error: "No clients found to delete"
+                message: "No clients found to delete",
+                error: "CLIENT_NOT_FOUND"
             });
         }
         
@@ -1061,7 +1502,8 @@ app.post("/api/clients/bulk-delete", async (req, res) => {
         console.error("❌ Error bulk deleting clients:", error);
         res.status(500).json({
             success: false,
-            error: "Failed to delete clients",
+            message: "Failed to delete clients",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
@@ -1073,7 +1515,8 @@ app.get("/api/admin/stats", async (req, res) => {
         if (!dbInitialized) {
             return res.status(503).json({
                 success: false,
-                error: "Database not initialized"
+                message: "Database not initialized",
+                error: "WIREGUARD_ERROR"
             });
         }
         
@@ -1084,14 +1527,51 @@ app.get("/api/admin/stats", async (req, res) => {
             Client.find().sort({ createdAt: -1 }).limit(5)
         ]);
         
-        // Get WireGuard status
+        // Get WireGuard status with detailed connection info
         let wgStatus = null;
+        let connectedDetails = [];
         try {
             const wgShow = await runCommand("wg show wg0 dump");
             const peers = wgShow.trim().split('\n').filter(line => line.trim());
+            
+            // Parse peer details and match with clients
+            for (const peerLine of peers) {
+                const parts = peerLine.split('\t');
+                if (parts.length >= 7) {
+                    const publicKey = parts[0].trim();
+                    const endpoint = parts[1];
+                    const lastHandshake = parts[3];
+                    
+                    // Find matching client (only enabled ones)
+                    const client = await Client.findOne({ publicKey: publicKey.trim(), enabled: true });
+                    if (client) {
+                        let handshakeTime = null;
+                        if (lastHandshake && lastHandshake.trim() !== '' && lastHandshake.trim() !== '0') {
+                            const handshakeSeconds = parseInt(lastHandshake.trim());
+                            if (!isNaN(handshakeSeconds) && handshakeSeconds > 0) {
+                                const date = new Date(handshakeSeconds * 1000);
+                                const now = new Date();
+                                const minDate = new Date('2020-01-01');
+                                if (date instanceof Date && !isNaN(date.getTime()) && date >= minDate && date <= now) {
+                                    handshakeTime = date;
+                                }
+                            }
+                        }
+                        
+                        const timeAgo = handshakeTime 
+                            ? getTimeAgo(handshakeTime)
+                            : 'Never';
+                        
+                        connectedDetails.push(
+                            `${client.name} - ${client.ip} - Last seen: ${timeAgo}`
+                        );
+                    }
+                }
+            }
+            
             wgStatus = {
                 connected: peers.length,
-                details: peers
+                details: connectedDetails.length > 0 ? connectedDetails : peers
             };
         } catch (error) {
             wgStatus = {
@@ -1109,18 +1589,39 @@ app.get("/api/admin/stats", async (req, res) => {
                     disabled: disabledClients
                 },
                 wireguard: wgStatus,
-                recent: recentClients.map(c => c.toSafeJSON())
+                recent: recentClients.map(c => {
+                    const safe = c.toSafeJSON();
+                    return {
+                        name: safe.name,
+                        lastHandshake: c.lastHandshake ? c.lastHandshake.toISOString() : null,
+                        transferRx: c.transferRx || 0,
+                        transferTx: c.transferTx || 0
+                    };
+                })
             }
         });
     } catch (error) {
         console.error("❌ Error getting stats:", error);
         res.status(500).json({
             success: false,
-            error: "Failed to get statistics",
+            message: "Failed to get statistics",
+            error: "WIREGUARD_ERROR",
             details: error.message
         });
     }
 });
+
+// Helper function to get time ago string
+function getTimeAgo(date) {
+    const seconds = Math.floor((new Date() - date) / 1000);
+    if (seconds < 60) return `${seconds} seconds ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} minutes ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} hours ago`;
+    const days = Math.floor(hours / 24);
+    return `${days} days ago`;
+}
 
 // Update client (enable/disable, notes) - Legacy
 app.patch("/clients/:name", async (req, res) => {
@@ -1150,7 +1651,8 @@ app.patch("/clients/:name", async (req, res) => {
             if (enabled) {
                 // Add to WireGuard
                 try {
-                    await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${KEEPALIVE_TIME}`);
+                    const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+                    await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
                     console.log(`✅ Enabled client ${client.name} in WireGuard`);
                 } catch (error) {
                     console.warn(`⚠️  Could not enable client in WireGuard: ${error.message}`);
@@ -1163,6 +1665,20 @@ app.patch("/clients/:name", async (req, res) => {
                 } catch (error) {
                     console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
                 }
+                
+                // Clear statistics for disabled client
+                await Client.updateOne(
+                    { _id: client._id },
+                    {
+                        $set: {
+                            lastHandshake: null,
+                            lastConnectionTime: null,
+                            lastConnectionIp: null,
+                            transferRx: 0,
+                            transferTx: 0
+                        }
+                    }
+                );
             }
         }
         
@@ -1253,6 +1769,8 @@ app.get("/", (req, res) => {
             "GET /api/clients/:name": "Get client details",
             "GET /api/clients/:name/config": "Get WireGuard config file",
             "GET /api/clients/:name/mikrotik": "Get MikroTik script",
+            "GET /api/clients/:name/autoconfig": "Get MikroTik auto-config script",
+            "POST /api/clients/:name/ping": "Ping remote server from client",
             "POST /api/clients": "Create new client",
             "PUT /api/clients/:name": "Update client",
             "DELETE /api/clients/:name": "Delete client",
@@ -1260,7 +1778,7 @@ app.get("/", (req, res) => {
             "POST /api/clients/:name/enable": "Enable client",
             "POST /api/clients/:name/disable": "Disable client",
             "POST /api/clients/bulk-delete": "Bulk delete clients",
-            "GET /api/admin/stats": "Get statistics",
+            "GET /api/admin/stats": "Get statistics with real-time connection details",
             "POST /generate-client": "Generate new client (legacy)",
             "POST /generate-mikrotik": "Generate MikroTik script (legacy)",
             "GET /mt/:name": "Get MikroTik script (short URL)",
