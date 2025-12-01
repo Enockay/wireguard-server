@@ -864,45 +864,83 @@ app.get("/api/clients/:name/autoconfig", async (req, res) => {
         const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
         const serverWgIp = "10.0.0.1";
         
-        // Generate comprehensive MikroTik auto-config script
+        // Generate smart MikroTik auto-config script with connectivity check
         const autoconfigScript = `# WireGuard Auto-Configuration Script
 # Generated: ${new Date().toISOString()}
 # Client: ${client.name}
 
-# Remove existing interface if present
-/interface/wireguard/remove [find name="${ifaceName}"]
+# Variables
+:local IFACE "${ifaceName}"
+:local CLIENT_IP "${client.ip}"
+:local SERVER_PUBKEY "${serverPublicKey}"
+:local SERVER_HOST "${serverHost}"
+:local SERVER_PORT "${serverPort}"
+:local ALLOWED "${allowed}"
+:local DNS_SERVERS "${dns.replace(/,/g, ',')}"
+:local KEEPALIVE ${keepalive}
+:local SERVER_WG_IP "${serverWgIp}"
+:local CLIENT_PRIVKEY "${client.privateKey}"
+
+# If interface already exists, test connectivity first
+:if ([/interface/wireguard/print count-only where name=$IFACE] > 0) do={
+    :put "WireGuard interface $IFACE already exists, testing connectivity..."
+    :local success 0
+    :do {
+        /ping $SERVER_WG_IP count=3 timeout=2s
+        :set success 1
+    } on-error={ :set success 0 }
+
+    :if ($success = 1) do={
+        :put "WireGuard for client '${client.name}' already configured and working. No changes made."
+        :return
+    } else={
+        :put "Existing WireGuard config for client '${client.name}' not working. Reinstalling..."
+
+        # Remove routes using this interface
+        /ip/route/remove [find where gateway=$IFACE]
+
+        # Remove addresses on this interface
+        /ip/address/remove [find where interface=$IFACE]
+
+        # Remove peers on this interface
+        /interface/wireguard/peers/remove [find where interface=$IFACE]
+
+        # Remove the interface itself
+        /interface/wireguard/remove [find name=$IFACE]
+    }
+}
 
 # Create WireGuard interface
-/interface/wireguard/add name=${ifaceName} listen-port=51820 mtu=1420 private-key="${client.privateKey}"
+/interface/wireguard/add name=$IFACE listen-port=51820 mtu=1420 private-key="$CLIENT_PRIVKEY"
 
-# Add peer configuration
-/interface/wireguard/peers/add interface=${ifaceName} public-key="${serverPublicKey}" endpoint-address=${serverHost} endpoint-port=${serverPort} allowed-address=${allowed} persistent-keepalive=${keepalive}s
+# Add peer configuration (server)
+/interface/wireguard/peers/add interface=$IFACE public-key="$SERVER_PUBKEY" endpoint-address=$SERVER_HOST endpoint-port=$SERVER_PORT allowed-address=$ALLOWED persistent-keepalive=$KEEPALIVE
 
-# Assign IP address
-/ip/address/add address=${client.ip} interface=${ifaceName}
+# Assign IP address to interface
+/ip/address/add address=$CLIENT_IP interface=$IFACE
 
 # Configure DNS
-/ip/dns/set servers=${dns.replace(/,/g, ',')}
+/ip/dns/set servers=$DNS_SERVERS
 
 # Enable interface
-/interface/wireguard/set ${ifaceName} disabled=no
+/interface/wireguard/set $IFACE disabled=no
 
 # Add routing if needed
-/ip/route/add dst-address=${allowed} gateway=${ifaceName} comment="WireGuard VPN Route"
+/ip/route/add dst-address=$ALLOWED gateway=$IFACE comment="WireGuard VPN Route"
 
 # Test connectivity
 :delay 2
 :local success 0
 :do {
-  /ping ${serverWgIp} count=3 timeout=2s
-  :set success 1
+    /ping $SERVER_WG_IP count=3 timeout=2s
+    :set success 1
 } on-error={ :set success 0 }
 
-# Success message
-:if ($success = 1) do={ 
-  :put "WireGuard client '${client.name}' configured successfully! Ping to ${serverWgIp} succeeded."
-} else={ 
-  :put "WireGuard client '${client.name}' configured but ping to ${serverWgIp} failed. Check firewall/connectivity."
+# Success / fail message
+:if ($success = 1) do={
+    :put "WireGuard client '${client.name}' configured successfully! Ping to $SERVER_WG_IP succeeded."
+} else={
+    :put "WireGuard client '${client.name}' configured but ping to $SERVER_WG_IP failed. Check firewall/connectivity."
 }`;
         
         res.setHeader('Content-Type', 'text/plain');
@@ -910,6 +948,128 @@ app.get("/api/clients/:name/autoconfig", async (req, res) => {
         res.send(autoconfigScript);
     } catch (error) {
         console.error("❌ Error generating auto-config:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to generate auto-config script",
+            error: "WIREGUARD_ERROR",
+            details: error.message
+        });
+    }
+});
+
+// Friendly short URL for MikroTik auto-config:
+// Example usage on MikroTik:
+// /tool/fetch url="https://vpn.blackie-networks.com/enockmikrotik/configure" dst-path=wg-config.rsc
+// /import file-name=wg-config.rsc
+app.get("/:name/configure", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+
+        if (!client) {
+            return res.status(404).json({
+                success: false,
+                message: `Client "${name}" not found`,
+                error: "CLIENT_NOT_FOUND"
+            });
+        }
+
+        const serverPublicKey = (await getServerPublicKey()).trim();
+        const serverEndpoint = client.endpoint || getServerEndpoint();
+        const serverEndpointParts = serverEndpoint.split(":");
+        const serverHost = serverEndpointParts[0];
+        const serverPort = serverEndpointParts[1] || "51820";
+
+        const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, "-");
+        const allowed = client.allowedIPs || "0.0.0.0/0";
+        const dns = client.dns || "8.8.8.8, 1.1.1.1";
+        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const serverWgIp = "10.0.0.1";
+
+        // Generate smart MikroTik auto-config script with connectivity check
+        const autoconfigScript = `# WireGuard Auto-Configuration Script
+# Generated: ${new Date().toISOString()}
+# Client: ${client.name}
+
+# Variables
+:local IFACE "${ifaceName}"
+:local CLIENT_IP "${client.ip}"
+:local SERVER_PUBKEY "${serverPublicKey}"
+:local SERVER_HOST "${serverHost}"
+:local SERVER_PORT "${serverPort}"
+:local ALLOWED "${allowed}"
+:local DNS_SERVERS "${dns.replace(/,/g, ',')}"
+:local KEEPALIVE ${keepalive}
+:local SERVER_WG_IP "${serverWgIp}"
+:local CLIENT_PRIVKEY "${client.privateKey}"
+
+# If interface already exists, test connectivity first
+:if ([/interface/wireguard/print count-only where name=$IFACE] > 0) do={
+    :put "WireGuard interface $IFACE already exists, testing connectivity..."
+    :local success 0
+    :do {
+        /ping $SERVER_WG_IP count=3 timeout=2s
+        :set success 1
+    } on-error={ :set success 0 }
+
+    :if ($success = 1) do={
+        :put "WireGuard for client '${client.name}' already configured and working. No changes made."
+        :return
+    } else={
+        :put "Existing WireGuard config for client '${client.name}' not working. Reinstalling..."
+
+        # Remove routes using this interface
+        /ip/route/remove [find where gateway=$IFACE]
+
+        # Remove addresses on this interface
+        /ip/address/remove [find where interface=$IFACE]
+
+        # Remove peers on this interface
+        /interface/wireguard/peers/remove [find where interface=$IFACE]
+
+        # Remove the interface itself
+        /interface/wireguard/remove [find name=$IFACE]
+    }
+}
+
+# Create WireGuard interface
+/interface/wireguard/add name=$IFACE listen-port=51820 mtu=1420 private-key="$CLIENT_PRIVKEY"
+
+# Add peer configuration (server)
+/interface/wireguard/peers/add interface=$IFACE public-key="$SERVER_PUBKEY" endpoint-address=$SERVER_HOST endpoint-port=$SERVER_PORT allowed-address=$ALLOWED persistent-keepalive=$KEEPALIVE
+
+# Assign IP address to interface
+/ip/address/add address=$CLIENT_IP interface=$IFACE
+
+# Configure DNS
+/ip/dns/set servers=$DNS_SERVERS
+
+# Enable interface
+/interface/wireguard/set $IFACE disabled=no
+
+# Add routing if needed
+/ip/route/add dst-address=$ALLOWED gateway=$IFACE comment="WireGuard VPN Route"
+
+# Test connectivity
+:delay 2
+:local success 0
+:do {
+    /ping $SERVER_WG_IP count=3 timeout=2s
+    :set success 1
+} on-error={ :set success 0 }
+
+# Success / fail message
+:if ($success = 1) do={
+    :put "WireGuard client '${client.name}' configured successfully! Ping to $SERVER_WG_IP succeeded."
+} else={
+    :put "WireGuard client '${client.name}' configured but ping to $SERVER_WG_IP failed. Check firewall/connectivity."
+}`;
+
+        res.setHeader("Content-Type", "text/plain");
+        res.setHeader("Content-Disposition", `attachment; filename="${client.name}-autoconfig.rsc"`);
+        res.send(autoconfigScript);
+    } catch (error) {
+        console.error("❌ Error generating short-url auto-config:", error);
         res.status(500).json({
             success: false,
             message: "Failed to generate auto-config script",
