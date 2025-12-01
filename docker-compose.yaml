@@ -2,10 +2,12 @@ version: '3.8'
 
 services:
   wireguard:
-    build: .
-    container_name: ${COOLIFY_CONTAINER_NAME:-blackie-wireguard}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${COOLIFY_CONTAINER_NAME:-wireguard}
     restart: unless-stopped
-    privileged: true  # REQUIRED: Enable in Coolify UI → Settings → Advanced → Privileged Mode
+    privileged: true  # REQUIRED: Enable in Coolify UI → Settings → Advanced → Privileged Mode (see Dockerfile comments)
     cap_add:
       - NET_ADMIN      # REQUIRED: Add in Coolify UI → Settings → Advanced → Capabilities
       - SYS_MODULE     # REQUIRED: Add in Coolify UI → Settings → Advanced → Capabilities
@@ -14,8 +16,8 @@ services:
       - net.ipv4.conf.all.forwarding=1
       - net.ipv6.conf.all.forwarding=1
     ports:
-      - "51820:51820/udp"  # WireGuard port
-      - "5000:5000/tcp"    # API port
+      - "51820:51820/udp"  # WireGuard port (matches Dockerfile EXPOSE)
+      - "5000:5000/tcp"    # API port (matches Dockerfile EXPOSE)
     environment:
       - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
       - MONGO_URI=${MONGO_URI}
@@ -25,6 +27,12 @@ services:
       - COOLIFY_BRANCH=${COOLIFY_BRANCH}
       - COOLIFY_RESOURCE_UUID=${COOLIFY_RESOURCE_UUID}
       - COOLIFY_CONTAINER_NAME=${COOLIFY_CONTAINER_NAME}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - coolify
 

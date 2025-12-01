@@ -2,23 +2,36 @@ version: '3.8'
 
 services:
   wireguard:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: wireguard
     restart: unless-stopped
-    privileged: true  # Required for WireGuard on most VPS systems
+    privileged: true  # Required for WireGuard to create network interfaces (see Dockerfile comments)
+    cap_add:
+      - NET_ADMIN      # Required for network interface management
+      - SYS_MODULE     # Required for kernel module operations
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.forwarding=1
       - net.ipv6.conf.all.forwarding=1
     ports:
-      - "51820:51820/udp"
-      - "5000:5000/tcp"
+      - "51820:51820/udp"  # WireGuard port (matches Dockerfile EXPOSE)
+      - "5000:5000/tcp"    # API port (matches Dockerfile EXPOSE)
     env_file:
-      - .env
+      - .env  # Loads WIREGUARD_PRIVATE_KEY (see Dockerfile comments)
     environment:
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
       - MONGO_URI=mongodb://mongo:27017/wireguard
+      - SERVER_ENDPOINT=${SERVER_ENDPOINT:-YOUR_SERVER_IP:51820}
     depends_on:
       - mongo
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - wireguard-net
 
