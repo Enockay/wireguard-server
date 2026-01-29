@@ -655,50 +655,13 @@ app.get("/:name/configure", async (req, res) => {
         const serverHost = serverEndpointParts[0];
         const serverPort = serverEndpointParts[1] || '51820';
         
-        const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
-        const allowed = client.allowedIPs || "0.0.0.0/0";
-        const dns = client.dns || "8.8.8.8, 1.1.1.1";
+        const ifaceName = (client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+        const allowed = client.allowedIPs || "10.0.0.0/24";
         const keepalive = validateKeepalive(client.persistentKeepalive);
-        const serverWgIp = "10.0.0.1";
         
-        // Format DNS servers properly (remove spaces, ensure comma separation)
-        const dnsServers = dns ? dns.replace(/\s*,\s*/g, ',').replace(/\s+/g, ',') : '8.8.8.8';
-        
-        const autoconfigScript = `# WireGuard Auto-Configuration Script
-# Generated: ${new Date().toISOString()}
-# Client: ${client.name}
-
-# Remove existing interface if present
-/interface/wireguard/remove [find name="${ifaceName}"]
-
-# Create WireGuard interface
-/interface/wireguard/add name=${ifaceName} listen-port=51820 mtu=1420 private-key="${client.privateKey}"
-
-# Add peer configuration
-/interface/wireguard/peers/add interface=${ifaceName} public-key="${serverPublicKey}" endpoint-address=${serverHost} endpoint-port=${serverPort} allowed-address=${allowed} persistent-keepalive=${keepalive}
-
-# Assign IP address
-/ip/address/add address=${client.ip} interface=${ifaceName}
-
-# Configure DNS
-/ip/dns/set servers=${dnsServers}
-
-# Enable interface
-/interface/wireguard/set ${ifaceName} disabled=no
-
-# Add routing if needed
-/ip/route/add dst-address=${allowed} gateway=${ifaceName} comment="WireGuard VPN Route"
-
-# Test connectivity
-:delay 2
-:local success 0
-:do {
-  /ping ${serverWgIp} count=3 timeout=2s
-  :set success 1
-} on-error={ :set success 0 }
-
-# Success message
-:if ($success = 1) do={:put "WireGuard client ${client.name} configured successfully! Ping to ${serverWgIp} succeeded."} else={:put "WireGuard client ${client.name} configured but ping to ${serverWgIp} failed. Check firewall/connectivity."}`;
+        // Generate minified MikroTik script (single line, no comments) - same format as working script
+        // This format works when fetched via /tool/fetch and imported
+        const autoconfigScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
         
         res.setHeader('Content-Type', 'text/plain');
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);
@@ -1043,53 +1006,6 @@ app.get("/api/clients/:name/autoconfig", async (req, res) => {
         res.send(autoconfigScript);
     } catch (error) {
         console.error("❌ Error generating auto-config:", error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to generate auto-config script",
-            error: "WIREGUARD_ERROR",
-            details: error.message
-        });
-    }
-});
-
-// Friendly short URL for MikroTik auto-config:
-// Example usage on MikroTik:
-// /tool/fetch url="https://vpn.blackie-networks.com/enockmikrotik/configure" dst-path=wg-config.rsc
-// /import file-name=wg-config.rsc
-app.get("/:name/configure", async (req, res) => {
-    try {
-        const { name } = req.params;
-        const client = await Client.findOne({ name: name.toLowerCase() });
-
-        if (!client) {
-            return res.status(404).json({
-                success: false,
-                message: `Client "${name}" not found`,
-                error: "CLIENT_NOT_FOUND"
-            });
-        }
-
-        const serverPublicKey = (await getServerPublicKey()).trim();
-        const serverEndpoint = client.endpoint || getServerEndpoint();
-        const serverEndpointParts = serverEndpoint.split(":");
-        const serverHost = serverEndpointParts[0];
-        const serverPort = serverEndpointParts[1] || "51820";
-
-        const ifaceName = (client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, "-");
-        const allowed = client.allowedIPs || "10.0.0.0/24";
-        const keepalive = validateKeepalive(client.persistentKeepalive);
-
-        // Generate minified MikroTik script (single line, no comments) - same format as working script
-        // Order: create interface -> set keys -> enable -> add IP -> add peer -> add route -> test ping
-        // Route ensures traffic to allowed subnet (10.0.0.0/24) goes through WireGuard interface
-        // The route with gateway=$IFACE will route ping traffic to 10.0.0.1 through the tunnel
-        const autoconfigScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
-
-        res.setHeader("Content-Type", "text/plain");
-        res.setHeader("Content-Disposition", `attachment; filename="${client.name}-autoconfig.rsc"`);
-        res.send(autoconfigScript);
-    } catch (error) {
-        console.error("❌ Error generating short-url auto-config:", error);
         res.status(500).json({
             success: false,
             message: "Failed to generate auto-config script",
