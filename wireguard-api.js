@@ -621,6 +621,77 @@ app.get("/mt/:name", async (req, res) => {
     }
 });
 
+// MikroTik Auto-Configure (Direct URL)
+app.get("/:name/configure", async (req, res) => {
+    try {
+        const { name } = req.params;
+        const client = await Client.findOne({ name: name.toLowerCase() });
+        
+        if (!client) {
+            return res.status(404).send(`Client "${name}" not found`);
+        }
+        
+        const serverPublicKey = (await getServerPublicKey()).trim();
+        const serverEndpoint = client.endpoint || getServerEndpoint();
+        const serverEndpointParts = serverEndpoint.split(':');
+        const serverHost = serverEndpointParts[0];
+        const serverPort = serverEndpointParts[1] || '51820';
+        
+        const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+        const allowed = client.allowedIPs || "0.0.0.0/0";
+        const dns = client.dns || "8.8.8.8, 1.1.1.1";
+        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const serverWgIp = "10.0.0.1";
+        
+        const autoconfigScript = `# WireGuard Auto-Configuration Script
+# Generated: ${new Date().toISOString()}
+# Client: ${client.name}
+
+# Remove existing interface if present
+/interface/wireguard/remove [find name="${ifaceName}"]
+
+# Create WireGuard interface
+/interface/wireguard/add name=${ifaceName} listen-port=51820 mtu=1420 private-key="${client.privateKey}"
+
+# Add peer configuration
+/interface/wireguard/peers/add interface=${ifaceName} public-key="${serverPublicKey}" endpoint-address=${serverHost} endpoint-port=${serverPort} allowed-address=${allowed} persistent-keepalive=${keepalive}s
+
+# Assign IP address
+/ip/address/add address=${client.ip} interface=${ifaceName}
+
+# Configure DNS
+/ip/dns/set servers=${dns.replace(/,/g, ',')}
+
+# Enable interface
+/interface/wireguard/set ${ifaceName} disabled=no
+
+# Add routing if needed
+/ip/route/add dst-address=${allowed} gateway=${ifaceName} comment="WireGuard VPN Route"
+
+# Test connectivity
+:delay 2
+:local success 0
+:do {
+  /ping ${serverWgIp} count=3 timeout=2s
+  :set success 1
+} on-error={ :set success 0 }
+
+# Success message
+:if ($success = 1) do={ 
+  :put "WireGuard client '${client.name}' configured successfully! Ping to ${serverWgIp} succeeded."
+} else={ 
+  :put "WireGuard client '${client.name}' configured but ping to ${serverWgIp} failed. Check firewall/connectivity."
+}`;
+        
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);
+        res.send(autoconfigScript);
+    } catch (error) {
+        console.error("❌ Error generating auto-config:", error);
+        res.status(500).send("Failed to generate auto-config script");
+    }
+});
+
 // Get all connected peers
 app.get("/list-peers", async (req, res) => {
     try {
