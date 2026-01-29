@@ -42,6 +42,23 @@ const KEEPALIVE_TIME = 25; // Keepalive interval (in seconds)
 const STARTING_CLIENT_IP = 6; // Start assigning IPs from 10.0.0.6 (1=server, 2-5=preconfigured)
 const STATS_UPDATE_INTERVAL = 30000; // Update statistics every 30 seconds
 
+// Helper function to validate and normalize persistent keepalive value
+function validateKeepalive(value) {
+    const keepalive = parseInt(value);
+    if (isNaN(keepalive) || keepalive < 0 || keepalive > 65535) {
+        return KEEPALIVE_TIME;
+    }
+    return keepalive;
+}
+
+// Helper function to strip CIDR notation from IP address
+function stripCidr(ip) {
+    if (typeof ip === 'string' && ip.includes('/')) {
+        return ip.split('/')[0];
+    }
+    return ip;
+}
+
 // Initialize MongoDB connection
 let dbInitialized = false;
 (async () => {
@@ -95,7 +112,7 @@ async function loadClientsFromDatabase() {
         
         for (const client of clients) {
             try {
-                const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+                const keepalive = validateKeepalive(client.persistentKeepalive);
                 await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
                 console.log(`✅ Loaded client: ${client.name} (${client.ip})`);
             } catch (error) {
@@ -641,8 +658,11 @@ app.get("/:name/configure", async (req, res) => {
         const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
         const allowed = client.allowedIPs || "0.0.0.0/0";
         const dns = client.dns || "8.8.8.8, 1.1.1.1";
-        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const keepalive = validateKeepalive(client.persistentKeepalive);
         const serverWgIp = "10.0.0.1";
+        
+        // Format DNS servers properly (remove spaces, ensure comma separation)
+        const dnsServers = dns ? dns.replace(/\s*,\s*/g, ',').replace(/\s+/g, ',') : '8.8.8.8';
         
         const autoconfigScript = `# WireGuard Auto-Configuration Script
 # Generated: ${new Date().toISOString()}
@@ -655,13 +675,13 @@ app.get("/:name/configure", async (req, res) => {
 /interface/wireguard/add name=${ifaceName} listen-port=51820 mtu=1420 private-key="${client.privateKey}"
 
 # Add peer configuration
-/interface/wireguard/peers/add interface=${ifaceName} public-key="${serverPublicKey}" endpoint-address=${serverHost} endpoint-port=${serverPort} allowed-address=${allowed} persistent-keepalive=${keepalive}s
+/interface/wireguard/peers/add interface=${ifaceName} public-key="${serverPublicKey}" endpoint-address=${serverHost} endpoint-port=${serverPort} allowed-address=${allowed} persistent-keepalive=${keepalive}
 
 # Assign IP address
 /ip/address/add address=${client.ip} interface=${ifaceName}
 
 # Configure DNS
-/ip/dns/set servers=${dns.replace(/,/g, ',')}
+/ip/dns/set servers=${dnsServers}
 
 # Enable interface
 /interface/wireguard/set ${ifaceName} disabled=no
@@ -678,11 +698,7 @@ app.get("/:name/configure", async (req, res) => {
 } on-error={ :set success 0 }
 
 # Success message
-:if ($success = 1) do={ 
-  :put "WireGuard client '${client.name}' configured successfully! Ping to ${serverWgIp} succeeded."
-} else={ 
-  :put "WireGuard client '${client.name}' configured but ping to ${serverWgIp} failed. Check firewall/connectivity."
-}`;
+:if ($success = 1) do={:put "WireGuard client ${client.name} configured successfully! Ping to ${serverWgIp} succeeded."} else={:put "WireGuard client ${client.name} configured but ping to ${serverWgIp} failed. Check firewall/connectivity."}`;
         
         res.setHeader('Content-Type', 'text/plain');
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);
@@ -886,7 +902,7 @@ app.get("/api/clients/:name/config", async (req, res) => {
         // Generate complete client configuration
         const dns = client.dns || "";
         const allowedIPs = client.allowedIPs || "0.0.0.0/0";
-        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const keepalive = validateKeepalive(client.persistentKeepalive);
         
         let clientConfig = `[Interface]
 PrivateKey = ${client.privateKey}
@@ -940,7 +956,7 @@ app.get("/api/clients/:name/autoconfig", async (req, res) => {
         const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
         const allowed = client.allowedIPs || "0.0.0.0/0";
         const dns = client.dns || "8.8.8.8, 1.1.1.1";
-        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const keepalive = validateKeepalive(client.persistentKeepalive);
         const serverWgIp = "10.0.0.1";
         
         // Generate smart MikroTik auto-config script with connectivity check
@@ -1061,7 +1077,7 @@ app.get("/:name/configure", async (req, res) => {
 
         const ifaceName = (client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, "-");
         const allowed = client.allowedIPs || "10.0.0.0/24";
-        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const keepalive = validateKeepalive(client.persistentKeepalive);
 
         // Generate minified MikroTik script (single line, no comments) - same format as working script
         // Order: create interface -> set keys -> enable -> add IP -> add peer -> add route -> test ping
@@ -1153,7 +1169,7 @@ app.get("/api/clients/:name/mikrotik", async (req, res) => {
         
         const ifaceName = (iface || client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
         const allowed = (subnet || client.allowedIPs || "0.0.0.0/0").toString();
-        const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+        const keepalive = validateKeepalive(client.persistentKeepalive);
         
         // Generate MikroTik script
         const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
@@ -1280,7 +1296,8 @@ app.post("/api/clients", async (req, res) => {
         // Add to WireGuard if enabled
         if (enabled) {
             try {
-                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIp} persistent-keepalive ${persistentKeepalive}`);
+                const keepalive = validateKeepalive(persistentKeepalive);
+                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIp} persistent-keepalive ${keepalive}`);
                 console.log(`✅ Added client ${clientName} to WireGuard`);
             } catch (error) {
                 console.warn(`⚠️  Could not add client to WireGuard: ${error.message}`);
@@ -1372,7 +1389,7 @@ app.put("/api/clients/:name", async (req, res) => {
         if (allowedIPs !== undefined) updateData.allowedIPs = allowedIPs;
         if (endpoint !== undefined) updateData.endpoint = endpoint;
         if (dns !== undefined) updateData.dns = dns;
-        if (persistentKeepalive !== undefined) updateData.persistentKeepalive = persistentKeepalive;
+        if (persistentKeepalive !== undefined) updateData.persistentKeepalive = validateKeepalive(persistentKeepalive);
         
         const updatedClient = await Client.findOneAndUpdate(
             { name: name.toLowerCase() },
@@ -1384,7 +1401,7 @@ app.put("/api/clients/:name", async (req, res) => {
         if (typeof enabled === 'boolean' || ip !== undefined) {
             if (enabled !== false && updatedClient.enabled) {
                 try {
-                    const keepalive = updatedClient.persistentKeepalive || KEEPALIVE_TIME;
+                    const keepalive = validateKeepalive(updatedClient.persistentKeepalive);
                     await runCommand(`wg set wg0 peer ${updatedClient.publicKey} allowed-ips ${updatedClient.ip} persistent-keepalive ${keepalive}`);
                     console.log(`✅ Updated client ${name} in WireGuard`);
                 } catch (error) {
@@ -1460,7 +1477,7 @@ app.post("/api/clients/:name/regenerate", async (req, res) => {
         // Add new peer to WireGuard if enabled
         if (client.enabled) {
             try {
-                const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+                const keepalive = validateKeepalive(client.persistentKeepalive);
                 await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
                 console.log(`✅ Added regenerated client ${name} to WireGuard`);
             } catch (error) {
@@ -1505,7 +1522,7 @@ app.post("/api/clients/:name/enable", async (req, res) => {
         
         // Add to WireGuard
         try {
-            const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+            const keepalive = validateKeepalive(client.persistentKeepalive);
             await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
             console.log(`✅ Enabled client ${name} in WireGuard`);
         } catch (error) {
@@ -1815,7 +1832,7 @@ app.patch("/clients/:name", async (req, res) => {
             if (enabled) {
                 // Add to WireGuard
                 try {
-                    const keepalive = client.persistentKeepalive || KEEPALIVE_TIME;
+                    const keepalive = validateKeepalive(client.persistentKeepalive);
                     await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
                     console.log(`✅ Enabled client ${client.name} in WireGuard`);
                 } catch (error) {
