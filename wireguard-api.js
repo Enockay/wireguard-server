@@ -12,7 +12,8 @@ const app = express();
 const allowedOrigins = [
     "https://admin.blackie-networks.com",
     "https://blackie-softwareadmin-enockays-projects.vercel.app",
-    "http://localhost:5000"
+    "http://localhost:5000",
+    "http://localhost:5173"
 ];
 
 // Configure CORS with explicit origin validation
