@@ -68,22 +68,6 @@ services:
       retries: 3
       start_period: 40s
 
-  mongo:
-    image: mongo:latest
-    container_name: wireguard-mongo
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo_data:/data/db
-    networks:
-      - wireguard-net
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
 networks:
   wireguard-net:
     driver: bridge
