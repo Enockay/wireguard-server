@@ -49,6 +49,8 @@ services:
     container_name: wireguard-api
     restart: unless-stopped
     network_mode: "service:wireguard"  # Share WireGuard container's network namespace
+    cap_add:
+      - NET_ADMIN  # Required to run 'wg set' commands to modify WireGuard interface
     depends_on:
       - wireguard
       - mongo
@@ -67,6 +69,22 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  mongo:
+    image: mongo:latest
+    container_name: wireguard-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - wireguard-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 networks:
   wireguard-net:
