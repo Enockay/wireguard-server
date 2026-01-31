@@ -49,11 +49,12 @@ services:
     container_name: wireguard-api
     restart: unless-stopped
     network_mode: "service:wireguard"  # Share WireGuard container's network namespace
+    cap_add:
+      - NET_ADMIN  # Required to run 'wg set' commands to modify WireGuard interface
     depends_on:
       - wireguard
-      - mongo
     environment:
-      # MongoDB connection string (REQUIRED - set this in Coolify)
+      # MongoDB connection string (REQUIRED - use external MongoDB or set MONGO_URI)
       - MONGO_URI=${MONGO_URI:-mongodb://mongo:27017/wireguard}
       # Server endpoint for client configs
       - SERVER_ENDPOINT=${SERVER_ENDPOINT:-YOUR_SERVER_IP:51820}
@@ -68,25 +69,6 @@ services:
       retries: 3
       start_period: 40s
 
-  mongo:
-    image: mongo:latest
-    container_name: wireguard-mongo
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo_data:/data/db
-    networks:
-      - wireguard-net
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
 networks:
   wireguard-net:
     driver: bridge
-
-volumes:
-  mongo_data:
