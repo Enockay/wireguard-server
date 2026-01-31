@@ -1915,6 +1915,6 @@ app.get("/api/health", async (req, res) => {
     }
 });
 
-// Run API on TCP Port 5000
-const PORT = 5000;
+// Run API on TCP Port (default 5000, can be overridden via PORT env var)
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`✅ WireGuard API running on port ${PORT}`));
