@@ -1,0 +1,30 @@
+# API Server-only container
+# This container handles the REST API and shares WireGuard's network namespace
+FROM alpine:latest
+
+# Install Node.js, npm, and wireguard-tools (for wg commands)
+RUN apk update && \
+    apk add --no-cache \
+        nodejs \
+        npm \
+        wireguard-tools \
+        curl
+
+# Set working directory for API
+WORKDIR /app
+
+# Copy the API script and database files
+COPY wireguard-api.js /app/
+COPY db.js /app/
+COPY models /app/models/
+
+# Install API dependencies
+RUN npm init -y && npm install --no-audit --no-fund express body-parser cors mongoose
+
+# Expose API port (will be accessible through WireGuard container's network)
+EXPOSE 5000/tcp
+
+# Set entrypoint to API startup script
+COPY run-api.sh /run-api.sh
+RUN chmod +x /run-api.sh
+ENTRYPOINT ["/run-api.sh"]

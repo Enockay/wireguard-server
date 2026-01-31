@@ -1,13 +1,13 @@
-version: '3.8'
+version: '3.9'
 
 services:
   wireguard:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.wireguard
     container_name: wireguard
     restart: unless-stopped
-    privileged: true  # Required for WireGuard to create network interfaces (see Dockerfile comments)
+    privileged: true  # Required for WireGuard to create network interfaces
     cap_add:
       - NET_ADMIN      # Required for network interface management
       - SYS_MODULE     # Required for kernel module operations
@@ -15,25 +15,58 @@ services:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.forwarding=1
       - net.ipv6.conf.all.forwarding=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - /lib/modules:/lib/modules
     ports:
-      - "51820:51820/udp"  # WireGuard port (matches Dockerfile EXPOSE)
-      - "5000:5000/tcp"    # API port (matches Dockerfile EXPOSE)
+      # WireGuard VPN port (UDP)
+      - "51820:51820/udp"
+      # API port (exposed through WireGuard container's network)
+      - "${API_PORT:-5000}:5000/tcp"
     env_file:
-      - .env  # Loads WIREGUARD_PRIVATE_KEY (see Dockerfile comments)
+      - .env  # Loads WIREGUARD_PRIVATE_KEY
     environment:
       - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
-      - MONGO_URI=mongodb://mongo:27017/wireguard
-      - SERVER_ENDPOINT=${SERVER_ENDPOINT:-YOUR_SERVER_IP:51820}
-    depends_on:
-      - mongo
+      - TZ=${TZ:-UTC}
+    labels:
+      # Tell Coolify to use this container
+      - "coolify.managed=true"
+      - "coolify.name=wireguard-vpn"
+      - "coolify.http.port=5000"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5000/api/health || exit 1"]
+      test: ["CMD-SHELL", "wg show wg0 > /dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
     networks:
       - wireguard-net
+
+  wireguard-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: wireguard-api
+    restart: unless-stopped
+    network_mode: "service:wireguard"  # Share WireGuard container's network namespace
+    depends_on:
+      - wireguard
+      - mongo
+    environment:
+      # MongoDB connection string (REQUIRED - set this in Coolify)
+      - MONGO_URI=${MONGO_URI:-mongodb://mongo:27017/wireguard}
+      # Server endpoint for client configs
+      - SERVER_ENDPOINT=${SERVER_ENDPOINT:-YOUR_SERVER_IP:51820}
+      # Node environment
+      - NODE_ENV=${NODE_ENV:-production}
+      # API port (internal, shared with WireGuard container)
+      - PORT=5000
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   mongo:
     image: mongo:latest
@@ -45,6 +78,11 @@ services:
       - mongo_data:/data/db
     networks:
       - wireguard-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 networks:
   wireguard-net:
@@ -52,4 +90,3 @@ networks:
 
 volumes:
   mongo_data:
-

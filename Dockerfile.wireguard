@@ -1,0 +1,29 @@
+# WireGuard-only container
+# This container only handles WireGuard VPN networking
+FROM alpine:latest
+
+# Update package list and install WireGuard tools
+RUN apk update && \
+    apk add --no-cache \
+        wireguard-tools \
+        iproute2 \
+        bash \
+        iptables \
+        curl
+
+# Copy WireGuard configuration and startup script
+COPY wg0.conf /etc/wireguard/wg0.conf
+COPY run-wireguard.sh /run-wireguard.sh
+
+# Make sure the script is executable
+RUN chmod +x /run-wireguard.sh
+
+# Expose WireGuard port
+EXPOSE 51820/udp
+
+# Set entrypoint to WireGuard startup script
+ENTRYPOINT ["/run-wireguard.sh"]
+
+# Required runtime capabilities:
+# --privileged: Required for WireGuard to create network interfaces
+# -p 51820:51820/udp: WireGuard port

@@ -1,6 +1,15 @@
-# WireGuard VPN Server + Management API (Single-File Docs)
+# WireGuard VPN Server + Management API
 
 Self-hosted WireGuard server with a REST API, MongoDB persistence, and MikroTik auto-provisioning.
+
+## Architecture
+
+This setup uses **separated containers** to prevent connection drops:
+- **wireguard**: Handles VPN networking only (runs WireGuard interface)
+- **wireguard-api**: REST API server (shares WireGuard's network namespace)
+- **mongo**: MongoDB database for client persistence
+
+The API container uses `network_mode: "service:wireguard"` to share the WireGuard container's network stack, allowing it to manage WireGuard peers without interfering with VPN connections.
 
 ## Prerequisites
 
@@ -66,34 +75,27 @@ docker run -d \
   wireguard-vpn
 ```
 
-**Option B: Using Docker Compose** (Easier management)
+**Option B: Using Docker Compose** (Recommended - Separated Architecture)
 
-Create a `docker-compose.yml` file:
+The `docker-compose.yml` file is already configured with separated services:
 
-```yaml
-version: '3.8'
-
-services:
-  wireguard:
-    build: .
-    container_name: wireguard
-    restart: unless-stopped
-    privileged: true  # Required for WireGuard on most VPS systems
-    sysctls:
-      - net.ipv4.ip_forward=1
-      - net.ipv4.conf.all.forwarding=1
-      - net.ipv6.conf.all.forwarding=1
-    ports:
-      - "51820:51820/udp"
-      - "5000:5000/tcp"
-    env_file:
-      - .env
-```
-
-Then run:
 ```bash
+# Build and start all services
 docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# View specific service logs
+docker-compose logs -f wireguard      # VPN server
+docker-compose logs -f wireguard-api  # API server
+docker-compose logs -f mongo          # Database
 ```
+
+The compose file includes:
+- **wireguard**: VPN server container (privileged, handles networking)
+- **wireguard-api**: API server (shares WireGuard's network namespace)
+- **mongo**: MongoDB database
 
 ## API (Essential Endpoints)
 
@@ -123,11 +125,16 @@ curl -sS "http://YOUR_SERVER:5000/mt/device-1" -o mt.rsc
 ## Check Status
 
 ```bash
-# Check container logs
-docker logs wireguard
+# Check all container logs
+docker-compose logs -f
 
-# Or if using docker-compose
-docker-compose logs -f wireguard
+# Check specific service
+docker-compose logs -f wireguard      # VPN server
+docker-compose logs -f wireguard-api # API server
+
+# Or using docker directly
+docker logs wireguard
+docker logs wireguard-api
 ```
 
 ## Deployment to Fly.io
@@ -156,11 +163,14 @@ The container needs `NET_ADMIN` capability to manage network interfaces.
 
 ### Check WireGuard Status
 ```bash
-# Enter the container
+# Enter the WireGuard container
 docker exec -it wireguard bash
 
 # Check WireGuard status
 wg show
+
+# Or from API container (shares network namespace)
+docker exec -it wireguard-api wg show wg0
 ```
 
 ### View Logs
@@ -169,7 +179,18 @@ docker logs wireguard
 ```
 
 ### VPS/Coolify Notes
-- If running on a VPS or via Coolify, ensure the container is privileged or the host has the WireGuard module loaded.
-- Typical run flags: `--privileged` and `--sysctl net.ipv4.ip_forward=1`.
-- Coolify: expose ports 51820/udp and 5000/tcp, and add the privileged/cap capabilities in settings.
+- The `wireguard` container must run with `--privileged` or the host must have the WireGuard module loaded.
+- The `wireguard-api` container shares the WireGuard container's network namespace, so it doesn't need privileged mode.
+- Coolify: 
+  - Expose ports `51820/udp` (WireGuard) and `5000/tcp` (API)
+  - Set `wireguard` container to privileged mode
+  - The compose file includes Coolify labels for automatic configuration
+  - Environment variables: `WIREGUARD_PRIVATE_KEY`, `MONGO_URI`, `SERVER_ENDPOINT`
+
+### Why Separated Containers?
+Running WireGuard and the API in separate containers prevents connection drops because:
+1. WireGuard handles only VPN networking (no HTTP overhead)
+2. API server shares the network namespace but runs independently
+3. If the API restarts, VPN connections remain stable
+4. Better resource isolation and monitoring
 
