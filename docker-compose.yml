@@ -49,8 +49,6 @@ services:
     container_name: wireguard-api
     restart: unless-stopped
     network_mode: "service:wireguard"  # Share WireGuard container's network namespace
-    cap_add:
-      - NET_ADMIN  # Required to run 'wg set' commands to modify WireGuard interface
     depends_on:
       - wireguard
       - mongo
