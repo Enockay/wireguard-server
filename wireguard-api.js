@@ -306,8 +306,14 @@ let cachedServerPublicKey = null;
 async function getServerPublicKey() {
     if (cachedServerPublicKey) return cachedServerPublicKey;
     try {
-        cachedServerPublicKey = (await wgLock.run(() => runWgCommand(['show', 'wg0', 'public-key']))).trim();
-        return cachedServerPublicKey;
+        const key = (await wgLock.run(() => runWgCommand(['show', 'wg0', 'public-key']))).trim();
+        if (isValidWgKey(key)) {
+            cachedServerPublicKey = key;
+            return cachedServerPublicKey;
+        }
+        // wg returned a non-key value like "(none)" -- don't cache it
+        log('warn', 'server_pubkey_invalid', { raw: key });
+        return "REPLACE_WITH_SERVER_PUBLIC_KEY";
     } catch (error) {
         // If wireguard is not running yet, return placeholder (don't cache it)
         return "REPLACE_WITH_SERVER_PUBLIC_KEY";
