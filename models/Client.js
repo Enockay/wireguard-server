@@ -92,7 +92,7 @@ const clientSchema = new mongoose.Schema({
 // Index for faster queries
 clientSchema.index({ enabled: 1, name: 1 });
 clientSchema.index({ createdAt: -1 });
-clientSchema.index({ publicKey: 1 }); // For statistics matching
+// publicKey index already created by `unique: true` on the field definition
 
 // Ensure name is lowercase (Mongoose 7+ uses promise-based middleware, no next callback)
 clientSchema.pre('save', function() {
