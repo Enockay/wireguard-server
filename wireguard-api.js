@@ -235,10 +235,13 @@ async function loadClientsFromDatabase() {
         
         const tmpFile = '/tmp/wg0-peers.conf';
         fs.writeFileSync(tmpFile, conf);
-        await wgLock.run(() => runWgCommand(['syncconf', 'wg0', tmpFile]));
+        // Use addconf (not syncconf) -- syncconf with a peers-only file strips
+        // the interface's private key and listen port, breaking all handshakes.
+        // addconf only adds/updates peers without touching the interface config.
+        await wgLock.run(() => runWgCommand(['addconf', 'wg0', tmpFile]));
         fs.unlinkSync(tmpFile);
         
-        log('info', 'syncconf_complete', { synced: clients.length - skipped, total: clients.length });
+        log('info', 'peers_loaded', { synced: clients.length - skipped, total: clients.length });
     } catch (error) {
         log('error', 'load_clients_failed', { error: error.message });
     }
@@ -305,19 +308,41 @@ let cachedServerPublicKey = null;
 
 async function getServerPublicKey() {
     if (cachedServerPublicKey) return cachedServerPublicKey;
+
+    // Method 1: try wg show wg0 public-key (may return "(none)" without privileged mode)
     try {
         const key = (await wgLock.run(() => runWgCommand(['show', 'wg0', 'public-key']))).trim();
         if (isValidWgKey(key)) {
             cachedServerPublicKey = key;
+            log('info', 'server_pubkey_cached', { method: 'public-key', key: key.substring(0, 8) + '...' });
             return cachedServerPublicKey;
         }
-        // wg returned a non-key value like "(none)" -- don't cache it
-        log('warn', 'server_pubkey_invalid', { raw: key });
-        return "REPLACE_WITH_SERVER_PUBLIC_KEY";
+        log('warn', 'server_pubkey_invalid', { raw: key, method: 'public-key' });
     } catch (error) {
-        // If wireguard is not running yet, return placeholder (don't cache it)
-        return "REPLACE_WITH_SERVER_PUBLIC_KEY";
+        log('warn', 'server_pubkey_cmd_failed', { method: 'public-key', error: error.message });
     }
+
+    // Method 2: parse from wg show wg0 dump (first line, second field is public key)
+    try {
+        const dump = (await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']))).trim();
+        const firstLine = dump.split('\n')[0];
+        if (firstLine) {
+            const fields = firstLine.split('\t');
+            const key = (fields[1] || '').trim();
+            if (isValidWgKey(key)) {
+                cachedServerPublicKey = key;
+                log('info', 'server_pubkey_cached', { method: 'dump', key: key.substring(0, 8) + '...' });
+                return cachedServerPublicKey;
+            }
+            log('warn', 'server_pubkey_invalid', { raw: key, method: 'dump', fieldCount: fields.length });
+        }
+    } catch (error) {
+        log('warn', 'server_pubkey_cmd_failed', { method: 'dump', error: error.message });
+    }
+
+    // Both methods failed -- don't cache the placeholder
+    log('error', 'server_pubkey_unavailable', { note: 'all methods exhausted' });
+    return "REPLACE_WITH_SERVER_PUBLIC_KEY";
 }
 
 // Get server endpoint (IP or domain)
@@ -484,15 +509,13 @@ async function reconcilePeers() {
             }
         }
 
-        // 4. Re-add missing peers via wg syncconf
+        // 4. Re-add missing peers via wg addconf (NOT syncconf -- see loadClientsFromDatabase)
         if (missing.length > 0) {
             log('warn', 'peers_missing', { count: missing.length, peers: missing.map(c => c.name) });
 
-            // Build peers config for syncconf (include ALL enabled peers so
-            // syncconf doesn't remove existing active ones)
+            // Build config with only the missing peers (addconf won't touch existing ones)
             let conf = '';
-            for (const client of enabledClients) {
-                // Phase 2.2: Skip clients with invalid data
+            for (const client of missing) {
                 if (!isValidWgKey(client.publicKey) || !isValidCidr(client.ip)) {
                     continue;
                 }
@@ -505,7 +528,7 @@ async function reconcilePeers() {
 
             const tmpFile = '/tmp/wg0-reconcile.conf';
             fs.writeFileSync(tmpFile, conf);
-            await wgLock.run(() => runWgCommand(['syncconf', 'wg0', tmpFile]));
+            await wgLock.run(() => runWgCommand(['addconf', 'wg0', tmpFile]));
             fs.unlinkSync(tmpFile);
 
             log('info', 'reconcile_complete', { added: missing.length, unchanged: enabledClients.length - missing.length });
