@@ -1,6 +1,6 @@
 # WireGuard-only container
 # This container only handles WireGuard VPN networking
-FROM alpine:latest
+FROM alpine:3.20
 
 # Update package list and install WireGuard tools
 RUN apk update && \

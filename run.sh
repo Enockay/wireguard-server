@@ -52,19 +52,29 @@ node /app/wireguard-api.js &
 echo "Container is now running. API available on port 5000"
 echo "WireGuard status will be checked periodically"
 
+fail_count=0
 while true; do
     sleep 60
     if wg show wg0 &>/dev/null; then
+        fail_count=0
         if ! wg show wg0 | grep -q "peer"; then
             echo "⚠️  WireGuard interface is up but no peers connected"
         fi
     else
-        echo "⚠️  WireGuard interface is down - attempting restart..."
-        wg-quick down wg0 2>/dev/null || true
-        if wg-quick up wg0 2>/dev/null; then
-            echo "✅ WireGuard interface restarted successfully"
-        else
-            echo "❌ Failed to restart WireGuard interface - will retry later"
+        fail_count=$((fail_count + 1))
+        echo "⚠️  WireGuard check failed ($fail_count/3)"
+        if [ $fail_count -ge 3 ]; then
+            echo "⚠️  WireGuard interface is down - attempting restart..."
+            wg-quick down wg0 2>/dev/null || true
+            if wg-quick up wg0 2>/dev/null; then
+                echo "✅ WireGuard interface restarted successfully"
+                # Signal API to reload all peers from database
+                sleep 2
+                curl -s -X POST http://localhost:5000/reload || echo "API reload failed"
+            else
+                echo "❌ Failed to restart WireGuard interface - will retry later"
+            fi
+            fail_count=0
         fi
     fi
 done

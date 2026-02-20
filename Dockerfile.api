@@ -1,6 +1,6 @@
 # API Server-only container
 # This container handles the REST API and shares WireGuard's network namespace
-FROM alpine:latest
+FROM alpine:3.20
 
 # Install Node.js, npm, and wireguard-tools (for wg commands)
 RUN apk update && \

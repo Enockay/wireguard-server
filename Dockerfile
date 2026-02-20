@@ -1,5 +1,5 @@
 # Use Alpine as the base image
-FROM alpine:latest
+FROM alpine:3.20
 
 # IMPORTANT: This container MUST be run with --privileged flag for WireGuard to work
 # Example: docker run --privileged --env-file .env wireguard-vpn

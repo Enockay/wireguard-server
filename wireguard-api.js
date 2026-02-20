@@ -1,10 +1,39 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
-const { exec } = require("child_process");
+const { exec, execFile } = require("child_process");
 const fs = require("fs");
 const db = require("./db");
 const Client = require("./models/Client");
+
+// Phase 1.3: Async mutex to serialize all wg set/show operations.
+// Prevents the stats job, API endpoints, and reload from stepping on each other.
+class WgMutex {
+    constructor() {
+        this._queue = Promise.resolve();
+    }
+    run(fn) {
+        const task = this._queue.then(() => fn());
+        // Catch so the queue doesn't break on rejection
+        this._queue = task.catch(() => {});
+        return task;
+    }
+}
+
+const wgLock = new WgMutex();
+
+// Phase 5.1: Structured logging.
+// Wraps console output in JSON for machine-parsable container logs.
+// No external dependencies -- just a thin wrapper around console.
+function log(level, msg, data = {}) {
+    const entry = {
+        ts: new Date().toISOString(),
+        level,
+        msg,
+        ...data
+    };
+    console[level === 'error' ? 'error' : 'log'](JSON.stringify(entry));
+}
 
 const app = express();
 
@@ -60,77 +89,165 @@ function stripCidr(ip) {
     return ip;
 }
 
+// Phase 2.2: Input validation to prevent shell injection.
+// Every value interpolated into a wg command must pass these checks first.
+function isValidWgKey(key) {
+    // WireGuard keys are exactly 44 chars of base64 (43 chars + trailing '=')
+    return typeof key === 'string' && /^[A-Za-z0-9+/]{43}=$/.test(key);
+}
+
+function isValidCidr(ip) {
+    return typeof ip === 'string' && /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(ip);
+}
+
+// Phase 3.4: Wait for WireGuard interface with exponential backoff.
+// If wg-quick up hasn't finished yet, loadClientsFromDatabase() would fail
+// silently and peers would never be loaded.
+async function waitForWireGuard(maxRetries = 10) {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            await runWgCommand(['show', 'wg0']);
+            return true;
+        } catch (e) {
+            const delay = Math.min(2000 * (i + 1), 15000);
+            log('info', 'wg_wait_retry', { attempt: i + 1, maxRetries, delayMs: delay });
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+    return false;
+}
+
 // Initialize MongoDB connection
 let dbInitialized = false;
 (async () => {
     try {
         await db.connect();
         dbInitialized = true;
-        console.log("✅ Database initialized, loading clients...");
-        // Load and apply all enabled clients from database
-        await loadClientsFromDatabase();
-        // Start background statistics update job
+        log('info', 'db_initialized');
+
+        // Phase 3.4: Wait for the WireGuard interface before loading peers
+        const wgReady = await waitForWireGuard();
+        if (wgReady) {
+            log('info', 'wg_ready');
+            await loadClientsFromDatabase();
+        } else {
+            log('warn', 'wg_not_ready_after_retries');
+        }
+
+        // Start background jobs (stats, cleanup, reconciliation)
         startStatisticsUpdateJob();
     } catch (error) {
-        console.error("❌ Failed to initialize database:", error.message);
+        log('error', 'db_init_failed', { error: error.message });
         dbInitialized = false;
     }
 })();
 
-// Function to execute shell commands safely
+// Function to execute shell commands safely.
+// Phase 2.3: Rejects with proper Error objects (not raw strings) and adds
+// a 10s timeout so a hung wg process doesn't block the mutex queue forever.
 function runCommand(command) {
     return new Promise((resolve, reject) => {
-        exec(command, (error, stdout, stderr) => {
+        exec(command, { timeout: 10000 }, (error, stdout, stderr) => {
             if (error) {
-                console.error(`❌ Command execution error: ${stderr}`);
-                return reject(stderr);
+                const err = new Error(stderr.trim() || error.message);
+                err.code = error.code;
+                log('error', 'cmd_exec_error', { error: err.message });
+                return reject(err);
             }
             resolve(stdout);
         });
     });
 }
 
-// Generate WireGuard keys
-async function generateKeys() {
-    const privateKey = (await runCommand("wg genkey")).trim();
-    const publicKey = (await runCommand(`echo "${privateKey}" | wg pubkey`)).trim();
-    return {
-        privateKey: privateKey,
-        publicKey: publicKey
-    };
+// Phase 4.3: Direct binary execution for wg commands.
+// execFile() runs the binary directly without spawning a shell -- faster,
+// no shell injection risk, and lower memory usage than exec().
+function runWgCommand(args) {
+    return new Promise((resolve, reject) => {
+        execFile('wg', args, { timeout: 10000 }, (error, stdout, stderr) => {
+            if (error) {
+                const err = new Error(stderr.trim() || error.message);
+                err.code = error.code;
+                log('error', 'wg_cmd_error', { subcommand: args[0], error: err.message });
+                return reject(err);
+            }
+            resolve(stdout);
+        });
+    });
 }
 
-// Load clients from database and apply to WireGuard
+// Generate WireGuard keys (Phase 4.3: uses execFile, no shell needed)
+async function generateKeys() {
+    const privateKey = (await runWgCommand(['genkey'])).trim();
+    // Pipe private key via stdin to wg pubkey (avoids shell echo pipe)
+    const publicKey = await new Promise((resolve, reject) => {
+        const proc = execFile('wg', ['pubkey'], { timeout: 5000 },
+            (err, stdout, stderr) => {
+                if (err) {
+                    reject(new Error(stderr.trim() || err.message));
+                    return;
+                }
+                resolve(stdout.trim());
+            }
+        );
+        proc.stdin.write(privateKey);
+        proc.stdin.end();
+    });
+    // Phase 2.2: Validate generated keys to catch corruption
+    if (!isValidWgKey(privateKey) || !isValidWgKey(publicKey)) {
+        throw new Error('Key generation produced invalid keys');
+    }
+    return { privateKey, publicKey };
+}
+
+// Load clients from database and apply to WireGuard using wg syncconf (Phase 1.4).
+// syncconf only touches peers that differ from the running config -- existing
+// active peers keep their handshake state and sessions.
 async function loadClientsFromDatabase() {
     if (!dbInitialized) {
-        console.log("⚠️  Database not initialized, skipping client load");
+        log('warn', 'db_not_initialized', { action: 'skip_client_load' });
         return;
     }
     
     try {
         const clients = await Client.find({ enabled: true });
-        console.log(`🔄 Loading ${clients.length} enabled clients from database...`);
+        log('info', 'syncconf_start', { clientCount: clients.length });
         
+        // Build wg config with only [Peer] sections (no [Interface])
+        // Phase 2.2: Skip clients with invalid keys/IPs (defense-in-depth)
+        let conf = '';
+        let skipped = 0;
         for (const client of clients) {
-            try {
-                const keepalive = validateKeepalive(client.persistentKeepalive);
-                await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
-                console.log(`✅ Loaded client: ${client.name} (${client.ip})`);
-            } catch (error) {
-                console.warn(`⚠️  Could not load client ${client.name}: ${error.message}`);
+            if (!isValidWgKey(client.publicKey) || !isValidCidr(client.ip)) {
+                log('warn', 'invalid_client_data', { client: client.name, action: 'skip_sync' });
+                skipped++;
+                continue;
             }
+            const keepalive = validateKeepalive(client.persistentKeepalive);
+            conf += `[Peer]\n`;
+            conf += `PublicKey = ${client.publicKey}\n`;
+            conf += `AllowedIPs = ${client.ip}\n`;
+            conf += `PersistentKeepalive = ${keepalive}\n\n`;
+        }
+        if (skipped > 0) {
+            log('warn', 'sync_skipped_clients', { skipped });
         }
         
-        console.log(`✅ Successfully loaded ${clients.length} clients from database`);
+        const tmpFile = '/tmp/wg0-peers.conf';
+        fs.writeFileSync(tmpFile, conf);
+        await wgLock.run(() => runWgCommand(['syncconf', 'wg0', tmpFile]));
+        fs.unlinkSync(tmpFile);
+        
+        log('info', 'syncconf_complete', { synced: clients.length - skipped, total: clients.length });
     } catch (error) {
-        console.error("❌ Error loading clients from database:", error.message);
+        log('error', 'load_clients_failed', { error: error.message });
     }
 }
 
 // Get all currently used IPs from WireGuard
 async function getUsedIPs() {
     try {
-        const wgShow = await runCommand("wg show wg0 dump");
+        const wgShow = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
         const ips = [];
         wgShow.split('\n').forEach(line => {
             const parts = line.split('\t');
@@ -177,17 +294,22 @@ async function getNextAvailableIP() {
         
         throw new Error("No available IP addresses in the VPN network");
     } catch (error) {
-        console.error("Error getting next available IP:", error);
+        log('error', 'next_ip_failed', { error: error.message || String(error) });
         throw error;
     }
 }
 
-// Get server's public key
+// Phase 4.2: Cache server public key -- it never changes during the
+// container's lifetime, so there's no need to shell out on every request.
+let cachedServerPublicKey = null;
+
 async function getServerPublicKey() {
+    if (cachedServerPublicKey) return cachedServerPublicKey;
     try {
-        return await runCommand("wg show wg0 public-key");
+        cachedServerPublicKey = (await wgLock.run(() => runWgCommand(['show', 'wg0', 'public-key']))).trim();
+        return cachedServerPublicKey;
     } catch (error) {
-        // If wireguard is not running yet, return placeholder
+        // If wireguard is not running yet, return placeholder (don't cache it)
         return "REPLACE_WITH_SERVER_PUBLIC_KEY";
     }
 }
@@ -197,145 +319,235 @@ function getServerEndpoint() {
     return process.env.SERVER_ENDPOINT || "YOUR_SERVER_IP:51820";
 }
 
-// Update client statistics from WireGuard interface
+// Phase 4.1 + 4.3: Update client statistics using batched MongoDB writes.
+// Reduces N*2 DB round-trips (findOne + updateOne per peer) to just 2
+// (one find, one bulkWrite) per 30-second cycle.
 async function updateClientStatistics() {
     if (!dbInitialized) {
         return;
     }
     
     try {
-        // Get WireGuard interface dump
-        const wgShow = await runCommand("wg show wg0 dump");
-        const lines = wgShow.trim().split('\n').filter(line => line.trim());
-        
-        // Get all enabled clients to update
-        const enabledClients = await Client.find({ enabled: true });
-        const enabledPublicKeys = new Set(enabledClients.map(c => c.publicKey.trim()));
-        
-        // Process active peers from WireGuard
+        // Single wg dump via execFile (Phase 4.3)
+        const wgDump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
+        const lines = wgDump.trim().split('\n').filter(l => l.trim());
+
+        // Build a map of publicKey -> stats from wg dump
+        const peerStats = new Map();
         for (const line of lines) {
             const parts = line.split('\t');
             if (parts.length < 7) continue;
-            
-            const [
-                publicKey,
-                endpoint,
-                allowedIPs,
-                lastHandshake,
-                transferRx,
-                transferTx,
-                persistentKeepalive
-            ] = parts;
-            
-            const publicKeyTrimmed = publicKey.trim();
-            
-            // Only update statistics for enabled clients
-            if (!enabledPublicKeys.has(publicKeyTrimmed)) {
-                continue;
-            }
-            
-            // Find client by public key
-            const client = await Client.findOne({ publicKey: publicKeyTrimmed, enabled: true });
-            if (!client) continue;
-            
+            peerStats.set(parts[0].trim(), {
+                endpoint: parts[1],
+                lastHandshake: parts[3],
+                transferRx: parts[4],
+                transferTx: parts[5]
+            });
+        }
+
+        // Get all enabled clients in one query
+        const clients = await Client.find({ enabled: true });
+        const ops = [];
+
+        for (const client of clients) {
+            const stats = peerStats.get(client.publicKey.trim());
+            if (!stats) continue;
+
+            const update = { updatedAt: new Date() };
+
             // Parse endpoint to get IP
-            const endpointIp = endpoint && endpoint !== '(none)' && endpoint.trim() !== ''
-                ? endpoint.split(':')[0].trim()
-                : null;
-            
+            if (stats.endpoint && stats.endpoint !== '(none)' && stats.endpoint.trim() !== '') {
+                update.lastConnectionIp = stats.endpoint.split(':')[0].trim();
+            }
+
             // Parse handshake time (Unix timestamp in seconds) with proper validation
-            let handshakeTime = null;
-            if (lastHandshake && lastHandshake.trim() !== '' && lastHandshake.trim() !== '0') {
-                const handshakeSeconds = parseInt(lastHandshake.trim());
-                // Validate: must be a valid number and within reasonable range (not before 2020, not in future)
+            if (stats.lastHandshake && stats.lastHandshake.trim() !== '' && stats.lastHandshake.trim() !== '0') {
+                const handshakeSeconds = parseInt(stats.lastHandshake.trim());
                 if (!isNaN(handshakeSeconds) && handshakeSeconds > 0) {
                     const date = new Date(handshakeSeconds * 1000);
                     const now = new Date();
                     const minDate = new Date('2020-01-01');
-                    // Only accept if date is valid, after 2020, and not in the future
                     if (date instanceof Date && !isNaN(date.getTime()) && date >= minDate && date <= now) {
-                        handshakeTime = date;
+                        update.lastHandshake = date;
+                        update.lastConnectionTime = date;
                     }
                 }
             }
-            
-            // Parse transfer values (they're in bytes)
-            const rxBytes = parseInt(transferRx && transferRx.trim() !== '' ? transferRx.trim() : '0') || 0;
-            const txBytes = parseInt(transferTx && transferTx.trim() !== '' ? transferTx.trim() : '0') || 0;
-            
-            // Update client statistics
-            const updateData = {
-                transferRx: rxBytes,
-                transferTx: txBytes,
-                updatedAt: new Date()
-            };
-            
-            if (handshakeTime) {
-                updateData.lastHandshake = handshakeTime;
-                updateData.lastConnectionTime = handshakeTime;
-            }
-            
-            if (endpointIp) {
-                updateData.lastConnectionIp = endpointIp;
-            }
-            
-            await Client.updateOne(
-                { publicKey: publicKeyTrimmed },
-                { $set: updateData }
-            );
-        }
-        
-        // Clear statistics for disabled clients that might still be in WireGuard
-        // (in case they weren't properly removed)
-        const allClients = await Client.find({ enabled: false });
-        for (const disabledClient of allClients) {
-            // Check if this client is still in WireGuard
-            const stillInWg = lines.some(line => {
-                const parts = line.split('\t');
-                return parts.length > 0 && parts[0].trim() === disabledClient.publicKey.trim();
+
+            // Parse transfer values (bytes)
+            update.transferRx = parseInt(stats.transferRx && stats.transferRx.trim() !== '' ? stats.transferRx.trim() : '0') || 0;
+            update.transferTx = parseInt(stats.transferTx && stats.transferTx.trim() !== '' ? stats.transferTx.trim() : '0') || 0;
+
+            ops.push({
+                updateOne: {
+                    filter: { _id: client._id },
+                    update: { $set: update }
+                }
             });
-            
-            // If still in WireGuard, try to remove it
-            if (stillInWg) {
-                try {
-                    await runCommand(`wg set wg0 peer ${disabledClient.publicKey} remove`);
-                    console.log(`✅ Removed disabled client ${disabledClient.name} from WireGuard`);
-                } catch (error) {
-                    // Ignore errors - peer might already be removed
-                }
-            }
-            
-            // Clear statistics for disabled clients
-            await Client.updateOne(
-                { _id: disabledClient._id },
-                { 
-                    $set: {
-                        lastHandshake: null,
-                        lastConnectionTime: null,
-                        lastConnectionIp: null,
-                        transferRx: 0,
-                        transferTx: 0,
-                        updatedAt: new Date()
-                    }
-                }
-            );
+        }
+
+        if (ops.length > 0) {
+            await Client.bulkWrite(ops, { ordered: false });
         }
     } catch (error) {
         // Silently fail - WireGuard might not be running
         if (error.message && !error.message.includes('No such device')) {
-            console.error('Error updating statistics:', error.message);
+            log('error', 'stats_update_error', { error: error.message });
         }
     }
 }
 
-// Start background job to update statistics
-function startStatisticsUpdateJob() {
-    // Run immediately
-    updateClientStatistics();
+// Phase 1.1: Separate disabled-peer cleanup (safety net only).
+// Disabled peers are already removed immediately by disable/delete endpoints.
+// This catches any that slip through, on a much longer interval to avoid
+// contending with active handshakes.
+const CLEANUP_INTERVAL = 300000; // 5 minutes
+
+async function cleanupDisabledPeers() {
+    if (!dbInitialized) return;
     
-    // Then run every 30 seconds
+    try {
+        const wgDump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
+        const lines = wgDump.trim().split('\n').filter(line => line.trim());
+        const activePeerKeys = new Set(
+            lines.map(l => l.split('\t')[0].trim()).filter(k => k)
+        );
+        
+        const disabledClients = await Client.find({ enabled: false });
+        const toRemove = disabledClients.filter(
+            c => activePeerKeys.has(c.publicKey.trim())
+        );
+        
+        if (toRemove.length > 0) {
+            // Batch removal under a single lock acquisition
+            await wgLock.run(async () => {
+                for (const client of toRemove) {
+                    // Phase 2.2: Validate key before passing to command
+                    if (!isValidWgKey(client.publicKey)) {
+                        log('warn', 'invalid_peer_key', { peer: client.name, action: 'skip_removal' });
+                        continue;
+                    }
+                    try {
+                        await runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']);
+                        log('info', 'removed_disabled_peer', { peer: client.name });
+                    } catch (error) {
+                        // Ignore -- peer might already be gone
+                    }
+                }
+            });
+        }
+    } catch (error) {
+        if (error.message && !error.message.includes('No such device')) {
+            log('error', 'cleanup_disabled_error', { error: error.message });
+        }
+    }
+}
+
+// Phase 2.1: Periodic reconciliation loop.
+// Detects and re-adds peers that went missing from the kernel (e.g. interface
+// restarts where the /reload curl missed, kernel OOM, or any other drift
+// between DB state and kernel state).
+const RECONCILE_INTERVAL = 120000; // 2 minutes
+
+async function reconcilePeers() {
+    if (!dbInitialized) return;
+
+    try {
+        // 1. Get set of public keys currently in kernel
+        const wgDump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
+        const kernelKeys = new Set();
+        const lines = wgDump.trim().split('\n').filter(line => line.trim());
+        for (const line of lines) {
+            const parts = line.split('\t');
+            // Peer lines have 8 fields; the interface line has 4 -- skip it
+            if (parts.length < 7) continue;
+            kernelKeys.add(parts[0].trim());
+        }
+
+        // 2. Get set of public keys that should exist (enabled in DB)
+        const enabledClients = await Client.find({ enabled: true });
+        const dbEnabledKeys = new Map(
+            enabledClients.map(c => [c.publicKey.trim(), c])
+        );
+
+        // 3. Find missing peers: in DB (enabled) but not in kernel
+        const missing = [];
+        for (const [key, client] of dbEnabledKeys) {
+            if (!kernelKeys.has(key)) {
+                missing.push(client);
+            }
+        }
+
+        // 4. Re-add missing peers via wg syncconf
+        if (missing.length > 0) {
+            log('warn', 'peers_missing', { count: missing.length, peers: missing.map(c => c.name) });
+
+            // Build peers config for syncconf (include ALL enabled peers so
+            // syncconf doesn't remove existing active ones)
+            let conf = '';
+            for (const client of enabledClients) {
+                // Phase 2.2: Skip clients with invalid data
+                if (!isValidWgKey(client.publicKey) || !isValidCidr(client.ip)) {
+                    continue;
+                }
+                const keepalive = validateKeepalive(client.persistentKeepalive);
+                conf += `[Peer]\n`;
+                conf += `PublicKey = ${client.publicKey}\n`;
+                conf += `AllowedIPs = ${client.ip}\n`;
+                conf += `PersistentKeepalive = ${keepalive}\n\n`;
+            }
+
+            const tmpFile = '/tmp/wg0-reconcile.conf';
+            fs.writeFileSync(tmpFile, conf);
+            await wgLock.run(() => runWgCommand(['syncconf', 'wg0', tmpFile]));
+            fs.unlinkSync(tmpFile);
+
+            log('info', 'reconcile_complete', { added: missing.length, unchanged: enabledClients.length - missing.length });
+        }
+
+        // 5. Check for extra peers (in kernel but not in any DB record)
+        const disabledClients = await Client.find({ enabled: false });
+        const dbAllKeys = new Set([
+            ...enabledClients.map(c => c.publicKey.trim()),
+            ...disabledClients.map(c => c.publicKey.trim())
+        ]);
+
+        const extra = [];
+        for (const key of kernelKeys) {
+            if (!dbAllKeys.has(key)) {
+                extra.push(key);
+            }
+        }
+
+        if (extra.length > 0) {
+            log('warn', 'unknown_kernel_peers', { count: extra.length });
+        }
+    } catch (error) {
+        // Silently ignore if WireGuard interface doesn't exist yet
+        if (error.message && !error.message.includes('No such device')) {
+            log('error', 'reconcile_error', { error: error.message });
+        }
+    }
+}
+
+// Start background jobs for statistics, disabled-peer cleanup, and reconciliation
+function startStatisticsUpdateJob() {
+    // Run statistics update immediately, then every 30 seconds (read-only)
+    updateClientStatistics();
     setInterval(updateClientStatistics, STATS_UPDATE_INTERVAL);
-    console.log(`✅ Statistics update job started (runs every ${STATS_UPDATE_INTERVAL/1000}s)`);
+    log('info', 'job_started', { job: 'statistics', intervalSec: STATS_UPDATE_INTERVAL / 1000 });
+    
+    // Run disabled-peer cleanup every 5 minutes (Phase 1.1)
+    setInterval(cleanupDisabledPeers, CLEANUP_INTERVAL);
+    log('info', 'job_started', { job: 'cleanup_disabled', intervalSec: CLEANUP_INTERVAL / 1000 });
+
+    // Run peer reconciliation every 2 minutes (Phase 2.1)
+    // First run after 30s to let initial load settle
+    setTimeout(() => {
+        reconcilePeers();
+        setInterval(reconcilePeers, RECONCILE_INTERVAL);
+    }, 30000);
+    log('info', 'job_started', { job: 'reconciliation', intervalSec: RECONCILE_INTERVAL / 1000 });
 }
 
 // Generate a new client configuration
@@ -351,15 +563,15 @@ app.post("/generate-client", async (req, res) => {
         }
         
         const clientName = name.toLowerCase().trim();
-        console.log(`🔐 Generating new WireGuard client for "${clientName}"...`);
+        log('info', 'generate_client_start', { client: clientName });
         
         // Generate client keys
         const { privateKey, publicKey } = await generateKeys();
-        console.log(`✅ Generated keys for client`);
+        log('info', 'keys_generated', { client: clientName });
         
         // Get next available IP
         const allowedIPs = await getNextAvailableIP();
-        console.log(`✅ Assigned IP: ${allowedIPs}`);
+        log('info', 'ip_assigned', { client: clientName, ip: allowedIPs });
         
         // Save to MongoDB
         const client = new Client({
@@ -372,17 +584,17 @@ app.post("/generate-client", async (req, res) => {
         });
         
         await client.save();
-        console.log(`✅ Saved client "${clientName}" to database`);
+        log('info', 'client_saved', { client: clientName });
         
         // Add peer to WireGuard
         try {
-            await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allowedIPs} persistent-keepalive ${KEEPALIVE_TIME}`);
-            console.log(`✅ Added peer to WireGuard`);
+            await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', allowedIPs, 'persistent-keepalive', String(KEEPALIVE_TIME)]));
+            log('info', 'peer_added', { client: clientName });
         } catch (error) {
-            console.warn("⚠️  Could not add peer to WireGuard (might not be running yet), but saved to database");
+            log('warn', 'peer_add_failed', { client: clientName, note: 'saved to database' });
         }
         
-        // Get server's public key
+        // Get server's public key (Phase 4.2: cached after first call)
         const serverPublicKey = (await getServerPublicKey()).trim();
         
         // Get server endpoint
@@ -399,7 +611,7 @@ Endpoint = ${serverEndpoint}
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = ${KEEPALIVE_TIME}`;
         
-        console.log(`✅ Client configuration generated successfully`);
+        log('info', 'config_generated', { client: clientName });
         
         // Set content type for WireGuard config file
         res.setHeader('Content-Type', 'text/plain');
@@ -409,7 +621,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
         res.send(clientConfig);
         
     } catch (error) {
-        console.error("❌ Error generating client:", error);
+        log('error', 'generate_client_error', { error: error.message });
         
         // Handle duplicate name error
         if (error.code === 11000) {
@@ -473,10 +685,10 @@ app.post("/generate-mikrotik", async (req, res) => {
 
         // 4) Add to running WireGuard
         try {
-            await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIpWithCidr} persistent-keepalive ${KEEPALIVE_TIME}`);
+            await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', allocatedIpWithCidr, 'persistent-keepalive', String(KEEPALIVE_TIME)]));
         } catch (error) {
             // Proceed even if wg0 is not yet up; DB has the record
-            console.warn("⚠️  Could not add peer to running WireGuard:", error?.message || error);
+            log('warn', 'peer_add_failed', { client: clientName, error: error?.message || String(error) });
         }
 
         // 5) Build MikroTik script
@@ -557,7 +769,7 @@ app.post("/generate-mikrotik", async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${clientName}.rsc"`);
         return res.send(mikrotikScript);
     } catch (error) {
-        console.error("❌ Error generating MikroTik script:", error);
+        log('error', 'generate_mikrotik_error', { error: error.message });
         return res.status(500).json({
             success: false,
             error: "Failed to generate MikroTik configuration script",
@@ -597,9 +809,9 @@ async function ensureClientRecord({ name, notes, interfaceName }) {
     });
     await record.save();
     try {
-        await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIpWithCidr} persistent-keepalive ${KEEPALIVE_TIME}`);
+        await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', allocatedIpWithCidr, 'persistent-keepalive', String(KEEPALIVE_TIME)]));
     } catch (e) {
-        console.warn("⚠️  wg set failed (ensureClientRecord):", e?.message || e);
+        log('warn', 'peer_add_failed', { context: 'ensureClientRecord', error: e?.message || String(e) });
     }
     return record;
 }
@@ -635,7 +847,7 @@ app.get("/mt/:name", async (req, res) => {
         res.setHeader('Cache-Control', 'no-store');
         return res.send(s);
     } catch (error) {
-        console.error("❌ /mt/:name error", error);
+        log('error', 'mt_shorturl_error', { error: error.message });
         return res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -668,7 +880,7 @@ app.get("/:name/configure", async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);
         res.send(autoconfigScript);
     } catch (error) {
-        console.error("❌ Error generating auto-config:", error);
+        log('error', 'autoconfig_error', { name: req.params.name, error: error.message });
         res.status(500).send("Failed to generate auto-config script");
     }
 });
@@ -676,13 +888,13 @@ app.get("/:name/configure", async (req, res) => {
 // Get all connected peers
 app.get("/list-peers", async (req, res) => {
     try {
-        const wgStatus = await runCommand("wg show");
+        const wgStatus = await wgLock.run(() => runWgCommand(['show']));
         res.json({ 
             success: true,
             peers: wgStatus 
         });
     } catch (error) {
-        console.error("❌ Error listing peers:", error);
+        log('error', 'list_peers_error', { error: error.message });
         res.status(500).json({ 
             success: false,
             error: "Failed to list peers", 
@@ -700,15 +912,23 @@ app.post("/add-peer", async (req, res) => {
             return res.status(400).json({ error: "Missing parameters" });
         }
 
+        // Phase 2.2: Validate inputs before passing to shell command
+        if (!isValidWgKey(publicKey)) {
+            return res.status(400).json({ error: "Invalid WireGuard public key format" });
+        }
+        if (!isValidCidr(allowedIPs)) {
+            return res.status(400).json({ error: "Invalid CIDR format for allowedIPs" });
+        }
+
         // Add peer dynamically without modifying wg0.conf
-        await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allowedIPs} persistent-keepalive ${KEEPALIVE_TIME}`);
+        await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', allowedIPs, 'persistent-keepalive', String(KEEPALIVE_TIME)]));
 
         // Verify WireGuard status
-        const wgStatus = await runCommand("wg show");
+        const wgStatus = await wgLock.run(() => runWgCommand(['show']));
 
         res.json({ message: "Peer added successfully", details: wgStatus });
     } catch (error) {
-        console.error("❌ Error adding peer:", error);
+        log('error', 'add_peer_error', { error: error.message });
         res.status(500).json({ error: "Failed to add peer", details: error.message });
     }
 });
@@ -773,7 +993,7 @@ app.get("/api/clients", async (req, res) => {
             }
         });
     } catch (error) {
-        console.error("❌ Error listing clients:", error);
+        log('error', 'list_clients_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to list clients",
@@ -801,7 +1021,7 @@ app.get("/clients", async (req, res) => {
             count: safeClients.length
         });
     } catch (error) {
-        console.error("❌ Error listing clients:", error);
+        log('error', 'list_clients_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to list clients",
@@ -835,7 +1055,7 @@ app.get("/api/clients/:name", async (req, res) => {
             data: clientData
         });
     } catch (error) {
-        console.error("❌ Error getting client:", error);
+        log('error', 'get_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to get client",
@@ -887,7 +1107,7 @@ PersistentKeepalive = ${keepalive}`;
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}.conf"`);
         res.send(clientConfig);
     } catch (error) {
-        console.error("❌ Error getting client config:", error);
+        log('error', 'get_config_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to get client config",
@@ -1006,7 +1226,7 @@ app.get("/api/clients/:name/autoconfig", async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);
         res.send(autoconfigScript);
     } catch (error) {
-        console.error("❌ Error generating auto-config:", error);
+        log('error', 'autoconfig_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to generate auto-config script",
@@ -1053,7 +1273,7 @@ app.post("/api/clients/:name/ping", async (req, res) => {
             });
         }
     } catch (error) {
-        console.error("❌ Error pinging:", error);
+        log('error', 'ping_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to ping remote server",
@@ -1095,7 +1315,7 @@ app.get("/api/clients/:name/mikrotik", async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}.rsc"`);
         res.send(mikrotikScript);
     } catch (error) {
-        console.error("❌ Error getting MikroTik script:", error);
+        log('error', 'get_mikrotik_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to get MikroTik script",
@@ -1137,7 +1357,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
         res.setHeader('Content-Disposition', `attachment; filename="${client.name}.conf"`);
         res.send(clientConfig);
     } catch (error) {
-        console.error("❌ Error getting client:", error);
+        log('error', 'get_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to get client",
@@ -1214,10 +1434,10 @@ app.post("/api/clients", async (req, res) => {
         if (enabled) {
             try {
                 const keepalive = validateKeepalive(persistentKeepalive);
-                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${allocatedIp} persistent-keepalive ${keepalive}`);
-                console.log(`✅ Added client ${clientName} to WireGuard`);
+                await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', allocatedIp, 'persistent-keepalive', String(keepalive)]));
+                log('info', 'peer_added', { client: clientName });
             } catch (error) {
-                console.warn(`⚠️  Could not add client to WireGuard: ${error.message}`);
+                log('warn', 'peer_add_failed', { client: clientName, error: error.message });
             }
         }
         
@@ -1235,7 +1455,7 @@ app.post("/api/clients", async (req, res) => {
             }
         });
     } catch (error) {
-        console.error("❌ Error creating client:", error);
+        log('error', 'create_client_error', { error: error.message });
         
         if (error.code === 11000) {
             return res.status(409).json({
@@ -1319,17 +1539,17 @@ app.put("/api/clients/:name", async (req, res) => {
             if (enabled !== false && updatedClient.enabled) {
                 try {
                     const keepalive = validateKeepalive(updatedClient.persistentKeepalive);
-                    await runCommand(`wg set wg0 peer ${updatedClient.publicKey} allowed-ips ${updatedClient.ip} persistent-keepalive ${keepalive}`);
-                    console.log(`✅ Updated client ${name} in WireGuard`);
+                    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', updatedClient.publicKey, 'allowed-ips', updatedClient.ip, 'persistent-keepalive', String(keepalive)]));
+                    log('info', 'peer_updated', { client: name });
                 } catch (error) {
-                    console.warn(`⚠️  Could not update client in WireGuard: ${error.message}`);
+                    log('warn', 'peer_update_failed', { client: name, error: error.message });
                 }
             } else if (enabled === false) {
                 try {
-                    await runCommand(`wg set wg0 peer ${updatedClient.publicKey} remove`);
-                    console.log(`✅ Disabled client ${name} in WireGuard`);
+                    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', updatedClient.publicKey, 'remove']));
+                    log('info', 'peer_disabled', { client: name });
                 } catch (error) {
-                    console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
+                    log('warn', 'peer_disable_failed', { client: name, error: error.message });
                 }
                 
                 // Clear statistics for disabled client
@@ -1353,7 +1573,7 @@ app.put("/api/clients/:name", async (req, res) => {
             message: "Client updated successfully"
         });
     } catch (error) {
-        console.error("❌ Error updating client:", error);
+        log('error', 'update_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to update client",
@@ -1378,9 +1598,9 @@ app.post("/api/clients/:name/regenerate", async (req, res) => {
         
         // Remove old peer from WireGuard
         try {
-            await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
+            await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
         } catch (error) {
-            console.warn(`⚠️  Could not remove old peer: ${error.message}`);
+            log('warn', 'peer_remove_failed', { client: name, error: error.message });
         }
         
         // Generate new keys
@@ -1395,10 +1615,10 @@ app.post("/api/clients/:name/regenerate", async (req, res) => {
         if (client.enabled) {
             try {
                 const keepalive = validateKeepalive(client.persistentKeepalive);
-                await runCommand(`wg set wg0 peer ${publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
-                console.log(`✅ Added regenerated client ${name} to WireGuard`);
+                await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', client.ip, 'persistent-keepalive', String(keepalive)]));
+                log('info', 'peer_regenerated', { client: name });
             } catch (error) {
-                console.warn(`⚠️  Could not add regenerated client to WireGuard: ${error.message}`);
+                log('warn', 'peer_regenerate_add_failed', { client: name, error: error.message });
             }
         }
         
@@ -1411,7 +1631,7 @@ app.post("/api/clients/:name/regenerate", async (req, res) => {
             }
         });
     } catch (error) {
-        console.error("❌ Error regenerating client keys:", error);
+        log('error', 'regenerate_keys_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to regenerate client keys",
@@ -1440,10 +1660,10 @@ app.post("/api/clients/:name/enable", async (req, res) => {
         // Add to WireGuard
         try {
             const keepalive = validateKeepalive(client.persistentKeepalive);
-            await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
-            console.log(`✅ Enabled client ${name} in WireGuard`);
+            await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'allowed-ips', client.ip, 'persistent-keepalive', String(keepalive)]));
+            log('info', 'peer_enabled', { client: name });
         } catch (error) {
-            console.warn(`⚠️  Could not enable client in WireGuard: ${error.message}`);
+            log('warn', 'peer_enable_failed', { client: name, error: error.message });
         }
         
         res.json({
@@ -1451,7 +1671,7 @@ app.post("/api/clients/:name/enable", async (req, res) => {
             message: "Client enabled successfully"
         });
     } catch (error) {
-        console.error("❌ Error enabling client:", error);
+        log('error', 'enable_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to enable client",
@@ -1480,10 +1700,10 @@ app.post("/api/clients/:name/disable", async (req, res) => {
         
         // Remove from WireGuard
         try {
-            await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
-            console.log(`✅ Disabled client ${name} in WireGuard`);
+            await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
+            log('info', 'peer_disabled', { client: name });
         } catch (error) {
-            console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
+            log('warn', 'peer_disable_failed', { client: name, error: error.message });
         }
         
         // Clear statistics for disabled client
@@ -1505,7 +1725,7 @@ app.post("/api/clients/:name/disable", async (req, res) => {
             message: "Client disabled successfully"
         });
     } catch (error) {
-        console.error("❌ Error disabling client:", error);
+        log('error', 'disable_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to disable client",
@@ -1530,10 +1750,10 @@ app.delete("/api/clients/:name", async (req, res) => {
         
         // Remove from WireGuard
         try {
-            await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
-            console.log(`✅ Removed peer from WireGuard`);
+            await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
+            log('info', 'peer_removed', { client: name });
         } catch (error) {
-            console.warn("⚠️  Could not remove peer from WireGuard");
+            log('warn', 'peer_remove_failed', { client: name });
         }
         
         // Delete from database
@@ -1544,7 +1764,7 @@ app.delete("/api/clients/:name", async (req, res) => {
             message: "Client deleted successfully"
         });
     } catch (error) {
-        console.error("❌ Error deleting client:", error);
+        log('error', 'delete_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to delete client",
@@ -1581,9 +1801,9 @@ app.post("/api/clients/bulk-delete", async (req, res) => {
         // Remove from WireGuard
         for (const client of clients) {
             try {
-                await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
+                await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
             } catch (error) {
-                console.warn(`⚠️  Could not remove peer ${client.name} from WireGuard`);
+                log('warn', 'peer_remove_failed', { client: client.name });
             }
         }
         
@@ -1597,7 +1817,7 @@ app.post("/api/clients/bulk-delete", async (req, res) => {
             clients: clients.map(c => ({ name: c.name, ip: c.ip }))
         });
     } catch (error) {
-        console.error("❌ Error bulk deleting clients:", error);
+        log('error', 'bulk_delete_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to delete clients",
@@ -1629,7 +1849,7 @@ app.get("/api/admin/stats", async (req, res) => {
         let wgStatus = null;
         let connectedDetails = [];
         try {
-            const wgShow = await runCommand("wg show wg0 dump");
+            const wgShow = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
             const peers = wgShow.trim().split('\n').filter(line => line.trim());
             
             // Parse peer details and match with clients
@@ -1699,7 +1919,7 @@ app.get("/api/admin/stats", async (req, res) => {
             }
         });
     } catch (error) {
-        console.error("❌ Error getting stats:", error);
+        log('error', 'admin_stats_error', { error: error.message });
         res.status(500).json({
             success: false,
             message: "Failed to get statistics",
@@ -1750,18 +1970,18 @@ app.patch("/clients/:name", async (req, res) => {
                 // Add to WireGuard
                 try {
                     const keepalive = validateKeepalive(client.persistentKeepalive);
-                    await runCommand(`wg set wg0 peer ${client.publicKey} allowed-ips ${client.ip} persistent-keepalive ${keepalive}`);
-                    console.log(`✅ Enabled client ${client.name} in WireGuard`);
+                    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'allowed-ips', client.ip, 'persistent-keepalive', String(keepalive)]));
+                    log('info', 'peer_enabled', { client: client.name });
                 } catch (error) {
-                    console.warn(`⚠️  Could not enable client in WireGuard: ${error.message}`);
+                    log('warn', 'peer_enable_failed', { client: client.name, error: error.message });
                 }
             } else {
                 // Remove from WireGuard
                 try {
-                    await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
-                    console.log(`✅ Disabled client ${client.name} in WireGuard`);
+                    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
+                    log('info', 'peer_disabled', { client: client.name });
                 } catch (error) {
-                    console.warn(`⚠️  Could not disable client in WireGuard: ${error.message}`);
+                    log('warn', 'peer_disable_failed', { client: client.name, error: error.message });
                 }
                 
                 // Clear statistics for disabled client
@@ -1786,7 +2006,7 @@ app.patch("/clients/:name", async (req, res) => {
             client: client.toSafeJSON()
         });
     } catch (error) {
-        console.error("❌ Error updating client:", error);
+        log('error', 'update_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to update client",
@@ -1810,10 +2030,10 @@ app.delete("/clients/:name", async (req, res) => {
         
         // Remove from WireGuard
         try {
-            await runCommand(`wg set wg0 peer ${client.publicKey} remove`);
-            console.log(`✅ Removed peer from WireGuard`);
+            await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
+            log('info', 'peer_removed', { client: name });
         } catch (error) {
-            console.warn("⚠️  Could not remove peer from WireGuard");
+            log('warn', 'peer_remove_failed', { client: name });
         }
         
         // Delete from database
@@ -1828,7 +2048,7 @@ app.delete("/clients/:name", async (req, res) => {
             }
         });
     } catch (error) {
-        console.error("❌ Error deleting client:", error);
+        log('error', 'delete_client_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to delete client",
@@ -1846,7 +2066,7 @@ app.post("/reload", async (req, res) => {
             message: "Clients reloaded from database"
         });
     } catch (error) {
-        console.error("❌ Error reloading clients:", error);
+        log('error', 'reload_error', { error: error.message });
         res.status(500).json({
             success: false,
             error: "Failed to reload clients",
@@ -1885,7 +2105,10 @@ app.get("/", (req, res) => {
     });
 });
 
-// Enhanced health check
+// Phase 5.2: Enhanced health check with per-peer handshake age.
+// A peer whose last handshake was >3 minutes ago is stale (WireGuard rekeys every 2 min).
+// This lets external monitors (Coolify health check, uptime robot, etc.) detect
+// handshake problems before they escalate.
 app.get("/api/health", async (req, res) => {
     try {
         const health = {
@@ -1893,13 +2116,27 @@ app.get("/api/health", async (req, res) => {
             timestamp: new Date().toISOString(),
             service: "WireGuard VPN Management API",
             database: dbInitialized ? "connected" : "disconnected",
-            wireguard: null
+            wireguard: null,
+            stalePeers: []
         };
         
-        // Check WireGuard status
+        // Check WireGuard status and peer handshake health
         try {
-            await runCommand("wg show wg0");
+            const dump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
             health.wireguard = "running";
+            
+            const now = Date.now() / 1000;
+            for (const line of dump.trim().split('\n')) {
+                const parts = line.split('\t');
+                if (parts.length < 7) continue;
+                const handshake = parseInt(parts[3]);
+                if (handshake > 0 && (now - handshake) > 180) {
+                    health.stalePeers.push({
+                        publicKey: parts[0].substring(0, 8) + '...',
+                        lastHandshakeSec: Math.floor(now - handshake)
+                    });
+                }
+            }
         } catch (error) {
             health.wireguard = "not running";
             health.wireguardError = error.message;
@@ -1917,4 +2154,4 @@ app.get("/api/health", async (req, res) => {
 
 // Run API on TCP Port (default 5000, can be overridden via PORT env var)
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ WireGuard API running on port ${PORT}`));
+app.listen(PORT, () => log('info', 'server_started', { port: PORT }));
