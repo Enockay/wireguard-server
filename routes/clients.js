@@ -13,6 +13,8 @@ const {
     getNextAvailableIP
 } = require("../utils/route-helpers");
 const { getTimeAgo } = require("../utils/route-helpers");
+const dotenv = require('dotenv');
+dotenv.config();
 
 // Register all client management routes
 function registerClientRoutes(app, getDbInitialized) {
@@ -26,16 +28,16 @@ function registerClientRoutes(app, getDbInitialized) {
                     error: "Database not initialized"
                 });
             }
-            
-            const { 
-                page = 1, 
-                limit = 50, 
-                enabled, 
+
+            const {
+                page = 1,
+                limit = 50,
+                enabled,
                 search,
                 sortBy = 'createdAt',
                 sortOrder = 'desc'
             } = req.query;
-            
+
             // Build query
             const query = {};
             if (enabled !== undefined) {
@@ -48,11 +50,11 @@ function registerClientRoutes(app, getDbInitialized) {
                     { ip: { $regex: search, $options: 'i' } }
                 ];
             }
-            
+
             // Calculate pagination
             const skip = (parseInt(page) - 1) * parseInt(limit);
             const sort = { [sortBy]: sortOrder === 'asc' ? 1 : -1 };
-            
+
             // Get clients and total count
             const [clients, total] = await Promise.all([
                 Client.find(query)
@@ -61,9 +63,9 @@ function registerClientRoutes(app, getDbInitialized) {
                     .limit(parseInt(limit)),
                 Client.countDocuments(query)
             ]);
-            
+
             const safeClients = clients.map(c => c.toSafeJSON());
-            
+
             res.json({
                 success: true,
                 clients: safeClients,
@@ -90,7 +92,7 @@ function registerClientRoutes(app, getDbInitialized) {
             const { name } = req.params;
             const { includePrivateKey = 'false' } = req.query;
             const client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -98,12 +100,12 @@ function registerClientRoutes(app, getDbInitialized) {
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             // Return full details if requested, otherwise safe version
-            const clientData = includePrivateKey === 'true' 
-                ? client.toObject() 
+            const clientData = includePrivateKey === 'true'
+                ? client.toObject()
                 : client.toSafeJSON();
-            
+
             res.json({
                 success: true,
                 data: clientData
@@ -124,7 +126,7 @@ function registerClientRoutes(app, getDbInitialized) {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -132,31 +134,31 @@ function registerClientRoutes(app, getDbInitialized) {
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             // Get server's public key and endpoint
             const serverPublicKey = (await getServerPublicKey()).trim();
             const serverEndpoint = client.endpoint || getServerEndpoint();
-            
+
             // Generate complete client configuration
             const dns = client.dns || "";
             const allowedIPs = client.allowedIPs || "0.0.0.0/0";
             const keepalive = validateKeepalive(client.persistentKeepalive);
-            
+
             let clientConfig = `[Interface]
 PrivateKey = ${client.privateKey}
 Address = ${client.ip}`;
-            
+
             if (dns) {
                 clientConfig += `\nDNS = ${dns}`;
             }
-            
+
             clientConfig += `\n
 [Peer]
 PublicKey = ${serverPublicKey}
 Endpoint = ${serverEndpoint}
 AllowedIPs = ${allowedIPs}
 PersistentKeepalive = ${keepalive}`;
-            
+
             res.setHeader('Content-Type', 'text/plain');
             res.setHeader('Content-Disposition', `attachment; filename="${client.name}.conf"`);
             res.send(clientConfig);
@@ -177,7 +179,7 @@ PersistentKeepalive = ${keepalive}`;
             const { name } = req.params;
             // Try to find client by exact name match first
             let client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             // If not found, try to find by ID (in case name contains ID)
             if (!client && name.includes('-')) {
                 const parts = name.split('-');
@@ -194,7 +196,7 @@ PersistentKeepalive = ${keepalive}`;
                     }
                 }
             }
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -202,13 +204,13 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             const serverPublicKey = (await getServerPublicKey()).trim();
             const serverEndpoint = client.endpoint || getServerEndpoint();
             const serverEndpointParts = serverEndpoint.split(':');
             const serverHost = serverEndpointParts[0];
             const serverPort = serverEndpointParts[1] || '51820';
-            
+
             // Validate required fields
             if (!client.ip) {
                 return res.status(400).json({
@@ -217,7 +219,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "NO_IP_ADDRESS"
                 });
             }
-            
+
             if (!client.privateKey) {
                 return res.status(400).json({
                     success: false,
@@ -225,19 +227,19 @@ PersistentKeepalive = ${keepalive}`;
                     error: "NO_PRIVATE_KEY"
                 });
             }
-            
+
             const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
             const allowed = "10.0.0.0/24";
             // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
             const dns = (client.dns || "8.8.8.8,1.1.1.1").replace(/,\s+/g, ',').trim();
             const keepalive = validateKeepalive(client.persistentKeepalive);
             const serverWgIp = "10.0.0.1";
-            
+
             // System user credentials for SSH monitoring
             // Use environment variable or generate a secure password (same for all routers)
-            const systemUsername = process.env.MIKROTIK_SYSTEM_USERNAME ;
+            const systemUsername = process.env.MIKROTIK_SYSTEM_USERNAME;
             let systemPassword = process.env.MIKROTIK_SYSTEM_PASSWORD;
-            
+
             // If password not set, generate one and log it (admin should set it in env)
             if (!systemPassword) {
                 const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*';
@@ -245,13 +247,13 @@ PersistentKeepalive = ${keepalive}`;
                 for (let i = 0; i < 24; i++) {
                     systemPassword += chars.charAt(Math.floor(Math.random() * chars.length));
                 }
-                log('warn', 'system_password_generated', { 
+                log('warn', 'system_password_generated', {
                     message: 'MIKROTIK_SYSTEM_PASSWORD not set, generated random password. Set it in .env for consistency.',
                     username: systemUsername,
                     password: systemPassword
                 });
             }
-            
+
             // Escape values for MikroTik script (escape quotes and special chars properly)
             const escapeMikrotikValue = (value) => {
                 if (value === null || value === undefined) return '';
@@ -268,7 +270,7 @@ PersistentKeepalive = ${keepalive}`;
                 str = str.replace(/[\x00-\x1F\x7F]/g, '');
                 return str;
             };
-            
+
             // Generate smart MikroTik auto-config script with connectivity check
             const autoconfigScript = `# WireGuard Auto-Configuration Script
 # Generated: ${new Date().toISOString()}
@@ -371,7 +373,7 @@ PersistentKeepalive = ${keepalive}`;
 } else={
     :put "WireGuard client configured but ping to $SERVERWGIP failed. Check firewall/connectivity."
 }`;
-            
+
             res.setHeader('Content-Type', 'text/plain');
             res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);
             res.send(autoconfigScript);
@@ -392,7 +394,7 @@ PersistentKeepalive = ${keepalive}`;
             const { name } = req.params;
             const { iface, subnet } = req.query;
             const client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -400,20 +402,20 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             const serverPublicKey = (await getServerPublicKey()).trim();
             const serverEndpoint = client.endpoint || getServerEndpoint();
             const serverEndpointParts = serverEndpoint.split(':');
             const serverHost = serverEndpointParts[0];
             const serverPort = serverEndpointParts[1] || '51820';
-            
+
             const ifaceName = (iface || client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
             const allowed = (subnet || client.allowedIPs || "0.0.0.0/0").toString();
             const keepalive = validateKeepalive(client.persistentKeepalive);
-            
+
             // Generate MikroTik script
             const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
-            
+
             res.setHeader('Content-Type', 'text/plain');
             res.setHeader('Content-Disposition', `attachment; filename="${client.name}.rsc"`);
             res.send(mikrotikScript);
@@ -433,9 +435,9 @@ PersistentKeepalive = ${keepalive}`;
         try {
             const { name } = req.params;
             const { target, count = 3 } = req.body;
-            
+
             const client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -443,10 +445,10 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             // Extract router IP from client IP (remove /32 if present)
             let routerIp = target;
-            
+
             // If no target provided, try to get from client IP
             if (!routerIp) {
                 if (!client.ip) {
@@ -459,7 +461,7 @@ PersistentKeepalive = ${keepalive}`;
                 }
                 routerIp = client.ip.split('/')[0].trim();
             }
-            
+
             // Validate router IP
             if (!routerIp || routerIp.length === 0) {
                 return res.status(400).json({
@@ -469,7 +471,7 @@ PersistentKeepalive = ${keepalive}`;
                     client: client.name
                 });
             }
-            
+
             // Ping the router's VPN IP
             const { runCommand } = require("../wg-core");
             try {
@@ -505,17 +507,17 @@ PersistentKeepalive = ${keepalive}`;
     // Create new client (admin)
     app.post("/api/clients", async (req, res) => {
         try {
-            const { 
-                name, 
-                notes, 
-                interfaceName, 
+            const {
+                name,
+                notes,
+                interfaceName,
                 allowedIPs = "0.0.0.0/0",
                 endpoint,
                 dns,
                 persistentKeepalive = KEEPALIVE_TIME,
-                enabled = true 
+                enabled = true
             } = req.body;
-            
+
             if (!name) {
                 return res.status(400).json({
                     success: false,
@@ -523,9 +525,9 @@ PersistentKeepalive = ${keepalive}`;
                     error: "VALIDATION_ERROR"
                 });
             }
-            
+
             const clientName = name.toLowerCase().trim();
-            
+
             // Validate IP format if provided
             if (allowedIPs && !/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(allowedIPs) && allowedIPs !== "0.0.0.0/0") {
                 return res.status(400).json({
@@ -534,7 +536,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "INVALID_IP"
                 });
             }
-            
+
             // Check if client already exists
             const existing = await Client.findOne({ name: clientName });
             if (existing) {
@@ -544,11 +546,11 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_EXISTS"
                 });
             }
-            
+
             // Generate keys
             const { privateKey, publicKey } = await generateKeys();
             const allocatedIp = await getNextAvailableIP(getDbInitialized());
-            
+
             // Create client
             const client = new Client({
                 name: clientName,
@@ -563,9 +565,9 @@ PersistentKeepalive = ${keepalive}`;
                 dns: dns,
                 persistentKeepalive: persistentKeepalive
             });
-            
+
             await client.save();
-            
+
             // Add to WireGuard if enabled
             if (enabled) {
                 try {
@@ -576,7 +578,7 @@ PersistentKeepalive = ${keepalive}`;
                     log('warn', 'peer_add_failed', { client: clientName, error: error.message });
                 }
             }
-            
+
             res.status(201).json({
                 success: true,
                 message: "Client created successfully",
@@ -592,7 +594,7 @@ PersistentKeepalive = ${keepalive}`;
             });
         } catch (error) {
             log('error', 'create_client_error', { error: error.message });
-            
+
             if (error.code === 11000) {
                 return res.status(409).json({
                     success: false,
@@ -601,7 +603,7 @@ PersistentKeepalive = ${keepalive}`;
                     field: Object.keys(error.keyPattern || {})[0]
                 });
             }
-            
+
             res.status(500).json({
                 success: false,
                 message: "Failed to create client",
@@ -615,9 +617,9 @@ PersistentKeepalive = ${keepalive}`;
     app.put("/api/clients/:name", async (req, res) => {
         try {
             const { name } = req.params;
-            const { 
-                notes, 
-                interfaceName, 
+            const {
+                notes,
+                interfaceName,
                 enabled,
                 ip,
                 allowedIPs,
@@ -625,9 +627,9 @@ PersistentKeepalive = ${keepalive}`;
                 dns,
                 persistentKeepalive
             } = req.body;
-            
+
             const client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -635,7 +637,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             // Validate IP format if provided
             if (ip && !/^10\.0\.0\.\d{1,3}\/32$/.test(ip)) {
                 return res.status(400).json({
@@ -644,7 +646,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "INVALID_IP"
                 });
             }
-            
+
             if (allowedIPs && !/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(allowedIPs) && allowedIPs !== "0.0.0.0/0") {
                 return res.status(400).json({
                     success: false,
@@ -652,7 +654,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "INVALID_IP"
                 });
             }
-            
+
             // Update fields
             const updateData = {};
             if (notes !== undefined) updateData.notes = notes;
@@ -663,13 +665,13 @@ PersistentKeepalive = ${keepalive}`;
             if (endpoint !== undefined) updateData.endpoint = endpoint;
             if (dns !== undefined) updateData.dns = dns;
             if (persistentKeepalive !== undefined) updateData.persistentKeepalive = validateKeepalive(persistentKeepalive);
-            
+
             const updatedClient = await Client.findOneAndUpdate(
                 { name: name.toLowerCase() },
                 updateData,
                 { new: true }
             );
-            
+
             // Update WireGuard if enabled status changed or IP changed
             if (typeof enabled === 'boolean' || ip !== undefined) {
                 if (enabled !== false && updatedClient.enabled) {
@@ -687,7 +689,7 @@ PersistentKeepalive = ${keepalive}`;
                     } catch (error) {
                         log('warn', 'peer_disable_failed', { client: name, error: error.message });
                     }
-                    
+
                     // Clear statistics for disabled client
                     await Client.updateOne(
                         { _id: updatedClient._id },
@@ -703,7 +705,7 @@ PersistentKeepalive = ${keepalive}`;
                     );
                 }
             }
-            
+
             res.json({
                 success: true,
                 message: "Client updated successfully"
@@ -724,29 +726,29 @@ PersistentKeepalive = ${keepalive}`;
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
                     error: `Client "${name}" not found`
                 });
             }
-            
+
             // Remove old peer from WireGuard
             try {
                 await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
             } catch (error) {
                 log('warn', 'peer_remove_failed', { client: name, error: error.message });
             }
-            
+
             // Generate new keys
             const { privateKey, publicKey } = await generateKeys();
-            
+
             // Update client
             client.privateKey = privateKey;
             client.publicKey = publicKey;
             await client.save();
-            
+
             // Add new peer to WireGuard if enabled
             if (client.enabled) {
                 try {
@@ -757,7 +759,7 @@ PersistentKeepalive = ${keepalive}`;
                     log('warn', 'peer_regenerate_add_failed', { client: name, error: error.message });
                 }
             }
-            
+
             res.json({
                 success: true,
                 message: "Keys regenerated successfully",
@@ -785,14 +787,14 @@ PersistentKeepalive = ${keepalive}`;
                 { enabled: true },
                 { new: true }
             );
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
                     error: `Client "${name}" not found`
                 });
             }
-            
+
             // Add to WireGuard
             try {
                 const keepalive = validateKeepalive(client.persistentKeepalive);
@@ -801,7 +803,7 @@ PersistentKeepalive = ${keepalive}`;
             } catch (error) {
                 log('warn', 'peer_enable_failed', { client: name, error: error.message });
             }
-            
+
             res.json({
                 success: true,
                 message: "Client enabled successfully"
@@ -825,7 +827,7 @@ PersistentKeepalive = ${keepalive}`;
                 { enabled: false },
                 { new: true }
             );
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -833,7 +835,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             // Remove from WireGuard
             try {
                 await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
@@ -841,7 +843,7 @@ PersistentKeepalive = ${keepalive}`;
             } catch (error) {
                 log('warn', 'peer_disable_failed', { client: name, error: error.message });
             }
-            
+
             // Clear statistics for disabled client
             await Client.updateOne(
                 { _id: client._id },
@@ -855,7 +857,7 @@ PersistentKeepalive = ${keepalive}`;
                     }
                 }
             );
-            
+
             res.json({
                 success: true,
                 message: "Client disabled successfully"
@@ -875,7 +877,7 @@ PersistentKeepalive = ${keepalive}`;
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
-            
+
             if (!client) {
                 return res.status(404).json({
                     success: false,
@@ -883,7 +885,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             // Remove from WireGuard
             try {
                 await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'remove']));
@@ -891,10 +893,10 @@ PersistentKeepalive = ${keepalive}`;
             } catch (error) {
                 log('warn', 'peer_remove_failed', { client: name });
             }
-            
+
             // Delete from database
             await Client.deleteOne({ name: name.toLowerCase() });
-            
+
             res.json({
                 success: true,
                 message: "Client deleted successfully"
@@ -914,7 +916,7 @@ PersistentKeepalive = ${keepalive}`;
     app.post("/api/clients/bulk-delete", async (req, res) => {
         try {
             const { names } = req.body;
-            
+
             if (!Array.isArray(names) || names.length === 0) {
                 return res.status(400).json({
                     success: false,
@@ -922,10 +924,10 @@ PersistentKeepalive = ${keepalive}`;
                     error: "VALIDATION_ERROR"
                 });
             }
-            
+
             const lowerNames = names.map(n => n.toLowerCase());
             const clients = await Client.find({ name: { $in: lowerNames } });
-            
+
             if (clients.length === 0) {
                 return res.status(404).json({
                     success: false,
@@ -933,7 +935,7 @@ PersistentKeepalive = ${keepalive}`;
                     error: "CLIENT_NOT_FOUND"
                 });
             }
-            
+
             // Remove from WireGuard
             for (const client of clients) {
                 try {
@@ -942,10 +944,10 @@ PersistentKeepalive = ${keepalive}`;
                     log('warn', 'peer_remove_failed', { client: client.name });
                 }
             }
-            
+
             // Delete from database
             const result = await Client.deleteMany({ name: { $in: lowerNames } });
-            
+
             res.json({
                 success: true,
                 message: `Deleted ${result.deletedCount} client(s) successfully`,

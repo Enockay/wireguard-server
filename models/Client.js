@@ -54,11 +54,12 @@ const clientSchema = new mongoose.Schema({
     },
     allowedIPs: {
         type: String,
-        default: '0.0.0.0/0',
+        default: '10.0.0.0/24',
         trim: true
     },
     dns: {
         type: String,
+        default: '8.8.8.8,1.1.1.1',
         trim: true
     },
     persistentKeepalive: {
