@@ -273,7 +273,7 @@ PersistentKeepalive = ${keepalive}`;
     :put "WireGuard interface $IFACE already exists, testing connectivity..."
     :local success 0
     :do {
-        /ping $SERVERWGIP count=3 timeout=2s
+        /ping $SERVERWGIP count=3 
         :set success 1
     } on-error={
         :set success 0
