@@ -13,13 +13,28 @@ RUN apk update && \
 # Set working directory for API
 WORKDIR /app
 
+# Copy package.json first for better Docker layer caching
+COPY package.json package-lock.json* /app/
+
+# Install all dependencies from package.json
+RUN npm install --no-audit --no-fund --production
+
 # Copy the API script and database files
 COPY wireguard-api.js /app/
 COPY db.js /app/
+COPY wg-core.js /app/
+
+# Copy models directory
 COPY models /app/models/
 
-# Install API dependencies
-RUN npm init -y && npm install --no-audit --no-fund express body-parser cors mongoose
+# Copy routes directory
+COPY routes /app/routes/
+
+# Copy services directory
+COPY services /app/services/
+
+# Copy utils directory
+COPY utils /app/utils/
 
 # Expose API port (will be accessible through WireGuard container's network)
 EXPOSE 5000/tcp
