@@ -44,6 +44,8 @@ const app = express();
 // Enable CORS for all routes with explicit allowed origins
 const allowedOrigins = [
     "https://admin.blackie-networks.com",
+    "https://app.blackie-networks.com",
+    "https://mikrotik.blackie-networks.com",
     "https://blackie-softwareadmin-enockays-projects.vercel.app",
     "http://localhost:5000",
     "http://localhost:5173"
