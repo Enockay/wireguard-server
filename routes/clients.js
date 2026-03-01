@@ -275,7 +275,9 @@ PersistentKeepalive = ${keepalive}`;
     :do {
         /ping $SERVERWGIP count=3 timeout=2s
         :set success 1
-    } on-error={ :set success 0 }
+    } on-error={
+        :set success 0
+    }
 
     :if ($success = 1) do={
         :put "WireGuard for client already configured and working. No changes made."
@@ -319,9 +321,11 @@ PersistentKeepalive = ${keepalive}`;
 :delay 2
 :local success 0
 :do {
-    /ping $SERVER_WG_IP count=3 timeout=2s
+    /ping $SERVERWGIP count=3 timeout=2s
     :set success 1
-} on-error={ :set success 0 }
+} on-error={
+    :set success 0
+}
 
 # Success / fail message
 :if ($success = 1) do={
