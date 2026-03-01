@@ -175,7 +175,25 @@ PersistentKeepalive = ${keepalive}`;
     app.get("/api/clients/:name/autoconfig", async (req, res) => {
         try {
             const { name } = req.params;
-            const client = await Client.findOne({ name: name.toLowerCase() });
+            // Try to find client by exact name match first
+            let client = await Client.findOne({ name: name.toLowerCase() });
+            
+            // If not found, try to find by ID (in case name contains ID)
+            if (!client && name.includes('-')) {
+                const parts = name.split('-');
+                const possibleId = parts[parts.length - 1];
+                if (possibleId && possibleId.length === 24) {
+                    // Looks like a MongoDB ObjectId, try finding by _id
+                    try {
+                        const mongoose = require('mongoose');
+                        if (mongoose.Types.ObjectId.isValid(possibleId)) {
+                            client = await Client.findById(possibleId);
+                        }
+                    } catch (e) {
+                        // Ignore
+                    }
+                }
+            }
             
             if (!client) {
                 return res.status(404).json({
@@ -191,6 +209,23 @@ PersistentKeepalive = ${keepalive}`;
             const serverHost = serverEndpointParts[0];
             const serverPort = serverEndpointParts[1] || '51820';
             
+            // Validate required fields
+            if (!client.ip) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Client "${name}" has no IP address assigned`,
+                    error: "NO_IP_ADDRESS"
+                });
+            }
+            
+            if (!client.privateKey) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Client "${name}" has no private key`,
+                    error: "NO_PRIVATE_KEY"
+                });
+            }
+            
             const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
             const allowed = client.allowedIPs || "0.0.0.0/0";
             // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
@@ -198,10 +233,21 @@ PersistentKeepalive = ${keepalive}`;
             const keepalive = validateKeepalive(client.persistentKeepalive);
             const serverWgIp = "10.0.0.1";
             
-            // Escape values for MikroTik script (remove quotes and special chars that break syntax)
+            // Escape values for MikroTik script (escape quotes and special chars properly)
             const escapeMikrotikValue = (value) => {
-                if (!value) return '';
-                return String(value).replace(/"/g, '').replace(/\$/g, '\\$').trim();
+                if (value === null || value === undefined) return '';
+                let str = String(value).trim();
+                // Remove any existing quotes and problematic characters
+                // Escape backslashes first
+                str = str.replace(/\\/g, '\\\\');
+                // Escape quotes by doubling them (MikroTik uses "" for literal quote)
+                str = str.replace(/"/g, '""');
+                // Remove newlines and carriage returns
+                str = str.replace(/\r?\n/g, ' ');
+                str = str.replace(/\r/g, ' ');
+                // Remove any control characters
+                str = str.replace(/[\x00-\x1F\x7F]/g, '');
+                return str;
             };
             
             // Generate smart MikroTik auto-config script with connectivity check
@@ -211,22 +257,23 @@ PersistentKeepalive = ${keepalive}`;
 
 # Variables
 :local IFACE "${escapeMikrotikValue(ifaceName)}"
-:local CLIENT_IP "${escapeMikrotikValue(client.ip)}"
-:local SERVER_PUBKEY "${escapeMikrotikValue(serverPublicKey)}"
-:local SERVER_HOST "${escapeMikrotikValue(serverHost)}"
-:local SERVER_PORT "${escapeMikrotikValue(serverPort)}"
+:local CLIENTIPFULL "${escapeMikrotikValue(client.ip)}"
+:local CLIENTIP "${escapeMikrotikValue(client.ip.split('/')[0])}"
+:local SERVERPUBKEY "${escapeMikrotikValue(serverPublicKey)}"
+:local SERVERHOST "${escapeMikrotikValue(serverHost)}"
+:local SERVERPORT "${escapeMikrotikValue(serverPort)}"
 :local ALLOWED "${escapeMikrotikValue(allowed)}"
-:local DNS_SERVERS "${escapeMikrotikValue(dns)}"
+:local DNSSERVERS "${escapeMikrotikValue(dns)}"
 :local KEEPALIVE ${keepalive}
-:local SERVER_WG_IP "${escapeMikrotikValue(serverWgIp)}"
-:local CLIENT_PRIVKEY "${escapeMikrotikValue(client.privateKey)}"
+:local SERVERWGIP "${escapeMikrotikValue(serverWgIp)}"
+:local CLIENTPRIVKEY "${escapeMikrotikValue(client.privateKey)}"
 
 # If interface already exists, test connectivity first
 :if ([/interface/wireguard/print count-only where name=$IFACE] > 0) do={
     :put "WireGuard interface $IFACE already exists, testing connectivity..."
     :local success 0
     :do {
-        /ping $SERVER_WG_IP count=3 timeout=2s
+        /ping $SERVERWGIP count=3 timeout=2s
         :set success 1
     } on-error={ :set success 0 }
 
@@ -251,16 +298,16 @@ PersistentKeepalive = ${keepalive}`;
 }
 
 # Create WireGuard interface
-/interface/wireguard/add name=$IFACE listen-port=51820 mtu=1420 private-key="$CLIENT_PRIVKEY"
+/interface/wireguard/add name=$IFACE listen-port=51820 mtu=1420 private-key="$CLIENTPRIVKEY"
 
 # Add peer configuration (server)
-/interface/wireguard/peers/add interface=$IFACE public-key="$SERVER_PUBKEY" endpoint-address=$SERVER_HOST endpoint-port=$SERVER_PORT allowed-address=$ALLOWED persistent-keepalive=$KEEPALIVE
+/interface/wireguard/peers/add interface=$IFACE public-key="$SERVERPUBKEY" endpoint-address=$SERVERHOST endpoint-port=$SERVERPORT allowed-address=$ALLOWED persistent-keepalive=$KEEPALIVE
 
 # Assign IP address to interface
-/ip/address/add address=$CLIENT_IP interface=$IFACE
+/ip/address/add address=$CLIENTIPFULL interface=$IFACE
 
 # Configure DNS
-/ip/dns/set servers=$DNS_SERVERS
+/ip/dns/set servers=$DNSSERVERS
 
 # Enable interface
 /interface/wireguard/set $IFACE disabled=no
@@ -278,9 +325,9 @@ PersistentKeepalive = ${keepalive}`;
 
 # Success / fail message
 :if ($success = 1) do={
-    :put "WireGuard client configured successfully! Ping to $SERVER_WG_IP succeeded."
+    :put "WireGuard client configured successfully! Ping to $SERVERWGIP succeeded."
 } else={
-    :put "WireGuard client configured but ping to $SERVER_WG_IP failed. Check firewall/connectivity."
+    :put "WireGuard client configured but ping to $SERVERWGIP failed. Check firewall/connectivity."
 }`;
             
             res.setHeader('Content-Type', 'text/plain');
