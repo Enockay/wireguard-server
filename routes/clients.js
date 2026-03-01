@@ -193,26 +193,33 @@ PersistentKeepalive = ${keepalive}`;
             
             const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
             const allowed = client.allowedIPs || "0.0.0.0/0";
-            const dns = client.dns || "8.8.8.8, 1.1.1.1";
+            // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
+            const dns = (client.dns || "8.8.8.8,1.1.1.1").replace(/,\s+/g, ',').trim();
             const keepalive = validateKeepalive(client.persistentKeepalive);
             const serverWgIp = "10.0.0.1";
+            
+            // Escape values for MikroTik script (remove quotes and special chars that break syntax)
+            const escapeMikrotikValue = (value) => {
+                if (!value) return '';
+                return String(value).replace(/"/g, '').replace(/\$/g, '\\$').trim();
+            };
             
             // Generate smart MikroTik auto-config script with connectivity check
             const autoconfigScript = `# WireGuard Auto-Configuration Script
 # Generated: ${new Date().toISOString()}
-# Client: ${client.name}
+# Client: ${escapeMikrotikValue(client.name)}
 
 # Variables
-:local IFACE "${ifaceName}"
-:local CLIENT_IP "${client.ip}"
-:local SERVER_PUBKEY "${serverPublicKey}"
-:local SERVER_HOST "${serverHost}"
-:local SERVER_PORT "${serverPort}"
-:local ALLOWED "${allowed}"
-:local DNS_SERVERS "${dns.replace(/,/g, ',')}"
+:local IFACE "${escapeMikrotikValue(ifaceName)}"
+:local CLIENT_IP "${escapeMikrotikValue(client.ip)}"
+:local SERVER_PUBKEY "${escapeMikrotikValue(serverPublicKey)}"
+:local SERVER_HOST "${escapeMikrotikValue(serverHost)}"
+:local SERVER_PORT "${escapeMikrotikValue(serverPort)}"
+:local ALLOWED "${escapeMikrotikValue(allowed)}"
+:local DNS_SERVERS "${escapeMikrotikValue(dns)}"
 :local KEEPALIVE ${keepalive}
-:local SERVER_WG_IP "${serverWgIp}"
-:local CLIENT_PRIVKEY "${client.privateKey}"
+:local SERVER_WG_IP "${escapeMikrotikValue(serverWgIp)}"
+:local CLIENT_PRIVKEY "${escapeMikrotikValue(client.privateKey)}"
 
 # If interface already exists, test connectivity first
 :if ([/interface/wireguard/print count-only where name=$IFACE] > 0) do={
@@ -224,10 +231,10 @@ PersistentKeepalive = ${keepalive}`;
     } on-error={ :set success 0 }
 
     :if ($success = 1) do={
-        :put "WireGuard for client '${client.name}' already configured and working. No changes made."
+        :put "WireGuard for client already configured and working. No changes made."
         :return
     } else={
-        :put "Existing WireGuard config for client '${client.name}' not working. Reinstalling..."
+        :put "Existing WireGuard config not working. Reinstalling..."
 
         # Remove routes using this interface
         /ip/route/remove [find where gateway=$IFACE]
@@ -271,9 +278,9 @@ PersistentKeepalive = ${keepalive}`;
 
 # Success / fail message
 :if ($success = 1) do={
-    :put "WireGuard client '${client.name}' configured successfully! Ping to $SERVER_WG_IP succeeded."
+    :put "WireGuard client configured successfully! Ping to $SERVER_WG_IP succeeded."
 } else={
-    :put "WireGuard client '${client.name}' configured but ping to $SERVER_WG_IP failed. Check firewall/connectivity."
+    :put "WireGuard client configured but ping to $SERVER_WG_IP failed. Check firewall/connectivity."
 }`;
             
             res.setHeader('Content-Type', 'text/plain');
@@ -349,7 +356,30 @@ PersistentKeepalive = ${keepalive}`;
             }
             
             // Extract router IP from client IP (remove /32 if present)
-            const routerIp = target || client.ip.split('/')[0];
+            let routerIp = target;
+            
+            // If no target provided, try to get from client IP
+            if (!routerIp) {
+                if (!client.ip) {
+                    return res.status(400).json({
+                        success: false,
+                        message: `Client "${name}" has no IP address assigned. Please provide a target IP.`,
+                        error: "NO_IP_ADDRESS",
+                        client: client.name
+                    });
+                }
+                routerIp = client.ip.split('/')[0].trim();
+            }
+            
+            // Validate router IP
+            if (!routerIp || routerIp.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid target IP address",
+                    error: "INVALID_IP",
+                    client: client.name
+                });
+            }
             
             // Ping the router's VPN IP
             const { runCommand } = require("../wg-core");
