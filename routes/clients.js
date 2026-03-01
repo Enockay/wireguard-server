@@ -227,7 +227,7 @@ PersistentKeepalive = ${keepalive}`;
             }
             
             const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
-            const allowed = client.allowedIPs || "0.0.0.0/0";
+            const allowed = client.allowedIPs || "0.0.0.0/24";
             // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
             const dns = (client.dns || "8.8.8.8,1.1.1.1").replace(/,\s+/g, ',').trim();
             const keepalive = validateKeepalive(client.persistentKeepalive);
