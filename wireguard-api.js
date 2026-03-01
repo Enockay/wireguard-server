@@ -420,8 +420,10 @@ function startRouterStatusMonitoring() {
 
 // Run API on TCP Port (default 5000, can be overridden via PORT env var)
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-    log('info', 'server_started', { port: PORT });
+// Bind to 0.0.0.0 to make it accessible from outside the container
+// This is especially important when using network_mode: "service:wireguard"
+app.listen(PORT, '0.0.0.0', () => {
+    log('info', 'server_started', { port: PORT, host: '0.0.0.0' });
     
     // Start router status monitoring if WireGuard is enabled
     if (WG_ENABLED) {
