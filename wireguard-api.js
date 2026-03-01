@@ -396,9 +396,13 @@ function startRouterStatusMonitoring() {
                     const vpnIp = router.wireguardClientId.ip.split('/')[0]; // Remove /32
                     
                     // Check router by accessing it via VPN IP and getting routerboard info
+                    // Use system user credentials from environment variables
+                    const systemUsername = process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
+                    const systemPassword = process.env.MIKROTIK_SYSTEM_PASSWORD || '';
+                    
                     const activeCheck = await checkRouterActive(vpnIp, {
-                        username: 'admin', // Default username, can be made configurable
-                        password: '', // Empty password (use SSH keys in production)
+                        username: systemUsername,
+                        password: systemPassword,
                         method: 'ssh', // Try SSH first, falls back to API port check
                         timeout: 5000
                     });

@@ -2,13 +2,17 @@
 # This container handles the REST API and shares WireGuard's network namespace
 FROM alpine:3.20
 
-# Install Node.js, npm, and wireguard-tools (for wg commands)
+# Install Node.js, npm, wireguard-tools, and SSH client (for MikroTik API access)
+# Note: sshpass may not be in default Alpine repos, install openssh-client first
 RUN apk update && \
     apk add --no-cache \
         nodejs \
         npm \
         wireguard-tools \
-        curl
+        curl \
+        openssh-client && \
+    # Try to install sshpass from edge/testing if available, otherwise skip
+    (apk add --no-cache sshpass 2>/dev/null || echo "sshpass not available, password auth disabled") || true
 
 # Set working directory for API
 WORKDIR /app

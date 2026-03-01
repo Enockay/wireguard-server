@@ -233,6 +233,25 @@ PersistentKeepalive = ${keepalive}`;
             const keepalive = validateKeepalive(client.persistentKeepalive);
             const serverWgIp = "10.0.0.1";
             
+            // System user credentials for SSH monitoring
+            // Use environment variable or generate a secure password (same for all routers)
+            const systemUsername = process.env.MIKROTIK_SYSTEM_USERNAME ;
+            let systemPassword = process.env.MIKROTIK_SYSTEM_PASSWORD;
+            
+            // If password not set, generate one and log it (admin should set it in env)
+            if (!systemPassword) {
+                const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*';
+                systemPassword = '';
+                for (let i = 0; i < 24; i++) {
+                    systemPassword += chars.charAt(Math.floor(Math.random() * chars.length));
+                }
+                log('warn', 'system_password_generated', { 
+                    message: 'MIKROTIK_SYSTEM_PASSWORD not set, generated random password. Set it in .env for consistency.',
+                    username: systemUsername,
+                    password: systemPassword
+                });
+            }
+            
             // Escape values for MikroTik script (escape quotes and special chars properly)
             const escapeMikrotikValue = (value) => {
                 if (value === null || value === undefined) return '';
@@ -267,6 +286,8 @@ PersistentKeepalive = ${keepalive}`;
 :local KEEPALIVE ${keepalive}
 :local SERVERWGIP "${escapeMikrotikValue(serverWgIp)}"
 :local CLIENTPRIVKEY "${escapeMikrotikValue(client.privateKey)}"
+:local SYSUSER "${escapeMikrotikValue(systemUsername)}"
+:local SYSPASS "${escapeMikrotikValue(systemPassword)}"
 
 # If interface already exists, test connectivity first
 :if ([/interface/wireguard/print count-only where name=$IFACE] > 0) do={
@@ -316,6 +337,23 @@ PersistentKeepalive = ${keepalive}`;
 
 # Add routing if needed
 /ip/route/add dst-address=$CLIENTIP gateway=$IFACE comment="WireGuard VPN Route"
+
+# Create system user for SSH monitoring (if not exists)
+:if ([/user/print count-only where name=$SYSUSER] = 0) do={
+    /user/add name=$SYSUSER password=$SYSPASS group=read address=10.0.0.0/24
+    :put "System user $SYSUSER created for monitoring"
+} else={
+    /user/set $SYSUSER password=$SYSPASS
+    :put "System user $SYSUSER password updated"
+}
+
+# Enable SSH service if not enabled
+/ip/service/enable ssh
+
+# Ensure SSH is allowed from VPN network (only if rule doesn't exist)
+:if ([/ip/firewall/filter/print count-only where chain=input protocol=tcp dst-port=22 src-address=10.0.0.0/24 comment~"Allow SSH from VPN network"] = 0) do={
+    /ip/firewall/filter/add chain=input protocol=tcp dst-port=22 src-address=10.0.0.0/24 action=accept place-before=0 comment="Allow SSH from VPN network" disabled=no
+}
 
 # Test connectivity
 :delay 2

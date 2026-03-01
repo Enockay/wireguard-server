@@ -17,27 +17,52 @@ const execAsync = promisify(exec);
  */
 async function executeRouterOSCommand(vpnIp, command, username = 'admin', password = '', timeout = 5000) {
     try {
+        // Check if ssh command is available
+        try {
+            await execAsync('which ssh', { timeout: 1000 });
+        } catch (err) {
+            log('error', 'ssh_command_not_found', { vpnIp, error: 'ssh command not available in container' });
+            return {
+                success: false,
+                error: 'SSH client not available. Please install openssh-client in the container.',
+                code: 'ENOENT',
+                vpnIp,
+                command
+            };
+        }
+
         // Use sshpass if password is provided, otherwise use SSH keys
         // For security, we'll use SSH keys in production, but support password for now
         let sshCommand;
         
         if (password) {
+            // Check if sshpass is available
+            try {
+                await execAsync('which sshpass', { timeout: 1000 });
+            } catch (err) {
+                log('warn', 'sshpass_not_found', { vpnIp, message: 'sshpass not available, trying key-based auth' });
+                password = ''; // Fall back to key-based auth
+            }
+        }
+        
+        if (password) {
             // Use sshpass (requires sshpass to be installed)
             // Format: sshpass -p 'password' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 user@host command
-            sshCommand = `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null ${username}@${vpnIp} "${command}"`;
+            sshCommand = `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes ${username}@${vpnIp} "${command}"`;
         } else {
-            // Use SSH without password (key-based auth)
-            sshCommand = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null ${username}@${vpnIp} "${command}"`;
+            // Use SSH without password (key-based auth or interactive)
+            // Note: This will fail if no keys are set up and password auth is disabled
+            sshCommand = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=no -o BatchMode=yes ${username}@${vpnIp} "${command}"`;
         }
 
-        log('info', 'executing_routeros_command', { vpnIp, command: command.substring(0, 50) });
+        log('info', 'executing_routeros_command', { vpnIp, command: command.substring(0, 50), method: password ? 'password' : 'key' });
 
         const { stdout, stderr } = await execAsync(sshCommand, {
             timeout,
             maxBuffer: 1024 * 1024 // 1MB buffer
         });
 
-        if (stderr && !stderr.includes('Warning: Permanently added')) {
+        if (stderr && !stderr.includes('Warning: Permanently added') && !stderr.includes('Host key verification failed')) {
             log('warn', 'routeros_command_stderr', { vpnIp, stderr: stderr.substring(0, 100) });
         }
 
@@ -49,17 +74,25 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
             command
         };
     } catch (error) {
+        // Check if it's an authentication error
+        const isAuthError = error.message.includes('Permission denied') || 
+                           error.message.includes('Authentication failed') ||
+                           error.message.includes('Host key verification failed') ||
+                           error.message.includes('Permission denied (publickey');
+        
         log('error', 'routeros_command_error', { 
             vpnIp, 
             command: command.substring(0, 50),
             error: error.message,
-            code: error.code
+            code: error.code,
+            isAuthError
         });
         
         return {
             success: false,
             error: error.message,
             code: error.code,
+            isAuthError,
             vpnIp,
             command
         };
@@ -70,14 +103,27 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
  * Get routerboard information using SSH
  * Retrieves uptime, resources, and other system information
  */
-async function getRouterboardInfoSSH(vpnIp, username = 'admin', password = '') {
+async function getRouterboardInfoSSH(vpnIp, username = null, password = null) {
+    // Use system user credentials from environment variables
+    if (!username) {
+        username = process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
+    }
+    if (!password) {
+        password = process.env.MIKROTIK_SYSTEM_PASSWORD || '';
+    }
     try {
         // Get system resource information
         const resourceCommand = '/system resource print';
         const resourceResult = await executeRouterOSCommand(vpnIp, resourceCommand, username, password);
         
         if (!resourceResult.success) {
-            // If SSH fails, try checking if API port is open as fallback
+            // If SSH fails due to missing command or auth, fall back to API port check
+            if (resourceResult.code === 'ENOENT' || resourceResult.isAuthError) {
+                log('info', 'ssh_fallback_to_api_port', { vpnIp, reason: resourceResult.code === 'ENOENT' ? 'ssh_not_found' : 'auth_failed' });
+                return await checkAPIPortOpen(vpnIp);
+            }
+            // For other errors, still try API port check as fallback
+            log('warn', 'ssh_command_failed_fallback', { vpnIp, error: resourceResult.error });
             return await checkAPIPortOpen(vpnIp);
         }
 
