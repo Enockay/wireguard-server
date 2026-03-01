@@ -228,19 +228,71 @@ function registerAdminRoutes(app, getDbInitialized) {
     // Get TCP proxy status (admin)
     app.get("/api/admin/proxy/status", async (req, res) => {
         try {
-            const { getAllActiveProxies } = require('../services/tcp-proxy-service');
+            const { getAllActiveProxies, getProxyStatus } = require('../services/tcp-proxy-service');
+            const MikrotikRouter = require('../models/MikrotikRouter');
+            
             const proxies = getAllActiveProxies();
+            const routers = await MikrotikRouter.find({ 
+                status: { $in: ['pending', 'active'] } 
+            }).populate('wireguardClientId');
+            
+            const detailedStatus = routers.map(router => {
+                const proxyStatus = getProxyStatus(router._id);
+                return {
+                    routerId: router._id.toString(),
+                    routerName: router.name,
+                    vpnIp: router.wireguardClientId ? router.wireguardClientId.ip.split('/')[0] : null,
+                    ports: router.ports,
+                    proxyStatus: proxyStatus,
+                    routerStatus: router.status,
+                    lastSeen: router.lastSeen
+                };
+            });
             
             res.json({
                 success: true,
                 proxies: proxies,
-                count: proxies.length
+                detailedStatus: detailedStatus,
+                count: proxies.length,
+                totalRouters: routers.length
             });
         } catch (error) {
             log('error', 'get_proxy_status_error', { error: error.message });
             res.status(500).json({
                 success: false,
                 error: "Failed to get proxy status",
+                details: error.message
+            });
+        }
+    });
+
+    // Test proxy connectivity (admin)
+    app.post("/api/admin/proxy/test", async (req, res) => {
+        try {
+            const { routerId, portType } = req.body;
+            
+            if (!routerId || !portType) {
+                return res.status(400).json({
+                    success: false,
+                    error: "routerId and portType are required",
+                    portTypes: ['winbox', 'ssh', 'api']
+                });
+            }
+
+            const { testProxyConnection } = require('../services/tcp-proxy-service');
+            const result = await testProxyConnection(routerId, portType);
+            
+            res.json({
+                success: result.success,
+                routerId,
+                portType,
+                result
+            });
+        } catch (error) {
+            log('error', 'test_proxy_error', { error: error.message });
+            res.status(500).json({
+                success: false,
+                error: "Failed to test proxy connection",
                 details: error.message
             });
         }

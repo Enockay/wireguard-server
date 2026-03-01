@@ -227,7 +227,7 @@ PersistentKeepalive = ${keepalive}`;
             }
             
             const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
-            const allowed = client.allowedIPs || "0.0.0.0/24";
+            const allowed = "10.0.0.0/24";
             // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
             const dns = (client.dns || "8.8.8.8,1.1.1.1").replace(/,\s+/g, ',').trim();
             const keepalive = validateKeepalive(client.persistentKeepalive);
@@ -315,7 +315,7 @@ PersistentKeepalive = ${keepalive}`;
 /interface/wireguard/set $IFACE disabled=no
 
 # Add routing if needed
-/ip/route/add dst-address=$ALLOWED gateway=$IFACE comment="WireGuard VPN Route"
+/ip/route/add dst-address=$CLIENTIP gateway=$IFACE comment="WireGuard VPN Route"
 
 # Test connectivity
 :delay 2

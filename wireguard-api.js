@@ -374,38 +374,71 @@ function startRouterStatusMonitoring() {
     if (!WG_ENABLED) return;
 
     const MikrotikRouter = require('./models/MikrotikRouter');
+    const { checkRouterActive } = require('./services/mikrotik-api-service');
 
     const checkRouterStatus = async () => {
         try {
             if (!dbInitialized) return;
 
             // Get all active routers
-            const routers = await MikrotikRouter.find({ status: { $in: ['pending', 'active'] } })
+            const routers = await MikrotikRouter.find({ status: { $in: ['pending', 'active', 'offline'] } })
                 .populate('wireguardClientId');
 
-            // Check WireGuard peers
-            try {
-                const wgDump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
-                const activePeers = new Set();
-                
-                wgDump.trim().split('\n').forEach(line => {
-                    const parts = line.split('\t');
-                    if (parts.length > 0 && parts[0].trim()) {
-                        activePeers.add(parts[0].trim());
-                    }
-                });
+            log('info', 'router_status_check_started', { count: routers.length });
 
-                // Update router status based on WireGuard peer status
-                for (const router of routers) {
-                    if (router.wireguardClientId) {
-                        const isOnline = activePeers.has(router.wireguardClientId.publicKey.trim());
-                        await updateRouterStatus(router._id, isOnline);
-                    }
+            // Check each router by connecting to it and retrieving routerboard info
+            for (const router of routers) {
+                if (!router.wireguardClientId) {
+                    continue;
                 }
-    } catch (error) {
-                // WireGuard not available, skip check
-                log('warn', 'router_status_check_skipped', { error: error.message });
+
+                try {
+                    const vpnIp = router.wireguardClientId.ip.split('/')[0]; // Remove /32
+                    
+                    // Check router by accessing it via VPN IP and getting routerboard info
+                    const activeCheck = await checkRouterActive(vpnIp, {
+                        username: 'admin', // Default username, can be made configurable
+                        password: '', // Empty password (use SSH keys in production)
+                        method: 'ssh', // Try SSH first, falls back to API port check
+                        timeout: 5000
+                    });
+
+                    const isActive = activeCheck.isActive;
+                    const routerboardInfo = activeCheck.info;
+
+                    // Update router status and store routerboard info
+                    await updateRouterStatus(router._id, isActive, routerboardInfo);
+
+                    if (isActive) {
+                        log('info', 'router_status_check_success', {
+                            routerId: router._id,
+                            routerName: router.name,
+                            vpnIp,
+                            uptime: routerboardInfo.uptime || 'N/A'
+                        });
+                    } else {
+                        log('warn', 'router_status_check_failed', {
+                            routerId: router._id,
+                            routerName: router.name,
+                            vpnIp,
+                            error: routerboardInfo.error || 'Unknown error'
+                        });
+                    }
+                } catch (error) {
+                    log('error', 'router_status_check_error', {
+                        routerId: router._id,
+                        routerName: router.name,
+                        error: error.message
+                    });
+                    // Mark as offline if check fails
+                    await updateRouterStatus(router._id, false);
+                }
+
+                // Small delay between checks to avoid overwhelming the system
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
+
+            log('info', 'router_status_check_completed', { count: routers.length });
         } catch (error) {
             log('error', 'router_status_monitoring_error', { error: error.message });
         }

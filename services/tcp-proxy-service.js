@@ -18,73 +18,146 @@ const MIKROTIK_PORTS = {
 function createProxyServer(publicPort, targetPort, targetIp, routerName) {
     const server = net.createServer((clientSocket) => {
         const clientInfo = `${clientSocket.remoteAddress}:${clientSocket.remotePort}`;
-        log('info', 'proxy_connection', { 
+        log('info', 'proxy_connection_received', { 
             publicPort, 
             target: `${targetIp}:${targetPort}`,
             router: routerName,
-            client: clientInfo
+            client: clientInfo,
+            timestamp: new Date().toISOString()
         });
 
-        const targetSocket = net.createConnection(targetPort, targetIp, () => {
-            log('info', 'proxy_connected', {
+        let targetSocket = null;
+        let bytesForwarded = 0;
+        let bytesReceived = 0;
+
+        try {
+            targetSocket = net.createConnection(targetPort, targetIp, () => {
+                log('info', 'proxy_target_connected', {
+                    publicPort,
+                    target: `${targetIp}:${targetPort}`,
+                    router: routerName,
+                    client: clientInfo
+                });
+                
+                // Pipe data both ways
+                clientSocket.pipe(targetSocket);
+                targetSocket.pipe(clientSocket);
+                
+                // Track data flow
+                clientSocket.on('data', (data) => {
+                    bytesReceived += data.length;
+                });
+                
+                targetSocket.on('data', (data) => {
+                    bytesForwarded += data.length;
+                });
+            });
+
+            targetSocket.on('error', (err) => {
+                log('error', 'proxy_target_connection_failed', { 
+                    publicPort, 
+                    target: `${targetIp}:${targetPort}`,
+                    router: routerName,
+                    client: clientInfo,
+                    error: err.message,
+                    code: err.code,
+                    errno: err.errno
+                });
+                if (clientSocket && !clientSocket.destroyed) {
+                    clientSocket.destroy();
+                }
+            });
+
+            clientSocket.on('error', (err) => {
+                log('error', 'proxy_client_error', { 
+                    publicPort, 
+                    router: routerName,
+                    client: clientInfo,
+                    error: err.message,
+                    code: err.code
+                });
+                if (targetSocket && !targetSocket.destroyed) {
+                    targetSocket.destroy();
+                }
+            });
+
+            clientSocket.on('close', () => {
+                log('info', 'proxy_client_closed', {
+                    publicPort,
+                    router: routerName,
+                    client: clientInfo,
+                    bytesReceived,
+                    bytesForwarded
+                });
+                if (targetSocket && !targetSocket.destroyed) {
+                    targetSocket.destroy();
+                }
+            });
+
+            targetSocket.on('close', () => {
+                log('info', 'proxy_target_closed', {
+                    publicPort,
+                    target: `${targetIp}:${targetPort}`,
+                    router: routerName,
+                    client: clientInfo,
+                    bytesReceived,
+                    bytesForwarded
+                });
+                if (clientSocket && !clientSocket.destroyed) {
+                    clientSocket.destroy();
+                }
+            });
+        } catch (error) {
+            log('error', 'proxy_creation_error', {
                 publicPort,
-                target: `${targetIp}:${targetPort}`,
-                router: routerName
-            });
-            clientSocket.pipe(targetSocket);
-            targetSocket.pipe(clientSocket);
-        });
-
-        targetSocket.on('error', (err) => {
-            log('error', 'proxy_target_error', { 
-                publicPort, 
-                target: `${targetIp}:${targetPort}`,
                 router: routerName,
-                error: err.message 
+                error: error.message
             });
-            clientSocket.destroy();
-        });
-
-        clientSocket.on('error', (err) => {
-            log('error', 'proxy_client_error', { 
-                publicPort, 
-                router: routerName,
-                error: err.message 
-            });
-            targetSocket.destroy();
-        });
-
-        clientSocket.on('close', () => {
-            targetSocket.destroy();
-        });
-
-        targetSocket.on('close', () => {
-            clientSocket.destroy();
-        });
+            if (clientSocket && !clientSocket.destroyed) {
+                clientSocket.destroy();
+            }
+        }
     });
 
     server.listen(publicPort, '0.0.0.0', () => {
-        log('info', 'proxy_server_started', { 
+        const address = server.address();
+        log('info', 'proxy_server_listening', { 
             publicPort, 
             target: `${targetIp}:${targetPort}`,
-            router: routerName
+            router: routerName,
+            address: address.address,
+            family: address.family,
+            port: address.port
         });
     });
 
     server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
-            log('warn', 'proxy_port_in_use', { 
+            log('error', 'proxy_port_in_use', { 
                 publicPort, 
                 router: routerName,
-                error: err.message 
+                error: err.message,
+                code: err.code
             });
         } else {
             log('error', 'proxy_server_error', { 
                 publicPort, 
                 router: routerName,
-                error: err.message 
+                error: err.message,
+                code: err.code,
+                errno: err.errno
             });
         }
+    });
+
+    // Track server state
+    server.on('listening', () => {
+        log('info', 'proxy_server_listening_state', {
+            publicPort,
+            router: routerName,
+            listening: server.listening,
+            address: server.address()
+        });
     });
 
     return server;
@@ -230,12 +303,26 @@ function getProxyStatus(routerId) {
         return { running: false };
     }
 
-    return {
+    const status = {
         running: true,
-        winbox: proxies.winbox.listening,
-        ssh: proxies.ssh.listening,
-        api: proxies.api.listening
+        winbox: {
+            listening: proxies.winbox.listening,
+            address: proxies.winbox.address ? proxies.winbox.address() : null,
+            connections: proxies.winbox.connections || 0
+        },
+        ssh: {
+            listening: proxies.ssh.listening,
+            address: proxies.ssh.address ? proxies.ssh.address() : null,
+            connections: proxies.ssh.connections || 0
+        },
+        api: {
+            listening: proxies.api.listening,
+            address: proxies.api.address ? proxies.api.address() : null,
+            connections: proxies.api.connections || 0
+        }
     };
+
+    return status;
 }
 
 /**
@@ -244,14 +331,89 @@ function getProxyStatus(routerId) {
 function getAllActiveProxies() {
     const result = [];
     for (const [routerId, proxies] of activeProxies.entries()) {
-        result.push({
-            routerId,
-            winbox: proxies.winbox.address(),
-            ssh: proxies.ssh.address(),
-            api: proxies.api.address()
-        });
+        try {
+            result.push({
+                routerId,
+                winbox: {
+                    listening: proxies.winbox.listening,
+                    address: proxies.winbox.address ? proxies.winbox.address() : null
+                },
+                ssh: {
+                    listening: proxies.ssh.listening,
+                    address: proxies.ssh.address ? proxies.ssh.address() : null
+                },
+                api: {
+                    listening: proxies.api.listening,
+                    address: proxies.api.address ? proxies.api.address() : null
+                }
+            });
+        } catch (error) {
+            log('error', 'get_proxy_address_error', { routerId, error: error.message });
+        }
     }
     return result;
+}
+
+/**
+ * Test proxy connectivity by attempting to connect to target
+ */
+async function testProxyConnection(routerId, portType) {
+    try {
+        const router = await MikrotikRouter.findById(routerId)
+            .populate('wireguardClientId');
+
+        if (!router || !router.wireguardClientId) {
+            throw new Error('Router or WireGuard client not found');
+        }
+
+        const vpnIp = router.wireguardClientId.ip.split('/')[0];
+        const publicPort = router.ports[portType];
+        const targetPort = MIKROTIK_PORTS[portType];
+
+        return new Promise((resolve, reject) => {
+            const testSocket = net.createConnection(targetPort, vpnIp, () => {
+                log('info', 'proxy_test_success', {
+                    routerId,
+                    routerName: router.name,
+                    portType,
+                    publicPort,
+                    target: `${vpnIp}:${targetPort}`
+                });
+                testSocket.destroy();
+                resolve({ success: true, target: `${vpnIp}:${targetPort}` });
+            });
+
+            testSocket.on('error', (err) => {
+                log('error', 'proxy_test_failed', {
+                    routerId,
+                    routerName: router.name,
+                    portType,
+                    publicPort,
+                    target: `${vpnIp}:${targetPort}`,
+                    error: err.message,
+                    code: err.code
+                });
+                resolve({ 
+                    success: false, 
+                    target: `${vpnIp}:${targetPort}`,
+                    error: err.message,
+                    code: err.code
+                });
+            });
+
+            testSocket.setTimeout(5000, () => {
+                testSocket.destroy();
+                resolve({ 
+                    success: false, 
+                    target: `${vpnIp}:${targetPort}`,
+                    error: 'Connection timeout'
+                });
+            });
+        });
+    } catch (error) {
+        log('error', 'proxy_test_error', { routerId, portType, error: error.message });
+        return { success: false, error: error.message };
+    }
 }
 
 module.exports = {
@@ -261,5 +423,6 @@ module.exports = {
     initializeAllProxies,
     getProxyStatus,
     getAllActiveProxies,
+    testProxyConnection,
     MIKROTIK_PORTS
 };

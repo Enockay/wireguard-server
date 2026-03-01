@@ -63,6 +63,19 @@ const mikrotikRouterSchema = new mongoose.Schema({
     notes: {
         type: String,
         trim: true
+    },
+    // Routerboard information (retrieved via API)
+    routerboardInfo: {
+        uptime: String,
+        cpuLoad: String,
+        memoryUsage: String,
+        totalMemory: String,
+        freeMemory: String,
+        boardName: String,
+        model: String,
+        serialNumber: String,
+        firmware: String,
+        lastChecked: Date
     }
 }, {
     timestamps: true,

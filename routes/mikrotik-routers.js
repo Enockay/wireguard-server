@@ -192,6 +192,7 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                         firstConnectedAt: r.firstConnectedAt,
                         createdAt: r.createdAt,
                         isOnline: r.status === 'active',
+                        routerboardInfo: r.routerboardInfo || null,
                         wireguardConfig: r.wireguardClientId ? {
                             clientName: r.wireguardClientId.name
                         } : null
@@ -242,6 +243,7 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                         ip: router.wireguardClientId.ip,
                         clientName: router.wireguardClientId.name
                     } : null,
+                    routerboardInfo: router.routerboardInfo || null,
                     lastSeen: router.lastSeen,
                     firstConnectedAt: router.firstConnectedAt,
                     createdAt: router.createdAt
@@ -343,7 +345,7 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
 }
 
 // Function to update router status when it comes online
-async function updateRouterStatus(routerId, isOnline) {
+async function updateRouterStatus(routerId, isOnline, routerboardInfo = null) {
     try {
         const router = await MikrotikRouter.findById(routerId).populate('userId');
         if (!router) return;
@@ -356,6 +358,22 @@ async function updateRouterStatus(routerId, isOnline) {
             router.lastSeen = now;
             if (!router.firstConnectedAt) {
                 router.firstConnectedAt = now;
+            }
+
+            // Store routerboard information if available
+            if (routerboardInfo && routerboardInfo.success) {
+                router.routerboardInfo = {
+                    uptime: routerboardInfo.uptime || null,
+                    cpuLoad: routerboardInfo.cpuLoad || null,
+                    memoryUsage: routerboardInfo.memoryUsage || null,
+                    totalMemory: routerboardInfo.totalMemory || null,
+                    freeMemory: routerboardInfo.freeMemory || null,
+                    boardName: routerboardInfo.boardName || null,
+                    model: routerboardInfo.model || null,
+                    serialNumber: routerboardInfo.serialNumber || null,
+                    firmware: routerboardInfo.firmware || null,
+                    lastChecked: now
+                };
             }
 
             // Ensure TCP proxy is running
@@ -381,7 +399,8 @@ async function updateRouterStatus(routerId, isOnline) {
                         vpnIp: router.vpnIp,
                         ports: router.ports,
                         status: router.status,
-                        lastSeen: router.lastSeen
+                        lastSeen: router.lastSeen,
+                        routerboardInfo: router.routerboardInfo
                     });
                     log('info', 'router_online_email_sent', { routerId, userId: router.userId._id });
                 } catch (emailError) {
@@ -393,6 +412,10 @@ async function updateRouterStatus(routerId, isOnline) {
             }
         } else {
             router.status = 'offline';
+            // Keep routerboard info but mark last checked
+            if (router.routerboardInfo) {
+                router.routerboardInfo.lastChecked = now;
+            }
         }
 
         await router.save();
