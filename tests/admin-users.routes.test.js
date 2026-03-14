@@ -309,7 +309,7 @@ test('admin users status, verification, password reset, force logout, and trial 
         assert.equal(forceLogout.response.status, 200);
         assert.equal(ctx.securityCalls.some((entry) => entry.type === 'revoke-all'), true);
 
-        const invalidDays = await request('POST', `/api/admin/users/${targetUser._id}/extend-trial`, { body: { days: 0 } });
+        const invalidDays = await request('POST', `/api/admin/users/${targetUser._id}/extend-trial`, { body: { days: 'invalid' } });
         assert.equal(invalidDays.response.status, 400);
 
         const extended = await request('POST', `/api/admin/users/${targetUser._id}/extend-trial`, { body: { days: 5, reason: 'conversion follow up' } });

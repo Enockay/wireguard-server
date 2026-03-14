@@ -43,6 +43,7 @@ function createMonitoringRouteMocks(overrides = {}) {
         async listProvisioningFailures() { return { items: [], pagination: { page: 1, limit: 20, total: 0, pages: 0 } }; },
         async listMonitoringIncidents() { return { items: [incident], pagination: { page: 1, limit: 20, total: 1, pages: 1 } }; },
         async getMonitoringIncidentDetail() { return incident; },
+        async getMonitoringIncidentDocument() { return incident; },
         async getMonitoringIncidentNotes() { return [{ body: 'check' }]; },
         async acknowledgeMonitoringIncident() { return incident; },
         async resolveMonitoringIncident() { return incident; },

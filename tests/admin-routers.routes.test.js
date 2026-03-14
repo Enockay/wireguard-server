@@ -51,7 +51,13 @@ function createRouterRouteMocks(overrides = {}) {
     };
 
     const routerModel = {
-        async findById(id) { return id === router._id ? router : null; },
+        findById(id) {
+            return {
+                async populate() {
+                    return id === router._id ? router : null;
+                }
+            };
+        },
         ...overrides.routerModel
     };
 

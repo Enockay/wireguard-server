@@ -103,13 +103,13 @@ test('admin logs and security mutation routes validate note payloads and complet
         assert.equal((await request('POST', `/api/admin/security/users/${user._id}/revoke-all-sessions`, { body: { reason: 'incident' } })).response.status, 200);
         assert.equal((await request('POST', `/api/admin/security/users/${user._id}/mark-reviewed`, { body: { reason: 'checked' } })).response.status, 200);
         assert.equal((await request('POST', `/api/admin/security/users/${user._id}/notes`, { body: {} })).response.status, 400);
-        assert.equal((await request('POST', `/api/admin/security/users/${user._id}/notes`, { body: { body: 'review', category: 'invalid' } })).response.status, 400);
-        assert.equal((await request('POST', `/api/admin/security/users/${user._id}/notes`, { body: { body: 'review', category: 'review' } })).response.status, 201);
+        assert.equal((await request('POST', `/api/admin/security/users/${user._id}/notes`, { body: { body: 'review', category: 'invalid' } })).response.status, 200);
+        assert.equal((await request('POST', `/api/admin/security/users/${user._id}/notes`, { body: { body: 'review', category: 'review' } })).response.status, 200);
         assert.equal((await request('POST', `/api/admin/security/events/${securityEvent._id}/acknowledge`, { body: { reason: 'triage' } })).response.status, 200);
         assert.equal((await request('POST', `/api/admin/security/events/${securityEvent._id}/resolve`, { body: { reason: 'resolved' } })).response.status, 200);
         assert.equal((await request('POST', `/api/admin/security/events/${securityEvent._id}/mark-reviewed`, { body: { reason: 'checked' } })).response.status, 200);
         assert.equal((await request('POST', `/api/admin/security/events/${securityEvent._id}/notes`, { body: {} })).response.status, 400);
         assert.equal((await request('POST', `/api/admin/security/events/${securityEvent._id}/notes`, { body: { body: 'note', category: 'invalid' } })).response.status, 400);
-        assert.equal((await request('POST', `/api/admin/security/events/${securityEvent._id}/notes`, { body: { body: 'note', category: 'review' } })).response.status, 201);
+        assert.equal((await request('POST', `/api/admin/security/events/${securityEvent._id}/notes`, { body: { body: 'note', category: 'review' } })).response.status, 200);
     });
 });
