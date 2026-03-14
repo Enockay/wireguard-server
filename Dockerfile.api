@@ -37,6 +37,9 @@ COPY routes /app/routes/
 # Copy services directory
 COPY services /app/services/
 
+# Copy middleware directory
+COPY middleware /app/middleware/
+
 # Copy utils directory
 COPY utils /app/utils/
 

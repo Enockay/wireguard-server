@@ -40,6 +40,7 @@ const registerAdminMonitoringRoutes = require("./routes/admin-monitoring");
 const registerAdminBillingRoutes = require("./routes/admin-billing");
 const registerAdminLogRoutes = require("./routes/admin-logs");
 const registerAdminSupportRoutes = require("./routes/admin-support");
+const { requestLogger } = require("./middleware/request-logger");
 
 // Allow running API without a WireGuard interface present (e.g. local dev).
 // When disabled, we skip wg0 readiness checks and wg-dependent background jobs.
@@ -86,6 +87,7 @@ if (!fs.existsSync(uploadsDir)) {
 
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/uploads', express.static(uploadsDir));
+app.use(requestLogger);
 
 // Initialize MongoDB connection
 let dbInitialized = false;
