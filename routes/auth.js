@@ -3,6 +3,8 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { log } = require('../wg-core');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email-service');
+const UserSession = require('../models/UserSession');
+const { recordSecurityEvent, createUserSession, touchSession, getRequestIp, getRequestUserAgent } = require('../services/security-event-service');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
@@ -77,6 +79,8 @@ function registerAuthRoutes(app) {
             // Send verification email
             try {
                 await sendVerificationEmail(user, verificationToken);
+                user.lastVerificationEmailSentAt = new Date();
+                await user.save();
                 log('info', 'verification_email_sent', { userId: user._id, email: user.email });
             } catch (emailError) {
                 log('error', 'verification_email_failed', { 
@@ -87,9 +91,27 @@ function registerAuthRoutes(app) {
                 // Don't fail signup if email fails, but log it
             }
 
+            user.lastLoginAt = new Date();
+            user.failedLoginCount = 0;
+            await user.save();
+
+            const session = await createUserSession({ userId: user._id, req, source: 'signup' });
+            await recordSecurityEvent({
+                eventType: 'signup',
+                category: 'auth',
+                severity: 'low',
+                source: 'user',
+                success: true,
+                userId: user._id,
+                sessionId: session.sessionId,
+                ipAddress: getRequestIp(req),
+                userAgent: getRequestUserAgent(req),
+                metadata: { email: user.email }
+            });
+
             // Generate JWT token
             const token = jwt.sign(
-                { userId: user._id, email: user.email },
+                { userId: user._id, email: user.email, sid: session.sessionId },
                 JWT_SECRET,
                 { expiresIn: JWT_EXPIRY }
             );
@@ -137,9 +159,20 @@ function registerAuthRoutes(app) {
             }
 
             user.emailVerified = true;
+            user.emailVerifiedAt = new Date();
             user.emailVerificationToken = undefined;
             user.emailVerificationExpires = undefined;
             await user.save();
+
+            await recordSecurityEvent({
+                eventType: 'email_verified',
+                category: 'account',
+                severity: 'low',
+                source: 'user',
+                success: true,
+                userId: user._id,
+                metadata: { email: user.email }
+            });
 
             res.json({
                 success: true,
@@ -179,6 +212,18 @@ function registerAuthRoutes(app) {
 
             try {
                 await sendVerificationEmail(user, verificationToken);
+                user.lastVerificationEmailSentAt = new Date();
+                await user.save();
+                await recordSecurityEvent({
+                    eventType: 'verification_email_sent',
+                    category: 'account',
+                    severity: 'low',
+                    source: 'user',
+                    success: true,
+                    userId: user._id,
+                    ipAddress: getRequestIp(req),
+                    userAgent: getRequestUserAgent(req)
+                });
                 log('info', 'verification_email_resent', { userId: user._id, email: user.email });
             } catch (emailError) {
                 log('error', 'resend_verification_email_failed', { 
@@ -221,6 +266,17 @@ function registerAuthRoutes(app) {
             // Find user
             const user = await User.findOne({ email: email.toLowerCase() });
             if (!user) {
+                await recordSecurityEvent({
+                    eventType: 'login_failed',
+                    category: 'auth',
+                    severity: 'medium',
+                    source: 'user',
+                    success: false,
+                    ipAddress: getRequestIp(req),
+                    userAgent: getRequestUserAgent(req),
+                    reason: 'User not found',
+                    metadata: { email: email.toLowerCase() }
+                });
                 return res.status(401).json({
                     success: false,
                     error: 'Invalid email or password'
@@ -230,6 +286,21 @@ function registerAuthRoutes(app) {
             // Check password
             const isValid = await user.comparePassword(password);
             if (!isValid) {
+                user.lastFailedLoginAt = new Date();
+                user.failedLoginCount = (user.failedLoginCount || 0) + 1;
+                await user.save();
+                await recordSecurityEvent({
+                    eventType: 'login_failed',
+                    category: 'auth',
+                    severity: user.failedLoginCount >= 5 ? 'high' : 'medium',
+                    source: 'user',
+                    success: false,
+                    userId: user._id,
+                    ipAddress: getRequestIp(req),
+                    userAgent: getRequestUserAgent(req),
+                    reason: 'Invalid password',
+                    metadata: { failedLoginCount: user.failedLoginCount }
+                });
                 return res.status(401).json({
                     success: false,
                     error: 'Invalid email or password'
@@ -238,15 +309,43 @@ function registerAuthRoutes(app) {
 
             // Check if user is active
             if (!user.isActive) {
+                await recordSecurityEvent({
+                    eventType: 'login_blocked',
+                    category: 'auth',
+                    severity: 'high',
+                    source: 'system',
+                    success: false,
+                    userId: user._id,
+                    ipAddress: getRequestIp(req),
+                    userAgent: getRequestUserAgent(req),
+                    reason: 'Account is deactivated'
+                });
                 return res.status(403).json({
                     success: false,
                     error: 'Account is deactivated'
                 });
             }
 
+            user.lastLoginAt = new Date();
+            user.failedLoginCount = 0;
+            await user.save();
+
+            const session = await createUserSession({ userId: user._id, req, source: 'login' });
+            await recordSecurityEvent({
+                eventType: 'login_succeeded',
+                category: 'auth',
+                severity: 'low',
+                source: 'user',
+                success: true,
+                userId: user._id,
+                sessionId: session.sessionId,
+                ipAddress: getRequestIp(req),
+                userAgent: getRequestUserAgent(req)
+            });
+
             // Generate JWT token
             const token = jwt.sign(
-                { userId: user._id, email: user.email },
+                { userId: user._id, email: user.email, sid: session.sessionId },
                 JWT_SECRET,
                 { expiresIn: JWT_EXPIRY }
             );
@@ -335,7 +434,18 @@ function registerAuthRoutes(app) {
 
             // Generate reset token
             const resetToken = user.generatePasswordResetToken();
+            user.passwordResetRequestedAt = new Date();
             await user.save();
+            await recordSecurityEvent({
+                eventType: 'password_reset_requested',
+                category: 'account',
+                severity: 'medium',
+                source: 'user',
+                success: true,
+                userId: user._id,
+                ipAddress: getRequestIp(req),
+                userAgent: getRequestUserAgent(req)
+            });
 
             // Send password reset email
             try {
@@ -392,9 +502,20 @@ function registerAuthRoutes(app) {
 
             // Set new password
             user.password = password;
+            user.passwordResetCompletedAt = new Date();
             user.passwordResetToken = undefined;
             user.passwordResetExpires = undefined;
             await user.save();
+            await recordSecurityEvent({
+                eventType: 'password_reset_completed',
+                category: 'account',
+                severity: 'high',
+                source: 'user',
+                success: true,
+                userId: user._id,
+                ipAddress: getRequestIp(req),
+                userAgent: getRequestUserAgent(req)
+            });
 
             res.json({
                 success: true,
@@ -423,15 +544,62 @@ function authenticateToken(req, res, next) {
         });
     }
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
+    jwt.verify(token, JWT_SECRET, async (err, user) => {
         if (err) {
             return res.status(403).json({
                 success: false,
                 error: 'Invalid or expired token'
             });
         }
-        req.user = user;
-        next();
+
+        try {
+            const dbUser = await User.findById(user.userId).select('_id email role isActive sessionsRevokedAt');
+            if (!dbUser) {
+                return res.status(401).json({
+                    success: false,
+                    error: 'User not found'
+                });
+            }
+
+            if (!dbUser.isActive) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Account is deactivated'
+                });
+            }
+
+            const issuedAtMs = user.iat ? user.iat * 1000 : 0;
+            if (dbUser.sessionsRevokedAt && issuedAtMs && issuedAtMs <= new Date(dbUser.sessionsRevokedAt).getTime()) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Token has been revoked'
+                });
+            }
+
+            if (user.sid) {
+                const session = await UserSession.findOne({ sessionId: user.sid }).select('status revokedAt');
+                if (session && session.status === 'revoked') {
+                    return res.status(403).json({
+                        success: false,
+                        error: 'Session has been revoked'
+                    });
+                }
+                await touchSession(user.sid);
+            }
+
+            req.user = {
+                ...user,
+                role: dbUser.role,
+                email: dbUser.email
+            };
+            next();
+        } catch (lookupError) {
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to validate authentication token',
+                details: lookupError.message
+            });
+        }
     });
 }
 

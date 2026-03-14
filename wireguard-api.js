@@ -33,6 +33,13 @@ const registerProfileRoutes = require("./routes/profile");
 const registerBillingRoutes = require("./routes/billing");
 const registerReferralRoutes = require("./routes/referrals");
 const registerSupportRoutes = require("./routes/support");
+const registerAdminUserRoutes = require("./routes/admin-users");
+const registerAdminRouterRoutes = require("./routes/admin-routers");
+const registerAdminVpnServerRoutes = require("./routes/admin-vpn-servers");
+const registerAdminMonitoringRoutes = require("./routes/admin-monitoring");
+const registerAdminBillingRoutes = require("./routes/admin-billing");
+const registerAdminLogRoutes = require("./routes/admin-logs");
+const registerAdminSupportRoutes = require("./routes/admin-support");
 
 // Allow running API without a WireGuard interface present (e.g. local dev).
 // When disabled, we skip wg0 readiness checks and wg-dependent background jobs.
@@ -72,7 +79,13 @@ app.use(cors({
     maxAge: 86400 // 24 hours
 }));
 
-app.use(bodyParser.json());
+const uploadsDir = `${__dirname}/uploads`;
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use('/uploads', express.static(uploadsDir));
 
 // Initialize MongoDB connection
 let dbInitialized = false;
@@ -88,6 +101,13 @@ registerProfileRoutes(app); // User profile management (requires auth)
 registerBillingRoutes(app); // Billing and transactions (requires auth)
 registerReferralRoutes(app); // Referral system (requires auth)
 registerSupportRoutes(app); // Support tickets (requires auth)
+registerAdminUserRoutes(app); // Admin user management
+registerAdminRouterRoutes(app); // Admin router management
+registerAdminVpnServerRoutes(app); // Admin VPN infrastructure management
+registerAdminMonitoringRoutes(app); // Admin monitoring and analytics
+registerAdminBillingRoutes(app); // Admin billing and subscription management
+registerAdminLogRoutes(app); // Admin logs, audit trail, and security management
+registerAdminSupportRoutes(app); // Admin support and ticket management
 (async () => {
     try {
         await db.connect();

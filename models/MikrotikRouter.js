@@ -24,6 +24,12 @@ const mikrotikRouterSchema = new mongoose.Schema({
         type: String,
         required: true
     },
+    serverNode: {
+        type: String,
+        default: 'wireguard',
+        trim: true,
+        index: true
+    },
     // Public ports allocated for this router
     ports: {
         winbox: {
@@ -60,10 +66,76 @@ const mikrotikRouterSchema = new mongoose.Schema({
     firstConnectedAt: {
         type: Date
     },
+    lastSetupGeneratedAt: {
+        type: Date
+    },
+    lastReconfiguredAt: {
+        type: Date
+    },
+    provisioningReviewedAt: {
+        type: Date
+    },
+    provisioningReviewedBy: {
+        type: String,
+        trim: true
+    },
+    provisioningError: {
+        type: String,
+        trim: true
+    },
     notes: {
         type: String,
         trim: true
     },
+    adminNotes: [{
+        body: {
+            type: String,
+            required: true,
+            trim: true
+        },
+        category: {
+            type: String,
+            enum: ['support', 'provisioning', 'monitoring', 'billing', 'abuse', 'infrastructure', 'follow_up'],
+            default: 'support'
+        },
+        pinned: {
+            type: Boolean,
+            default: false
+        },
+        author: {
+            type: String,
+            trim: true,
+            default: 'system'
+        },
+        createdAt: {
+            type: Date,
+            default: Date.now
+        }
+    }],
+    internalFlags: [{
+        flag: {
+            type: String,
+            trim: true
+        },
+        severity: {
+            type: String,
+            enum: ['low', 'medium', 'high'],
+            default: 'medium'
+        },
+        description: {
+            type: String,
+            trim: true
+        },
+        createdBy: {
+            type: String,
+            trim: true,
+            default: 'system'
+        },
+        createdAt: {
+            type: Date,
+            default: Date.now
+        }
+    }],
     // Routerboard information (retrieved via API)
     routerboardInfo: {
         uptime: String,
@@ -85,5 +157,6 @@ const mikrotikRouterSchema = new mongoose.Schema({
 // Compound index for user queries
 mikrotikRouterSchema.index({ userId: 1, createdAt: -1 });
 mikrotikRouterSchema.index({ status: 1, lastSeen: -1 });
+mikrotikRouterSchema.index({ serverNode: 1, status: 1, createdAt: -1 });
 
 module.exports = mongoose.model('MikrotikRouter', mikrotikRouterSchema);

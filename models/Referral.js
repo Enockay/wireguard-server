@@ -44,6 +44,5 @@ const referralSchema = new mongoose.Schema({
 
 // Indexes
 referralSchema.index({ referrerId: 1, status: 1 });
-referralSchema.index({ referredId: 1 });
 
 module.exports = mongoose.model('Referral', referralSchema);

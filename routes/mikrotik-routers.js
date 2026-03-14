@@ -80,6 +80,8 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                 vpnIp: allocatedIp,
                 ports,
                 status: 'pending',
+                lastSetupGeneratedAt: new Date(),
+                lastReconfiguredAt: new Date(),
                 notes: notes || ''
             });
 

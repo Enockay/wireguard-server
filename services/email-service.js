@@ -520,11 +520,136 @@ ${resetUrl}
     });
 }
 
+async function sendBillingReminderEmail(user, payload = {}) {
+    const amount = typeof payload.amount === 'number' ? payload.amount.toFixed(2) : '0.00';
+    const dueDate = payload.dueDate ? new Date(payload.dueDate).toISOString() : 'as soon as possible';
+    const paymentUrl = `${FRONTEND_URL}/billing`;
+    const htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #f39c12; color: white; padding: 20px; text-align: center; }
+                .content { padding: 20px; background-color: #f9f9f9; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #f39c12; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+                .info-box { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #f39c12; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Billing Reminder</h1>
+                </div>
+                <div class="content">
+                    <p>Hello ${user.name},</p>
+                    <p>This is a reminder that your account has a billing item that requires attention.</p>
+                    <div class="info-box">
+                        <p><strong>Amount:</strong> ${user.currency || 'USD'} ${amount}</p>
+                        <p><strong>Due date:</strong> ${dueDate}</p>
+                        <p><strong>Reference:</strong> ${payload.reference || 'Billing reminder'}</p>
+                    </div>
+                    <a href="${paymentUrl}" class="button">Open Billing</a>
+                    <p>${payload.message || 'Please review your billing page and complete any outstanding payment or balance top-up.'}</p>
+                </div>
+            </div>
+        </body>
+        </html>
+    `;
+
+    const textContent = `
+Billing Reminder
+
+Hello ${user.name},
+
+This is a reminder that your account has a billing item that requires attention.
+
+Amount: ${user.currency || 'USD'} ${amount}
+Due date: ${dueDate}
+Reference: ${payload.reference || 'Billing reminder'}
+
+${payload.message || 'Please review your billing page and complete any outstanding payment or balance top-up.'}
+
+Open Billing: ${paymentUrl}
+    `;
+
+    return sendEmail({
+        to: user.email,
+        subject: 'Billing Reminder - Blackie Networks',
+        htmlContent,
+        textContent
+    });
+}
+
+async function sendSupportTicketUpdateEmail(user, payload = {}) {
+    const supportUrl = `${FRONTEND_URL}/support`;
+    const subjectLine = payload.subjectLine || `Support Ticket Update: ${payload.ticketSubject || 'Your support request'}`;
+    const htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #1f6feb; color: white; padding: 20px; text-align: center; }
+                .content { padding: 20px; background-color: #f9f9f9; }
+                .info-box { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #1f6feb; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #1f6feb; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Support Ticket Update</h1>
+                </div>
+                <div class="content">
+                    <p>Hello ${user.name},</p>
+                    <p>${payload.intro || 'There has been an update on your support ticket.'}</p>
+                    <div class="info-box">
+                        <p><strong>Ticket:</strong> ${payload.ticketSubject || 'Support request'}</p>
+                        <p><strong>Status:</strong> ${payload.status || 'Updated'}</p>
+                        ${payload.priority ? `<p><strong>Priority:</strong> ${payload.priority}</p>` : ''}
+                    </div>
+                    ${payload.message ? `<div class="info-box"><p>${String(payload.message).replace(/\n/g, '<br>')}</p></div>` : ''}
+                    <a href="${supportUrl}" class="button">Open Support</a>
+                </div>
+            </div>
+        </body>
+        </html>
+    `;
+
+    const textContent = `
+Support Ticket Update
+
+Hello ${user.name},
+
+${payload.intro || 'There has been an update on your support ticket.'}
+
+Ticket: ${payload.ticketSubject || 'Support request'}
+Status: ${payload.status || 'Updated'}
+${payload.priority ? `Priority: ${payload.priority}` : ''}
+
+${payload.message || ''}
+
+Open Support: ${supportUrl}
+    `;
+
+    return sendEmail({
+        to: user.email,
+        subject: subjectLine,
+        htmlContent,
+        textContent
+    });
+}
+
 module.exports = {
     sendEmail,
     sendVerificationEmail,
     sendPasswordResetEmail,
     sendRouterCreatedEmail,
     sendRouterOnlineEmail,
-    sendRouterDeletedEmail
+    sendRouterDeletedEmail,
+    sendBillingReminderEmail,
+    sendSupportTicketUpdateEmail
 };

@@ -31,6 +31,9 @@ const userSchema = new mongoose.Schema({
         type: Boolean,
         default: false
     },
+    emailVerifiedAt: {
+        type: Date
+    },
     emailVerificationToken: {
         type: String,
         index: true
@@ -38,11 +41,20 @@ const userSchema = new mongoose.Schema({
     emailVerificationExpires: {
         type: Date
     },
+    lastVerificationEmailSentAt: {
+        type: Date
+    },
     passwordResetToken: {
         type: String,
         index: true
     },
     passwordResetExpires: {
+        type: Date
+    },
+    passwordResetRequestedAt: {
+        type: Date
+    },
+    passwordResetCompletedAt: {
         type: Date
     },
     isActive: {
@@ -81,6 +93,108 @@ const userSchema = new mongoose.Schema({
     currency: {
         type: String,
         default: 'USD'
+    },
+    company: {
+        type: String,
+        trim: true
+    },
+    phone: {
+        type: String,
+        trim: true
+    },
+    country: {
+        type: String,
+        trim: true
+    },
+    timezone: {
+        type: String,
+        trim: true
+    },
+    supportTier: {
+        type: String,
+        enum: ['standard', 'priority', 'vip'],
+        default: 'standard'
+    },
+    supportRole: {
+        type: String,
+        enum: ['none', 'agent', 'manager'],
+        default: 'none'
+    },
+    supportTeam: {
+        type: String,
+        enum: ['general', 'networking', 'billing', 'security', 'vip', 'operations'],
+        default: 'general'
+    },
+    riskStatus: {
+        type: String,
+        enum: ['normal', 'watchlist', 'flagged', 'restricted'],
+        default: 'normal'
+    },
+    internalFlags: [{
+        flag: {
+            type: String,
+            trim: true
+        },
+        severity: {
+            type: String,
+            enum: ['low', 'medium', 'high'],
+            default: 'medium'
+        },
+        description: {
+            type: String,
+            trim: true
+        },
+        createdBy: {
+            type: String,
+            trim: true,
+            default: 'system'
+        },
+        createdAt: {
+            type: Date,
+            default: Date.now
+        }
+    }],
+    adminNotes: [{
+        body: {
+            type: String,
+            required: true,
+            trim: true
+        },
+        category: {
+            type: String,
+            enum: ['billing', 'payment', 'subscription', 'overdue', 'support', 'finance_review', 'grace_period', 'adjustment', 'security', 'abuse', 'networking', 'onboarding', 'vip', 'technical', 'follow_up'],
+            default: 'support'
+        },
+        pinned: {
+            type: Boolean,
+            default: false
+        },
+        author: {
+            type: String,
+            trim: true,
+            default: 'system'
+        },
+        createdAt: {
+            type: Date,
+            default: Date.now
+        }
+    }],
+    lastLoginAt: {
+        type: Date
+    },
+    lastFailedLoginAt: {
+        type: Date
+    },
+    failedLoginCount: {
+        type: Number,
+        default: 0,
+        min: 0
+    },
+    sessionsRevokedAt: {
+        type: Date
+    },
+    lastSecurityReviewAt: {
+        type: Date
     }
 }, {
     timestamps: true,
@@ -129,9 +243,6 @@ userSchema.methods.toJSON = function() {
 };
 
 // Indexes
-userSchema.index({ email: 1 });
-userSchema.index({ emailVerificationToken: 1 });
-userSchema.index({ passwordResetToken: 1 });
 userSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('User', userSchema);

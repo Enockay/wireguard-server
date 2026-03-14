@@ -1,6 +1,23 @@
 const SupportTicket = require('../models/SupportTicket');
 const { log } = require('../wg-core');
 const { authenticateToken } = require('./auth');
+const { storeSupportAttachments } = require('../services/support-attachment-service');
+const { applySlaTargets } = require('../services/admin-support-service');
+const User = require('../models/User');
+
+function appendWorkflowEvent(ticket, event) {
+    if (!Array.isArray(ticket.workflowEvents)) {
+        ticket.workflowEvents = [];
+    }
+    ticket.workflowEvents.push({
+        eventType: event.eventType,
+        actorType: event.actorType || 'system',
+        actorUserId: event.actorUserId || null,
+        summary: event.summary || '',
+        metadata: event.metadata || {},
+        createdAt: event.createdAt || new Date()
+    });
+}
 
 function registerSupportRoutes(app) {
     // Create support ticket
@@ -16,17 +33,33 @@ function registerSupportRoutes(app) {
                 });
             }
 
+            const user = await User.findById(userId).lean();
             const ticket = new SupportTicket({
                 userId,
                 subject,
                 description,
                 category,
                 priority,
+                assignedTeam: category === 'billing' ? 'billing' : (category === 'technical' ? 'networking' : 'general'),
+                lastReplyAt: new Date(),
+                lastReplyDirection: 'customer',
                 messages: [{
                     userId,
-                    message: description
+                    message: description,
+                    source: 'customer',
+                    attachments: []
+                }],
+                workflowEvents: [{
+                    eventType: 'ticket_created',
+                    actorType: 'customer',
+                    actorUserId: userId,
+                    summary: 'Support ticket created',
+                    metadata: { category, priority }
                 }]
             });
+            const attachments = storeSupportAttachments(ticket._id, req.body?.attachments || []);
+            ticket.messages[0].attachments = attachments;
+            applySlaTargets(ticket, user?.supportTier || 'standard');
 
             await ticket.save();
 
@@ -162,6 +195,7 @@ function registerSupportRoutes(app) {
                 });
             }
 
+            const attachments = storeSupportAttachments(id, req.body?.attachments || []);
             const ticket = await SupportTicket.findOne({ _id: id, userId });
 
             if (!ticket) {
@@ -180,12 +214,31 @@ function registerSupportRoutes(app) {
 
             ticket.messages.push({
                 userId,
-                message
+                message,
+                source: 'customer',
+                attachments
+            });
+            ticket.lastReplyAt = new Date();
+            ticket.lastReplyDirection = 'customer';
+            appendWorkflowEvent(ticket, {
+                eventType: 'customer_reply_added',
+                actorType: 'customer',
+                actorUserId: userId,
+                summary: 'Customer replied to support ticket',
+                metadata: {}
             });
 
             // Reopen if resolved
             if (ticket.status === 'resolved') {
                 ticket.status = 'in_progress';
+                ticket.resolvedAt = null;
+                appendWorkflowEvent(ticket, {
+                    eventType: 'ticket_reopened_by_customer',
+                    actorType: 'customer',
+                    actorUserId: userId,
+                    summary: 'Customer reply reopened the ticket',
+                    metadata: {}
+                });
             }
 
             await ticket.save();
@@ -226,6 +279,13 @@ function registerSupportRoutes(app) {
 
             ticket.status = 'closed';
             ticket.closedAt = new Date();
+            appendWorkflowEvent(ticket, {
+                eventType: 'ticket_closed_by_customer',
+                actorType: 'customer',
+                actorUserId: userId,
+                summary: 'Customer closed the support ticket',
+                metadata: {}
+            });
             await ticket.save();
 
             res.json({
