@@ -66,6 +66,12 @@ const userSchema = new mongoose.Schema({
         enum: ['user', 'admin'],
         default: 'user'
     },
+    adminRole: {
+        type: String,
+        enum: ['super_admin', 'network_admin', 'billing_admin', 'support_admin', 'read_only', null],
+        default: null,
+        index: true
+    },
     trialEndsAt: {
         type: Date,
         default: function() {

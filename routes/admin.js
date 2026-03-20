@@ -1,4 +1,10 @@
 const Client = require("../models/Client");
+const User = require("../models/User");
+const MikrotikRouter = require("../models/MikrotikRouter");
+const MonitoringIncident = require("../models/MonitoringIncident");
+const SupportTicket = require("../models/SupportTicket");
+const Transaction = require("../models/Transaction");
+const AdminAuditLog = require("../models/AdminAuditLog");
 const {
     wgLock,
     log,
@@ -12,6 +18,31 @@ const {
 // Register all admin/system routes
 function registerAdminRoutes(app, getDbInitialized) {
     const wgEnabled = !["0", "false", "no", "off"].includes(String(process.env.WG_ENABLED || "true").toLowerCase());
+
+    function getAuditResource(logEntry) {
+        if (logEntry.targetRouterId) {
+            return { resourceType: "router", resourceId: String(logEntry.targetRouterId) };
+        }
+        if (logEntry.targetServerId) {
+            return { resourceType: "vpn_server", resourceId: String(logEntry.targetServerId) };
+        }
+        if (logEntry.targetIncidentId) {
+            return { resourceType: "incident", resourceId: String(logEntry.targetIncidentId) };
+        }
+        if (logEntry.targetTicketId) {
+            return { resourceType: "support_ticket", resourceId: String(logEntry.targetTicketId) };
+        }
+        if (logEntry.targetSecurityEventId) {
+            return { resourceType: "security_event", resourceId: String(logEntry.targetSecurityEventId) };
+        }
+        if (logEntry.targetUserId) {
+            return { resourceType: "user", resourceId: String(logEntry.targetUserId) };
+        }
+        if (logEntry.targetSessionId) {
+            return { resourceType: "session", resourceId: String(logEntry.targetSessionId) };
+        }
+        return { resourceType: "system", resourceId: "" };
+    }
 
     // Get admin statistics
     app.get("/api/admin/stats", async (req, res) => {
@@ -90,6 +121,111 @@ function registerAdminRoutes(app, getDbInitialized) {
                     };
                 }
             }
+
+            let extendedStats = {
+                users: {
+                    total: 0,
+                    active: 0,
+                    suspended: 0,
+                    trial: 0
+                },
+                routers: {
+                    total: 0,
+                    online: 0,
+                    offline: 0,
+                    pending: 0
+                },
+                billing: {
+                    monthlyRevenue: 0
+                },
+                incidents: {
+                    open: 0
+                },
+                support: {
+                    openTickets: 0
+                },
+                recentActivity: []
+            };
+
+            try {
+                const now = new Date();
+                const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+                const [
+                    totalUsers,
+                    activeUsers,
+                    suspendedUsers,
+                    trialUsers,
+                    totalRouters,
+                    onlineRouters,
+                    offlineRouters,
+                    pendingRouters,
+                    openIncidents,
+                    openTickets,
+                    monthlyRevenue,
+                    recentAuditLogs
+                ] = await Promise.all([
+                    User.countDocuments({ role: "user" }),
+                    User.countDocuments({ role: "user", isActive: true }),
+                    User.countDocuments({ role: "user", isActive: false }),
+                    User.countDocuments({ role: "user", trialUsed: false, trialEndsAt: { $gt: now } }),
+                    MikrotikRouter.countDocuments(),
+                    MikrotikRouter.countDocuments({ status: "active" }),
+                    MikrotikRouter.countDocuments({ status: "offline" }),
+                    MikrotikRouter.countDocuments({ status: "pending" }),
+                    MonitoringIncident.countDocuments({ status: { $in: ["open", "acknowledged"] } }),
+                    SupportTicket.countDocuments({ status: { $in: ["open", "in_progress"] } }),
+                    Transaction.aggregate([
+                        {
+                            $match: {
+                                createdAt: { $gte: monthStart },
+                                status: "completed"
+                            }
+                        },
+                        { $group: { _id: null, total: { $sum: "$amount" } } }
+                    ]),
+                    AdminAuditLog.find()
+                        .sort({ createdAt: -1 })
+                        .limit(8)
+                        .populate("actorUserId", "name email")
+                ]);
+
+                extendedStats = {
+                    users: {
+                        total: totalUsers,
+                        active: activeUsers,
+                        suspended: suspendedUsers,
+                        trial: trialUsers
+                    },
+                    routers: {
+                        total: totalRouters,
+                        online: onlineRouters,
+                        offline: offlineRouters,
+                        pending: pendingRouters
+                    },
+                    billing: {
+                        monthlyRevenue: monthlyRevenue[0]?.total ?? 0
+                    },
+                    incidents: {
+                        open: openIncidents
+                    },
+                    support: {
+                        openTickets: openTickets
+                    },
+                    recentActivity: recentAuditLogs.map((entry) => {
+                        const resource = getAuditResource(entry);
+                        return {
+                            id: entry._id.toString(),
+                            action: entry.action,
+                            adminName: entry.actorUserId?.name || entry.actorUserId?.email || "System",
+                            resourceType: resource.resourceType,
+                            resourceId: resource.resourceId,
+                            createdAt: entry.createdAt.toISOString()
+                        };
+                    })
+                };
+            } catch (extendedError) {
+                log('warn', 'admin_stats_extended_error', { error: extendedError.message });
+            }
             
             res.json({
                 success: true,
@@ -108,7 +244,13 @@ function registerAdminRoutes(app, getDbInitialized) {
                             transferRx: c.transferRx || 0,
                             transferTx: c.transferTx || 0
                         };
-                    })
+                    }),
+                    users: extendedStats.users,
+                    routers: extendedStats.routers,
+                    billing: extendedStats.billing,
+                    incidents: extendedStats.incidents,
+                    support: extendedStats.support,
+                    recentActivity: extendedStats.recentActivity
                 }
             });
         } catch (error) {

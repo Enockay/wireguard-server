@@ -383,6 +383,10 @@ async function listGlobalActivity(query = {}) {
     return paginate(items, query.page, query.limit);
 }
 
+async function exportGlobalActivity(query = {}) {
+    return listGlobalActivity({ ...query, page: 1, limit: Number(query.limit) || 1000 });
+}
+
 async function getGlobalActivityEvent(eventId) {
     const [prefix, rawId] = String(eventId || '').split(':');
     if (!prefix || !rawId) return null;
@@ -460,6 +464,10 @@ async function listAuditTrail(query = {}) {
     return paginate(items, query.page, query.limit);
 }
 
+async function exportAuditTrail(query = {}) {
+    return listAuditTrail({ ...query, page: 1, limit: Number(query.limit) || 1000 });
+}
+
 async function getAuditDetail(auditId) {
     const entry = await AdminAuditLog.findById(auditId)
         .populate('actorUserId', 'name email role')
@@ -520,6 +528,10 @@ async function listSecurityEvents(query = {}) {
         return true;
     });
     return paginate(items, query.page, query.limit);
+}
+
+async function exportSecurityEvents(query = {}) {
+    return listSecurityEvents({ ...query, page: 1, limit: Number(query.limit) || 1000 });
 }
 
 async function getSecurityEventDetail(eventId) {
@@ -980,11 +992,14 @@ module.exports = {
     ADMIN_LOG_PERMISSIONS,
     SECURITY_REVIEW_NOTE_CATEGORIES,
     listGlobalActivity,
+    exportGlobalActivity,
     getGlobalActivityEvent,
     listAuditTrail,
+    exportAuditTrail,
     getAuditDetail,
     getSecurityOverview,
     listSecurityEvents,
+    exportSecurityEvents,
     getSecurityEventDetail,
     listSuspiciousActivity,
     listSecurityReviews,

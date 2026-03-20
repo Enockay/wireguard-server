@@ -120,7 +120,10 @@ function registerAuthRoutes(app) {
                 success: true,
                 message: 'User created successfully. Please check your email to verify your account.',
                 data: {
-                    user: user.toJSON(),
+                    user: {
+                        ...user.toJSON(),
+                        adminRole: user.adminRole || null
+                    },
                     token
                 }
             });
@@ -354,7 +357,10 @@ function registerAuthRoutes(app) {
                 success: true,
                 message: 'Login successful',
                 data: {
-                    user: user.toJSON(),
+                    user: {
+                        ...user.toJSON(),
+                        adminRole: user.adminRole || null
+                    },
                     token
                 }
             });
@@ -395,6 +401,8 @@ function registerAuthRoutes(app) {
                 delete userData.password;
                 delete userData.emailVerificationToken;
             }
+
+            userData.adminRole = user.adminRole || null;
 
             res.json({
                 success: true,

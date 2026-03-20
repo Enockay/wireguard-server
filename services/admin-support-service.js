@@ -9,6 +9,7 @@ const AdminAuditLog = require('../models/AdminAuditLog');
 const { sendSupportTicketUpdateEmail } = require('./email-service');
 
 const ADMIN_SUPPORT_PERMISSIONS = {
+    CREATE: 'admin.support.create',
     VIEW: 'admin.support.view',
     VIEW_OVERVIEW: 'admin.support.view_overview',
     VIEW_TICKETS: 'admin.support.view_tickets',
@@ -355,6 +356,44 @@ function buildTicketListItem(ticket) {
         createdAt: ticket.createdAt,
         updatedAt: ticket.updatedAt
     };
+}
+
+async function createAdminSupportTicket({ userId, subject, description, category = 'general', priority = 'medium', assigneeId = null, actorUserId = null }) {
+    const [user, assignee] = await Promise.all([
+        User.findById(userId),
+        assigneeId ? User.findById(assigneeId) : Promise.resolve(null)
+    ]);
+    if (!user || user.role !== 'user') return null;
+    if (assignee && assignee.role !== 'admin') return false;
+
+    const assignedTeam = assignee?.supportTeam
+        || (category === 'billing' ? 'billing' : category === 'technical' ? 'networking' : 'general');
+
+    const ticket = new SupportTicket({
+        userId: user._id,
+        subject,
+        description,
+        category,
+        priority,
+        status: 'open',
+        assignedTo: assignee?._id || undefined,
+        assignedAt: assignee ? new Date() : undefined,
+        assignedTeam,
+        lastReplyDirection: 'customer',
+        workflowEvents: [{
+            eventType: 'ticket_created',
+            actorType: 'admin',
+            actorUserId,
+            summary: 'Support ticket created by admin',
+            metadata: { category, priority, assignedTeam, assignedTo: assignee?._id || null }
+        }]
+    });
+
+    applySlaTargets(ticket, user.supportTier || 'standard');
+    updateSlaProgress(ticket);
+    await ticket.save();
+
+    return ticket;
 }
 
 async function loadTicketDocument(ticketId) {
@@ -1074,6 +1113,7 @@ module.exports = {
     getSupportOverview,
     getSupportAnalytics,
     listAdminSupportTickets,
+    createAdminSupportTicket,
     getAdminSupportTicketDetail,
     getAdminSupportTicketMessages,
     getAdminSupportTicketContext,

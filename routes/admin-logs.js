@@ -3,11 +3,14 @@ const {
     ADMIN_LOG_PERMISSIONS,
     SECURITY_REVIEW_NOTE_CATEGORIES,
     listGlobalActivity,
+    exportGlobalActivity,
     getGlobalActivityEvent,
     listAuditTrail,
+    exportAuditTrail,
     getAuditDetail,
     getSecurityOverview,
     listSecurityEvents,
+    exportSecurityEvents,
     getSecurityEventDetail,
     listSuspiciousActivity,
     listSecurityReviews,
@@ -38,6 +41,15 @@ function normalizeReason(value) {
     return value ? String(value).trim() : '';
 }
 
+function toCsvValue(value) {
+    const normalized = value === null || value === undefined ? '' : String(value);
+    return `"${normalized.replace(/"/g, '""')}"`;
+}
+
+function buildCsv(headers, rows) {
+    return [headers.map(toCsvValue).join(','), ...rows.map((row) => row.map(toCsvValue).join(','))].join('\n');
+}
+
 function registerAdminLogRoutes(app) {
     app.get('/api/admin/logs/activity', requireAdminPermission(ADMIN_LOG_PERMISSIONS.VIEW_LOGS), async (req, res) => {
         try {
@@ -45,6 +57,35 @@ function registerAdminLogRoutes(app) {
             return res.json({ success: true, items: data.items, pagination: data.pagination });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load activity log', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/logs/activity/export', requireAdminPermission(ADMIN_LOG_PERMISSIONS.VIEW_LOGS), async (req, res) => {
+        try {
+            const data = await exportGlobalActivity(req.query || {});
+            const csv = buildCsv(
+                ['Event ID', 'Event Type', 'Category', 'Actor', 'Actor Email', 'Source', 'Resource Type', 'Resource ID', 'Target User', 'Target Email', 'Summary', 'Severity', 'Timestamp'],
+                data.items.map((item) => [
+                    item.eventId,
+                    item.eventType,
+                    item.category,
+                    item.actor?.name || '',
+                    item.actor?.email || '',
+                    item.source || '',
+                    item.resourceType || '',
+                    item.resourceId || '',
+                    item.targetUser?.name || '',
+                    item.targetUser?.email || '',
+                    item.summary,
+                    item.severity || '',
+                    item.timestamp || ''
+                ])
+            );
+            res.setHeader('Content-Type', 'text/csv');
+            res.setHeader('Content-Disposition', `attachment; filename="activity-logs-${Date.now()}.csv"`);
+            return res.send(csv);
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to export activity logs', details: error.message });
         }
     });
 
@@ -76,6 +117,33 @@ function registerAdminLogRoutes(app) {
         }
     });
 
+    app.get('/api/admin/audit/export', requireAdminPermission(ADMIN_LOG_PERMISSIONS.EXPORT_AUDIT), async (req, res) => {
+        try {
+            const data = await exportAuditTrail(req.query || {});
+            const csv = buildCsv(
+                ['Audit ID', 'Action', 'Actor', 'Actor Email', 'Target Account', 'Target Email', 'Resource Type', 'Resource ID', 'Reason', 'IP Address', 'Timestamp'],
+                data.items.map((item) => [
+                    item.auditId,
+                    item.actionType,
+                    item.actor?.name || '',
+                    item.actor?.email || '',
+                    item.targetAccount?.name || '',
+                    item.targetAccount?.email || '',
+                    item.resourceType || '',
+                    item.resourceId || '',
+                    item.reason || '',
+                    item.ipAddress || '',
+                    item.timestamp || ''
+                ])
+            );
+            res.setHeader('Content-Type', 'text/csv');
+            res.setHeader('Content-Disposition', `attachment; filename="audit-trail-${Date.now()}.csv"`);
+            return res.send(csv);
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to export audit trail', details: error.message });
+        }
+    });
+
     app.get('/api/admin/audit/:auditId', requireAdminPermission(ADMIN_LOG_PERMISSIONS.VIEW_AUDIT), async (req, res) => {
         try {
             const item = await getAuditDetail(req.params.auditId);
@@ -101,6 +169,33 @@ function registerAdminLogRoutes(app) {
             return res.json({ success: true, items: data.items, pagination: data.pagination });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load security events', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/security/events/export', requireAdminPermission(ADMIN_LOG_PERMISSIONS.EXPORT_AUDIT), async (req, res) => {
+        try {
+            const data = await exportSecurityEvents(req.query || {});
+            const csv = buildCsv(
+                ['Event ID', 'Event Type', 'Category', 'Severity', 'User', 'User Email', 'IP Address', 'Acknowledged', 'Resolved', 'Reviewed', 'Timestamp'],
+                data.items.map((item) => [
+                    item.eventId,
+                    item.eventType,
+                    item.category,
+                    item.severity,
+                    item.user?.name || '',
+                    item.user?.email || '',
+                    item.ipAddress || '',
+                    item.acknowledgedAt ? 'Yes' : 'No',
+                    item.resolvedAt ? 'Yes' : 'No',
+                    item.reviewedAt ? 'Yes' : 'No',
+                    item.timestamp || ''
+                ])
+            );
+            res.setHeader('Content-Type', 'text/csv');
+            res.setHeader('Content-Disposition', `attachment; filename="security-events-${Date.now()}.csv"`);
+            return res.send(csv);
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to export security events', details: error.message });
         }
     });
 

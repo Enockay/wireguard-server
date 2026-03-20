@@ -40,11 +40,20 @@ const transactionSchema = new mongoose.Schema({
     },
     paymentMethod: {
         type: String,
-        enum: ['paypal', 'paystack', 'balance', 'manual'],
+        enum: ['paypal', 'paystack', 'balance', 'manual', 'mpesa', 'airtel_money', 'bank_transfer', 'cash'],
         default: 'balance'
     },
     paymentGatewayId: {
         type: String // PayPal or Paystack transaction ID
+    },
+    dueDate: {
+        type: Date
+    },
+    settledAt: {
+        type: Date
+    },
+    failureReason: {
+        type: String
     },
     routerId: {
         type: mongoose.Schema.Types.ObjectId,

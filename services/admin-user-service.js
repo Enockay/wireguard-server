@@ -13,6 +13,9 @@ const FLAG_SEVERITIES = ['low', 'medium', 'high'];
 const ADMIN_PERMISSIONS = {
     VIEW: 'admin.users.view',
     VIEW_DETAILS: 'admin.users.view_details',
+    CREATE: 'admin.users.create',
+    DELETE: 'admin.users.delete',
+    EDIT_PROFILE: 'admin.users.edit_profile',
     MANAGE_STATUS: 'admin.users.manage_status',
     VERIFY: 'admin.users.verify',
     FORCE_PASSWORD_RESET: 'admin.users.force_password_reset',

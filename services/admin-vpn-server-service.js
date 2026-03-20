@@ -20,6 +20,7 @@ const ADMIN_VPN_SERVER_PERMISSIONS = {
     VIEW_HEALTH: 'admin.vpn_servers.view_health',
     VIEW_PEERS: 'admin.vpn_servers.view_peers',
     MANAGE_STATUS: 'admin.vpn_servers.manage_status',
+    RECONCILE: 'admin.vpn_servers.reconcile',
     ADD: 'admin.vpn_servers.add',
     DISABLE: 'admin.vpn_servers.disable',
     MAINTENANCE: 'admin.vpn_servers.maintenance',
@@ -137,6 +138,34 @@ function buildTrafficSummary(runtime) {
         totalTransferBytes: (runtime?.totalTransferRx || 0) + (runtime?.totalTransferTx || 0),
         activePeerCount: runtime?.activePeerCount || 0,
         totalPeerCount: runtime?.totalPeerCount || 0
+    };
+}
+
+function buildTrafficDetail(bundle) {
+    const summary = buildTrafficSummary(bundle.runtime);
+    const capacity = buildCapacitySummary(bundle.server, bundle.runtime, bundle.routers);
+
+    const routerPeerItems = bundle.routers
+        .map((router) => router.wireguardClientId)
+        .filter(Boolean);
+    const peerItems = bundle.server.nodeId === LOCAL_NODE_ID
+        ? [...routerPeerItems, ...bundle.standalonePeers]
+        : routerPeerItems;
+
+    const uniquePeers = Array.from(new Map(peerItems.map((peer) => [String(peer._id), peer])).values());
+
+    return {
+        serverId: String(bundle.server._id),
+        ...summary,
+        peerUtilization: capacity.peerUtilization,
+        routerUtilization: capacity.routerUtilization,
+        trafficByPeer: uniquePeers.map((peer) => ({
+            peerId: String(peer._id),
+            reference: peer.name || peer.email || String(peer._id),
+            transferRx: peer.transferRx || 0,
+            transferTx: peer.transferTx || 0,
+            lastHandshake: peer.lastHandshake || null
+        }))
     };
 }
 
@@ -368,7 +397,7 @@ async function getAdminVpnServerPeers(serverId, filters = {}) {
 async function getAdminVpnServerTraffic(serverId) {
     const bundle = await getServerBundle(serverId);
     if (!bundle) return null;
-    return buildTrafficSummary(bundle.runtime);
+    return buildTrafficDetail(bundle);
 }
 
 function formatAuditEvent(entry) {
@@ -461,13 +490,48 @@ function buildVpnServerDiagnostics(bundle) {
         issues.push({ code: 'overloaded', severity: 'warning', message: 'Server is near or above configured capacity.' });
     }
 
+    const healthChecks = [
+        {
+            check: 'Server enabled',
+            passed: Boolean(bundle.server.enabled),
+            detail: bundle.server.enabled ? 'Server is enabled for router assignments.' : 'Server is currently disabled.'
+        },
+        {
+            check: 'WireGuard interface',
+            passed: bundle.runtime ? Boolean(bundle.runtime.interfaceUp && !bundle.runtime.error) : false,
+            detail: bundle.runtime?.error || (bundle.runtime ? (bundle.runtime.interfaceUp ? 'WireGuard interface is up.' : 'WireGuard interface is down.') : 'Runtime metrics unavailable.')
+        },
+        {
+            check: 'Capacity headroom',
+            passed: !health.load.overloaded,
+            detail: health.load.peerUtilization != null || health.load.routerUtilization != null
+                ? `Peers ${health.load.peerUtilization ?? 0}% / Routers ${health.load.routerUtilization ?? 0}%`
+                : 'Capacity limits are not configured.'
+        },
+        {
+            check: 'Peer freshness',
+            passed: !bundle.runtime?.stalePeers,
+            detail: bundle.runtime?.stalePeers ? `${bundle.runtime.stalePeers} peers have stale or missing handshakes.` : 'Peer handshakes are fresh.'
+        },
+        {
+            check: 'Maintenance isolation',
+            passed: !(bundle.server.maintenanceMode && bundle.routers.some((router) => router.status === 'active')),
+            detail: bundle.server.maintenanceMode
+                ? 'Maintenance mode is enabled.'
+                : 'Server is not in maintenance mode.'
+        }
+    ];
+
     return {
+        serverId: String(bundle.server._id),
         status: issues.some((issue) => issue.severity === 'critical') ? 'critical' : (issues.length ? 'warning' : 'healthy'),
         issues,
         recommendedActions: [
             issues.some((issue) => issue.code === 'wireguard_runtime_error' || issue.code === 'interface_down') ? 'restart_vpn' : null,
             issues.some((issue) => issue.code === 'stale_peers') ? 'reconcile' : null
-        ].filter(Boolean)
+        ].filter(Boolean),
+        healthChecks,
+        generatedAt: new Date().toISOString()
     };
 }
 

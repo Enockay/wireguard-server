@@ -1,4 +1,5 @@
 const User = require('../models/User');
+const MikrotikRouter = require('../models/MikrotikRouter');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email-service');
 const { recordAdminAction } = require('../services/admin-audit-service');
 const { requireAdminPermission } = require('../middleware/admin-auth');
@@ -79,6 +80,46 @@ function registerAdminUserRoutes(app) {
     }
   });
 
+  app.post('/api/admin/users', requireAdminPermission(ADMIN_PERMISSIONS.CREATE), async (req, res) => {
+    try {
+      const name = String(req.body?.name || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+      const phone = req.body?.phone ? String(req.body.phone).trim() : undefined;
+      const company = req.body?.company ? String(req.body.company).trim() : undefined;
+      const country = req.body?.country ? String(req.body.country).trim() : undefined;
+      const reason = normalizeReason(req.body?.reason);
+
+      if (!name || !email || !password || password.length < 6) {
+        return res.status(400).json({ success: false, error: 'name, email, and password (min 6 chars) are required' });
+      }
+
+      const existingUser = await User.findOne({ email });
+      if (existingUser) {
+        return res.status(409).json({ success: false, error: 'A user with this email already exists' });
+      }
+
+      const user = new User({
+        name,
+        email,
+        password,
+        phone,
+        company,
+        country,
+        role: 'user',
+        isActive: true,
+        emailVerified: true,
+        emailVerifiedAt: new Date()
+      });
+      await user.save();
+      await audit(req, user._id, 'admin_create_user', reason, { email: user.email, name: user.name });
+
+      return res.status(201).json({ success: true, user: { id: String(user._id), name: user.name, email: user.email, createdAt: user.createdAt } });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: 'Failed to create user', details: error.message });
+    }
+  });
+
   app.get('/api/admin/users/:id', requireAdminPermission(ADMIN_PERMISSIONS.VIEW_DETAILS), async (req, res) => {
     try {
       const payload = await getAdminUserDetail(req.params.id);
@@ -89,6 +130,44 @@ function registerAdminUserRoutes(app) {
       return res.json({ success: true, data: payload });
     } catch (error) {
       return res.status(500).json({ success: false, error: 'Failed to load user details', details: error.message });
+    }
+  });
+
+  app.put('/api/admin/users/:id', requireAdminPermission(ADMIN_PERMISSIONS.EDIT_PROFILE), async (req, res) => {
+    try {
+      const user = await getTargetUserOr404(req, res);
+      if (!user) return;
+
+      const allowedFields = ['name', 'phone', 'company', 'country'];
+      const changedFields = {};
+      allowedFields.forEach((field) => {
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, field)) {
+          const nextValue = req.body[field] == null ? '' : String(req.body[field]).trim();
+          user[field] = nextValue || undefined;
+          changedFields[field] = user[field] || null;
+        }
+      });
+
+      if (!Object.keys(changedFields).length) {
+        return res.status(400).json({ success: false, error: 'No editable fields were provided' });
+      }
+
+      await user.save();
+      await audit(req, user._id, 'admin_edit_user_profile', normalizeReason(req.body?.reason), changedFields);
+
+      return res.json({
+        success: true,
+        message: 'Profile updated',
+        user: {
+          id: String(user._id),
+          name: user.name,
+          phone: user.phone || null,
+          company: user.company || null,
+          country: user.country || null
+        }
+      });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: 'Failed to update profile', details: error.message });
     }
   });
 
@@ -433,6 +512,29 @@ function registerAdminUserRoutes(app) {
       return res.json({ success: true, message: 'Trial extended successfully', trialEndsAt: user.trialEndsAt });
     } catch (error) {
       return res.status(500).json({ success: false, error: 'Failed to extend trial', details: error.message });
+    }
+  });
+
+  app.delete('/api/admin/users/:id', requireAdminPermission(ADMIN_PERMISSIONS.DELETE), async (req, res) => {
+    try {
+      const user = await getTargetUserOr404(req, res);
+      if (!user) return;
+      if (user.role !== 'user') {
+        return res.status(403).json({ success: false, error: 'Cannot delete another admin user' });
+      }
+
+      const routers = await MikrotikRouter.find({ userId: user._id }).select('status').lean();
+      if (routers.some((router) => router.status === 'active')) {
+        return res.status(400).json({ success: false, error: 'Cannot delete user with active routers — disable or delete routers first' });
+      }
+
+      const reason = normalizeReason(req.body?.reason);
+      await audit(req, user._id, 'admin_delete_user', reason, { email: user.email, name: user.name, routersCount: routers.length });
+      await User.findByIdAndDelete(user._id);
+
+      return res.json({ success: true, message: 'User deleted' });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: 'Failed to delete user', details: error.message });
     }
   });
 }

@@ -1,6 +1,8 @@
 const MikrotikRouter = require('../models/MikrotikRouter');
+const User = require('../models/User');
 const { requireAdminPermission } = require('../middleware/admin-auth');
 const { recordAdminAction } = require('../services/admin-audit-service');
+const { executeRouterOSCommand } = require('../services/mikrotik-api-service');
 const {
     ADMIN_ROUTER_PERMISSIONS,
     ROUTER_NOTE_CATEGORIES,
@@ -17,6 +19,7 @@ const {
     getAdminRouterDiagnostics,
     getAdminRouterNotes,
     getAdminRouterFlags,
+    createRouterAdmin,
     generateRouterSetupArtifacts,
     disableRouter,
     reactivateRouter,
@@ -29,6 +32,97 @@ const {
 
 function normalizeReason(value) {
     return value ? String(value).trim() : '';
+}
+
+function parseRouterKeyValueOutput(output) {
+    const result = {};
+    String(output || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .forEach((line) => {
+            const match = line.match(/^([^:]+):\s*(.+)$/);
+            if (!match) return;
+            const key = match[1].trim();
+            const normalizedKey = key.replace(/\s+/g, '').replace(/-([a-z])/g, (_, character) => character.toUpperCase());
+            result[normalizedKey.charAt(0).toLowerCase() + normalizedKey.slice(1)] = match[2].trim();
+        });
+    return result;
+}
+
+function parseSizeToBytes(value) {
+    if (!value) return null;
+    const match = String(value).trim().match(/^([\d.]+)\s*([kmgti]?i?b?)?$/i);
+    if (!match) return null;
+    const amount = Number(match[1]);
+    if (Number.isNaN(amount)) return null;
+    const unit = (match[2] || '').toLowerCase();
+    const multipliers = {
+        '': 1,
+        b: 1,
+        k: 1024,
+        kb: 1024,
+        kib: 1024,
+        m: 1024 ** 2,
+        mb: 1024 ** 2,
+        mib: 1024 ** 2,
+        g: 1024 ** 3,
+        gb: 1024 ** 3,
+        gib: 1024 ** 3,
+        t: 1024 ** 4,
+        tb: 1024 ** 4,
+        tib: 1024 ** 4,
+    };
+    return Math.round(amount * (multipliers[unit] || 1));
+}
+
+function parseCpuLoad(value) {
+    if (!value) return null;
+    const parsed = Number(String(value).replace(/[^\d.]/g, ''));
+    return Number.isNaN(parsed) ? null : parsed;
+}
+
+function parsePingOutput(output) {
+    const packetsSent = (String(output || '').match(/sent=(\d+)/i) || [])[1];
+    const packetsReceived = (String(output || '').match(/received=(\d+)/i) || [])[1];
+    const packetLoss = (String(output || '').match(/packet-loss=([\d.]+%?)/i) || [])[1];
+    const avgRtt = (String(output || '').match(/avg-rtt=([\d.]+(?:ms)?)/i) || [])[1];
+
+    const sent = packetsSent ? Number(packetsSent) : undefined;
+    const received = packetsReceived ? Number(packetsReceived) : undefined;
+    const parsedLoss = packetLoss ? Number(String(packetLoss).replace('%', '')) : undefined;
+    const parsedRtt = avgRtt ? Number(String(avgRtt).replace(/ms/i, '')) : undefined;
+
+    return {
+        reachable: (received || 0) > 0,
+        packetsSent: sent,
+        packetsReceived: received,
+        packetLoss: parsedLoss,
+        avgRtt: parsedRtt
+    };
+}
+
+function parseInterfacesOutput(output) {
+    const interfaces = [];
+    const lines = String(output || '').split('\n');
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || !/^\d+\s/.test(line)) continue;
+
+        const typeMatch = line.match(/\btype="?([^"\s]+)"?/i);
+        const nameMatch = line.match(/\bname="?([^"\s]+)"?/i);
+        const disabledMatch = line.match(/\bdisabled=(yes|no|true|false)\b/i);
+        const runningMatch = line.match(/\brunning=(yes|no|true|false)\b/i);
+        const commentMatch = line.match(/\bcomment="?([^"]*)"?$/i);
+
+        interfaces.push({
+            name: nameMatch?.[1] || line.replace(/^\d+\s+/, '').split(/\s+/)[0] || 'unknown',
+            type: typeMatch?.[1] || 'unknown',
+            running: runningMatch ? ['yes', 'true'].includes(runningMatch[1].toLowerCase()) : /\bR\b/.test(line),
+            disabled: disabledMatch ? ['yes', 'true'].includes(disabledMatch[1].toLowerCase()) : false,
+            comment: commentMatch?.[1] || null
+        });
+    }
+    return interfaces;
 }
 
 async function getRouterOr404(req, res) {
@@ -74,6 +168,62 @@ function registerAdminRouterRoutes(app) {
             return res.json({ success: true, items: result.items, pagination: result.pagination });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load routers', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const userId = String(req.body?.userId || '').trim();
+            const name = String(req.body?.name || '').trim();
+            const serverNode = String(req.body?.serverNode || 'wireguard').trim() || 'wireguard';
+            const reason = normalizeReason(req.body?.reason);
+
+            if (!userId) {
+                return res.status(400).json({ success: false, error: 'Customer user ID is required' });
+            }
+            if (!name) {
+                return res.status(400).json({ success: false, error: 'Router name is required' });
+            }
+
+            const targetUser = await User.findById(userId).lean();
+            if (!targetUser || targetUser.role !== 'user') {
+                return res.status(404).json({ success: false, error: 'Target customer not found' });
+            }
+
+            const created = await createRouterAdmin({
+                userId,
+                name,
+                serverNode,
+                notes: reason || ''
+            });
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: created.owner._id,
+                targetRouterId: created.router._id,
+                action: 'admin_create_router',
+                reason,
+                metadata: {
+                    serverNode,
+                    vpnIp: created.router.vpnIp,
+                    ports: created.router.ports
+                }
+            });
+
+            return res.status(201).json({
+                success: true,
+                data: {
+                    id: String(created.router._id),
+                    name: created.router.name,
+                    vpnIp: created.router.vpnIp,
+                    ports: created.router.ports,
+                    status: created.router.status,
+                    wireguardConfig: created.artifacts?.wireguardConfig
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to create router', details: error.message });
         }
     });
 
@@ -374,6 +524,140 @@ function registerAdminRouterRoutes(app) {
             return res.json({ success: true, message: 'Router provisioning marked as reviewed', reviewedAt: updated.provisioningReviewedAt });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to mark router as reviewed', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/reboot', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.LIVE_OPS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+            if (router.status !== 'active') {
+                return res.status(400).json({ success: false, error: 'Router is not online' });
+            }
+
+            const result = await executeRouterOSCommand(router.vpnIp, '/system reboot');
+            if (!result.success) {
+                return res.status(500).json({ success: false, error: result.error || 'Failed to send reboot command' });
+            }
+
+            await audit(req, router, 'admin.routers.reboot', normalizeReason(req.body?.reason), {});
+            return res.json({ success: true, message: 'Reboot command sent' });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to reboot router', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/ping', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.LIVE_OPS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const result = await executeRouterOSCommand(router.vpnIp, '/ping 10.0.0.1 count=4');
+            if (!result.success) {
+                return res.json({ success: false, reachable: false, error: result.error || 'Ping failed' });
+            }
+
+            return res.json({ success: true, result: parsePingOutput(result.output) });
+        } catch (error) {
+            return res.status(500).json({ success: false, reachable: false, error: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/command', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.RUN_COMMAND), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const command = String(req.body?.command || '').trim();
+            const reason = normalizeReason(req.body?.reason);
+            if (!command) {
+                return res.status(400).json({ success: false, error: 'Command is required' });
+            }
+            if (command.length > 500) {
+                return res.status(400).json({ success: false, error: 'Command is too long' });
+            }
+
+            const result = await executeRouterOSCommand(router.vpnIp, command);
+            await audit(req, router, 'admin.routers.run_command', reason, { command });
+
+            if (!result.success) {
+                return res.json({ success: false, error: result.error || 'Command execution failed' });
+            }
+
+            return res.json({ success: true, output: result.output || '' });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to run router command', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/routers/:id/interfaces', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.LIVE_OPS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const result = await executeRouterOSCommand(router.vpnIp, '/interface print detail');
+            if (!result.success) {
+                return res.json({ success: false, error: result.error || 'Unable to load interfaces', interfaces: [] });
+            }
+
+            return res.json({ success: true, interfaces: parseInterfacesOutput(result.output) });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: error.message, interfaces: [] });
+        }
+    });
+
+    app.get('/api/admin/routers/:id/live-health', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.LIVE_OPS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const result = await executeRouterOSCommand(router.vpnIp, '/system resource print');
+            if (!result.success) {
+                return res.json({
+                    success: false,
+                    health: {
+                        uptime: null,
+                        cpuLoad: null,
+                        freeMemory: null,
+                        totalMemory: null,
+                        freeHddSpace: null,
+                        boardName: null,
+                        routerosVersion: null,
+                        reachable: false,
+                        error: result.error || 'Unable to fetch live health'
+                    }
+                });
+            }
+
+            const parsed = parseRouterKeyValueOutput(result.output);
+            return res.json({
+                success: true,
+                health: {
+                    uptime: parsed.uptime || null,
+                    cpuLoad: parseCpuLoad(parsed.cpuLoad),
+                    freeMemory: parseSizeToBytes(parsed.freeMemory),
+                    totalMemory: parseSizeToBytes(parsed.totalMemory),
+                    freeHddSpace: parseSizeToBytes(parsed.freeHddSpace),
+                    boardName: parsed.boardName || null,
+                    routerosVersion: parsed.version || null,
+                    reachable: true
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                health: {
+                    uptime: null,
+                    cpuLoad: null,
+                    freeMemory: null,
+                    totalMemory: null,
+                    freeHddSpace: null,
+                    boardName: null,
+                    routerosVersion: null,
+                    reachable: false,
+                    error: error.message
+                }
+            });
         }
     });
 

@@ -56,6 +56,8 @@ services:
       - NET_ADMIN  # Required to run 'wg set' commands to modify WireGuard interface
     depends_on:
       - wireguard
+    volumes:
+      - ../client:/app/client:ro
     environment:
       # MongoDB connection string (REQUIRED - use external MongoDB or set MONGO_URI)
       - MONGO_URI=${MONGO_URI:-mongodb://mongo:27017/wireguard}

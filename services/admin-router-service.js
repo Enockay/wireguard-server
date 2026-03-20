@@ -9,6 +9,7 @@ const { allocatePorts, releasePorts } = require('../utils/port-allocator');
 const { generateKeys, getNextAvailableIP } = require('../utils/route-helpers');
 const { startRouterProxy, stopRouterProxy, restartRouterProxy, getProxyStatus } = require('./tcp-proxy-service');
 const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive, getServerEndpoint, getServerPublicKey } = require('../wg-core');
+const { createSubscription } = require('./billing-service');
 const { sendRouterDeletedEmail } = require('./email-service');
 
 const ROUTER_NOTE_CATEGORIES = ['support', 'provisioning', 'monitoring', 'billing', 'abuse', 'infrastructure', 'follow_up'];
@@ -28,7 +29,10 @@ const ADMIN_ROUTER_PERMISSIONS = {
     DELETE: 'admin.routers.delete',
     ADD_NOTE: 'admin.routers.add_note',
     FLAG: 'admin.routers.flag',
-    EXPORT: 'admin.routers.export'
+    EXPORT: 'admin.routers.export',
+    CREATE: 'admin.routers.create',
+    LIVE_OPS: 'admin.routers.live_ops',
+    RUN_COMMAND: 'admin.routers.run_command'
 };
 
 function toDateOrNull(value) {
@@ -775,6 +779,92 @@ async function generateRouterSetupArtifacts(routerId) {
     };
 }
 
+async function createRouterAdmin({ userId, name, serverNode = 'wireguard', notes = '', dbInitialized = true }) {
+    const owner = await User.findById(userId);
+    if (!owner || owner.role !== 'user') {
+        throw new Error('Target user not found');
+    }
+
+    const trimmedName = String(name || '').trim();
+    if (!trimmedName) {
+        throw new Error('Router name is required');
+    }
+
+    const existingRouter = await MikrotikRouter.findOne({ userId: owner._id, name: trimmedName }).lean();
+    if (existingRouter) {
+        throw new Error('A router with this name already exists for the selected customer');
+    }
+
+    const ports = await allocatePorts();
+    let wireguardClient = null;
+    let router = null;
+    try {
+        const { privateKey, publicKey } = await generateKeys();
+        const allocatedIp = await getNextAvailableIP(dbInitialized);
+
+        wireguardClient = new Client({
+            name: `router-${trimmedName.toLowerCase().replace(/[^a-z0-9_-]/g, '-')}-${owner._id}`,
+            ip: allocatedIp,
+            publicKey,
+            privateKey,
+            enabled: true,
+            notes: `MikroTik router: ${trimmedName}`,
+            createdBy: String(owner._id)
+        });
+
+        await wireguardClient.save();
+
+        try {
+            await attachPeerToWireGuard(wireguardClient);
+        } catch (error) {
+            // Keep parity with existing flows: peer add failures should not block creation.
+        }
+
+        router = new MikrotikRouter({
+            userId: owner._id,
+            name: trimmedName,
+            wireguardClientId: wireguardClient._id,
+            vpnIp: allocatedIp,
+            serverNode: String(serverNode || 'wireguard').trim() || 'wireguard',
+            ports,
+            status: 'pending',
+            lastSetupGeneratedAt: new Date(),
+            lastReconfiguredAt: new Date(),
+            notes: notes || ''
+        });
+
+        await router.save();
+        await createSubscription(owner._id, router._id);
+
+        try {
+            await startRouterProxy(router._id);
+        } catch (error) {
+            // Allow creation to succeed even if proxy bootstrap fails.
+        }
+
+        const serverPublicKey = (await getServerPublicKey()).trim();
+        const serverEndpoint = getServerEndpoint();
+
+        return {
+            router,
+            client: wireguardClient,
+            owner,
+            artifacts: {
+                wireguardConfig: buildWireGuardConfig(wireguardClient, serverPublicKey, serverEndpoint)
+            }
+        };
+    } catch (error) {
+        if (router?._id) {
+            await MikrotikRouter.findByIdAndDelete(router._id).catch(() => undefined);
+        }
+        if (wireguardClient?._id) {
+            await detachPeerFromWireGuard(wireguardClient).catch(() => undefined);
+            await Client.findByIdAndDelete(wireguardClient._id).catch(() => undefined);
+        }
+        throw error;
+    }
+}
+
 async function ensureRouterHasPorts(router) {
     if (router.ports?.winbox && router.ports?.ssh && router.ports?.api) {
         return router.ports;
@@ -1019,6 +1109,7 @@ module.exports = {
     getAdminRouterDiagnostics,
     getAdminRouterNotes,
     getAdminRouterFlags,
+    createRouterAdmin,
     generateRouterSetupArtifacts,
     disableRouter,
     reactivateRouter,

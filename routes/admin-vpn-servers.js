@@ -359,7 +359,7 @@ function registerAdminVpnServerRoutes(app) {
         }
     });
 
-    app.post('/api/admin/vpn-servers/:id/reconcile', requireAdminPermission(ADMIN_VPN_SERVER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+    app.post('/api/admin/vpn-servers/:id/reconcile', requireAdminPermission(ADMIN_VPN_SERVER_PERMISSIONS.RECONCILE), async (req, res) => {
         try {
             const server = await reconcileVpnServer(req.params.id);
             if (!server) {

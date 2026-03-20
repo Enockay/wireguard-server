@@ -5,6 +5,7 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const fs = require("fs");
+const path = require("path");
 const db = require("./db");
 const Client = require("./models/Client");
 const {
@@ -40,6 +41,8 @@ const registerAdminMonitoringRoutes = require("./routes/admin-monitoring");
 const registerAdminBillingRoutes = require("./routes/admin-billing");
 const registerAdminLogRoutes = require("./routes/admin-logs");
 const registerAdminSupportRoutes = require("./routes/admin-support");
+const registerAdminManagementRoutes = require("./routes/admin-management");
+const registerAdminServicePlanRoutes = require("./routes/admin-service-plans");
 const { requestLogger } = require("./middleware/request-logger");
 
 // Allow running API without a WireGuard interface present (e.g. local dev).
@@ -85,9 +88,29 @@ if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
+const clientDirCandidates = [
+    path.resolve(__dirname, "client"),
+    path.resolve(__dirname, "..", "client")
+];
+const clientDir = clientDirCandidates.find((candidate) => fs.existsSync(candidate));
+
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/uploads', express.static(uploadsDir));
 app.use(requestLogger);
+
+if (clientDir) {
+    app.use(express.static(clientDir, {
+        extensions: ['html']
+    }));
+
+    app.get('/', (req, res) => {
+        res.sendFile(path.join(clientDir, 'index.html'));
+    });
+
+    log('info', 'client_frontend_enabled', { clientDir });
+} else {
+    log('warn', 'client_frontend_missing', { checked: clientDirCandidates });
+}
 
 // Initialize MongoDB connection
 let dbInitialized = false;
@@ -110,6 +133,8 @@ registerAdminMonitoringRoutes(app); // Admin monitoring and analytics
 registerAdminBillingRoutes(app); // Admin billing and subscription management
 registerAdminLogRoutes(app); // Admin logs, audit trail, and security management
 registerAdminSupportRoutes(app); // Admin support and ticket management
+registerAdminManagementRoutes(app); // Admin account management
+registerAdminServicePlanRoutes(app); // Admin settings and service plan management
 (async () => {
     try {
         await db.connect();

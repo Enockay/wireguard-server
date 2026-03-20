@@ -11,6 +11,7 @@ const {
     getSupportOverview,
     getSupportAnalytics,
     listAdminSupportTickets,
+    createAdminSupportTicket,
     getAdminSupportTicketDetail,
     getAdminSupportTicketMessages,
     getAdminSupportTicketContext,
@@ -86,6 +87,70 @@ function registerAdminSupportRoutes(app) {
             return res.json({ success: true, items: data.items, pagination: data.pagination });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load support tickets', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/support/tickets', requireAdminPermission(ADMIN_SUPPORT_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const userId = normalizeString(req.body?.userId);
+            const subject = normalizeString(req.body?.subject);
+            const description = normalizeString(req.body?.description);
+            const category = normalizeString(req.body?.category || 'general');
+            const priority = normalizeString(req.body?.priority || 'medium');
+            const assigneeId = normalizeString(req.body?.assigneeId);
+            const reason = normalizeReason(req.body?.reason);
+
+            if (!userId || !subject || !description) {
+                return res.status(400).json({ success: false, error: 'userId, subject, and description are required' });
+            }
+            if (!['technical', 'billing', 'general', 'feature_request', 'bug_report'].includes(category)) {
+                return res.status(400).json({ success: false, error: 'Invalid category' });
+            }
+            if (!['low', 'medium', 'high', 'urgent'].includes(priority)) {
+                return res.status(400).json({ success: false, error: 'Invalid priority' });
+            }
+
+            const targetUser = await User.findById(userId);
+            if (!targetUser || targetUser.role !== 'user') {
+                return res.status(404).json({ success: false, error: 'Subscriber not found' });
+            }
+
+            const ticket = await createAdminSupportTicket({
+                userId,
+                subject,
+                description,
+                category,
+                priority,
+                assigneeId: assigneeId || null,
+                actorUserId: req.adminUser._id
+            });
+
+            if (ticket === false) {
+                return res.status(404).json({ success: false, error: 'Assignee not found' });
+            }
+            if (!ticket) {
+                return res.status(500).json({ success: false, error: 'Failed to create support ticket' });
+            }
+
+            await audit(req, ticket._id, targetUser._id, 'admin_create_ticket', reason, {
+                category,
+                priority,
+                assigneeId: assigneeId || null
+            });
+
+            return res.status(201).json({
+                success: true,
+                message: 'Ticket created',
+                ticket: {
+                    id: String(ticket._id),
+                    ticketReference: String(ticket._id),
+                    subject: ticket.subject,
+                    status: ticket.status,
+                    createdAt: ticket.createdAt
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to create support ticket', details: error.message });
         }
     });
 
