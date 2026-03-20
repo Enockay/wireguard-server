@@ -272,16 +272,25 @@ async function verifyRouterCandidate({ ipAddress, username, password, openPorts 
 
     const identityResult = await executeRouterOSCommand(ipAddress, '/system identity print', username, password, 5000);
     if (!identityResult.success) {
+        const sshReason = identityResult.code === 'ESSHPASS'
+            ? 'Password-based SSH verification is unavailable in the API environment'
+            : identityResult.isAuthError
+                ? 'Invalid credentials'
+                : 'SSH unreachable or disabled';
         return {
             success: false,
-            error: identityResult.isAuthError ? 'Invalid router credentials' : 'Could not connect to router via SSH',
+            error: identityResult.code === 'ESSHPASS'
+                ? 'SSH password verification is not available on this server. Install sshpass or use RouterOS API verification.'
+                : identityResult.isAuthError
+                    ? 'Invalid router credentials'
+                    : 'Could not connect to router via SSH',
             verification: {
                 status: identityResult.isAuthError ? 'failed' : 'unsupported',
                 method: 'ssh',
                 metadata: null,
                 readiness: {
                     status: 'blocked',
-                    reasons: [identityResult.isAuthError ? 'Invalid credentials' : 'SSH unreachable or disabled'],
+                    reasons: [sshReason],
                     apiReachable: openPorts.includes(8728) || openPorts.includes(8729),
                     sshReachable: false,
                     winboxReachable: openPorts.includes(8291),

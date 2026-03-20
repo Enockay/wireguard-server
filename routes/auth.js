@@ -5,9 +5,41 @@ const { log } = require('../wg-core');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email-service');
 const UserSession = require('../models/UserSession');
 const { recordSecurityEvent, createUserSession, touchSession, getRequestIp, getRequestUserAgent } = require('../services/security-event-service');
+const { verifyTotpCode } = require('../utils/totp');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
+const TWO_FACTOR_CHALLENGE_EXPIRY = '10m';
+
+function buildSessionUser(user) {
+    return {
+        ...user.toJSON(),
+        adminRole: user.adminRole || null,
+        twoFactorEnabled: user.role === 'admin' ? Boolean(user.twoFactorEnabled) : false,
+    };
+}
+
+function createSessionToken({ user, sessionId }) {
+    return jwt.sign(
+        { userId: user._id, email: user.email, sid: sessionId },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRY }
+    );
+}
+
+function createTwoFactorChallengeToken({ user, req }) {
+    return jwt.sign(
+        {
+            userId: user._id,
+            email: user.email,
+            purpose: '2fa_login',
+            ipAddress: getRequestIp(req),
+            userAgent: getRequestUserAgent(req),
+        },
+        JWT_SECRET,
+        { expiresIn: TWO_FACTOR_CHALLENGE_EXPIRY }
+    );
+}
 
 function registerAuthRoutes(app) {
     // User signup
@@ -120,10 +152,7 @@ function registerAuthRoutes(app) {
                 success: true,
                 message: 'User created successfully. Please check your email to verify your account.',
                 data: {
-                    user: {
-                        ...user.toJSON(),
-                        adminRole: user.adminRole || null
-                    },
+                    user: buildSessionUser(user),
                     token
                 }
             });
@@ -267,7 +296,7 @@ function registerAuthRoutes(app) {
             }
 
             // Find user
-            const user = await User.findOne({ email: email.toLowerCase() });
+            const user = await User.findOne({ email: email.toLowerCase() }).select('+twoFactorSecret');
             if (!user) {
                 await recordSecurityEvent({
                     eventType: 'login_failed',
@@ -329,6 +358,32 @@ function registerAuthRoutes(app) {
                 });
             }
 
+            if (user.role === 'admin' && user.twoFactorEnabled && user.twoFactorSecret) {
+                user.failedLoginCount = 0;
+                await user.save();
+                await recordSecurityEvent({
+                    eventType: 'login_challenged',
+                    category: 'auth',
+                    severity: 'low',
+                    source: 'user',
+                    success: true,
+                    userId: user._id,
+                    ipAddress: getRequestIp(req),
+                    userAgent: getRequestUserAgent(req),
+                    metadata: { twoFactorRequired: true }
+                });
+
+                return res.status(202).json({
+                    success: true,
+                    message: 'Two-factor authentication required',
+                    data: {
+                        requiresTwoFactor: true,
+                        challengeToken: createTwoFactorChallengeToken({ user, req }),
+                        user: buildSessionUser(user),
+                    }
+                });
+            }
+
             user.lastLoginAt = new Date();
             user.failedLoginCount = 0;
             await user.save();
@@ -346,21 +401,13 @@ function registerAuthRoutes(app) {
                 userAgent: getRequestUserAgent(req)
             });
 
-            // Generate JWT token
-            const token = jwt.sign(
-                { userId: user._id, email: user.email, sid: session.sessionId },
-                JWT_SECRET,
-                { expiresIn: JWT_EXPIRY }
-            );
+            const token = createSessionToken({ user, sessionId: session.sessionId });
 
             res.json({
                 success: true,
                 message: 'Login successful',
                 data: {
-                    user: {
-                        ...user.toJSON(),
-                        adminRole: user.adminRole || null
-                    },
+                    user: buildSessionUser(user),
                     token
                 }
             });
@@ -369,6 +416,122 @@ function registerAuthRoutes(app) {
             res.status(500).json({
                 success: false,
                 error: 'Failed to login',
+                details: error.message
+            });
+        }
+    });
+
+    app.post('/api/auth/login/2fa', async (req, res) => {
+        try {
+            const { challengeToken, code } = req.body;
+
+            if (!challengeToken || !code) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Challenge token and verification code are required'
+                });
+            }
+
+            let challenge;
+            try {
+                challenge = jwt.verify(challengeToken, JWT_SECRET);
+            } catch (error) {
+                return res.status(401).json({
+                    success: false,
+                    error: 'Invalid or expired two-factor challenge'
+                });
+            }
+
+            if (!challenge || challenge.purpose !== '2fa_login' || !challenge.userId) {
+                return res.status(401).json({
+                    success: false,
+                    error: 'Invalid two-factor challenge'
+                });
+            }
+
+            const user = await User.findById(challenge.userId).select('+twoFactorSecret');
+            if (!user) {
+                return res.status(404).json({
+                    success: false,
+                    error: 'User not found'
+                });
+            }
+
+            if (!user.isActive) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Account is deactivated'
+                });
+            }
+
+            if (user.role !== 'admin') {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Two-factor authentication is only available for admin accounts'
+                });
+            }
+
+            if (!user.twoFactorEnabled || !user.twoFactorSecret) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Two-factor authentication is not enabled for this account'
+                });
+            }
+
+            if (!verifyTotpCode(user.twoFactorSecret, code)) {
+                user.lastFailedLoginAt = new Date();
+                user.failedLoginCount = (user.failedLoginCount || 0) + 1;
+                await user.save();
+                await recordSecurityEvent({
+                    eventType: 'login_failed',
+                    category: 'auth',
+                    severity: user.failedLoginCount >= 5 ? 'high' : 'medium',
+                    source: 'user',
+                    success: false,
+                    userId: user._id,
+                    ipAddress: getRequestIp(req),
+                    userAgent: getRequestUserAgent(req),
+                    reason: 'Invalid two-factor code',
+                    metadata: { failedLoginCount: user.failedLoginCount }
+                });
+                return res.status(401).json({
+                    success: false,
+                    error: 'Invalid authentication code'
+                });
+            }
+
+            user.lastLoginAt = new Date();
+            user.failedLoginCount = 0;
+            user.twoFactorLastVerifiedAt = new Date();
+            await user.save();
+
+            const session = await createUserSession({ userId: user._id, req, source: 'login' });
+            await recordSecurityEvent({
+                eventType: 'login_succeeded',
+                category: 'auth',
+                severity: 'low',
+                source: 'user',
+                success: true,
+                userId: user._id,
+                sessionId: session.sessionId,
+                ipAddress: getRequestIp(req),
+                userAgent: getRequestUserAgent(req),
+                metadata: { twoFactorVerified: true }
+            });
+
+            res.json({
+                success: true,
+                message: 'Two-factor login successful',
+                data: {
+                    user: buildSessionUser(user),
+                    token: createSessionToken({ user, sessionId: session.sessionId }),
+                }
+            });
+        } catch (error) {
+            log('error', 'login_2fa_error', { error: error.message });
+            res.status(500).json({
+                success: false,
+                error: 'Failed to complete two-factor login',
                 details: error.message
             });
         }
@@ -403,6 +566,7 @@ function registerAuthRoutes(app) {
             }
 
             userData.adminRole = user.adminRole || null;
+            userData.twoFactorEnabled = Boolean(user.twoFactorEnabled);
 
             res.json({
                 success: true,

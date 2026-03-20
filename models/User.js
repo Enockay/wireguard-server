@@ -188,6 +188,24 @@ const userSchema = new mongoose.Schema({
     lastLoginAt: {
         type: Date
     },
+    twoFactorEnabled: {
+        type: Boolean,
+        default: false
+    },
+    twoFactorSecret: {
+        type: String,
+        select: false
+    },
+    twoFactorTempSecret: {
+        type: String,
+        select: false
+    },
+    twoFactorEnabledAt: {
+        type: Date
+    },
+    twoFactorLastVerifiedAt: {
+        type: Date
+    },
     lastFailedLoginAt: {
         type: Date
     },
@@ -245,6 +263,8 @@ userSchema.methods.toJSON = function() {
     const obj = this.toObject();
     delete obj.password;
     delete obj.emailVerificationToken;
+    delete obj.twoFactorSecret;
+    delete obj.twoFactorTempSecret;
     return obj;
 };
 

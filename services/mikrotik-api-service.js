@@ -40,8 +40,15 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
             try {
                 await execAsync('which sshpass', { timeout: 1000 });
             } catch (err) {
-                log('warn', 'sshpass_not_found', { vpnIp, message: 'sshpass not available, trying key-based auth' });
-                password = ''; // Fall back to key-based auth
+                log('warn', 'sshpass_not_found', { vpnIp, message: 'sshpass not available for password-based SSH authentication' });
+                return {
+                    success: false,
+                    error: 'Password-based SSH verification is unavailable because sshpass is not installed in the API environment.',
+                    code: 'ESSHPASS',
+                    isAuthError: false,
+                    vpnIp,
+                    command
+                };
             }
         }
         
