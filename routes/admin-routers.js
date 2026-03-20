@@ -1,8 +1,17 @@
+const crypto = require('crypto');
 const MikrotikRouter = require('../models/MikrotikRouter');
+const RouterOnboardingClaim = require('../models/RouterOnboardingClaim');
 const User = require('../models/User');
+const RouterDiscoverySession = require('../models/RouterDiscoverySession');
 const { requireAdminPermission } = require('../middleware/admin-auth');
 const { recordAdminAction } = require('../services/admin-audit-service');
 const { executeRouterOSCommand } = require('../services/mikrotik-api-service');
+const {
+    startDiscoveryScan,
+    listDiscoveryResults,
+    verifyDiscoveryCandidate,
+    importDiscoveryCandidate
+} = require('../services/router-discovery-service');
 const {
     ADMIN_ROUTER_PERMISSIONS,
     ROUTER_NOTE_CATEGORIES,
@@ -32,6 +41,87 @@ const {
 
 function normalizeReason(value) {
     return value ? String(value).trim() : '';
+}
+
+function normalizeText(value) {
+    const normalized = value == null ? '' : String(value).trim();
+    return normalized || null;
+}
+
+function resolveRequestIp(req) {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    if (typeof forwardedFor === 'string' && forwardedFor.trim()) {
+        return forwardedFor.split(',')[0].trim();
+    }
+    return req.ip || req.socket?.remoteAddress || null;
+}
+
+function isExpired(claim) {
+    return !!claim?.expiresAt && new Date(claim.expiresAt).getTime() < Date.now();
+}
+
+function markExpiredIfNeeded(claim) {
+    if (claim && ['pending', 'claimed'].includes(claim.status) && isExpired(claim)) {
+        claim.status = 'expired';
+    }
+    return claim;
+}
+
+function getPublicApiBaseUrl(req) {
+    const configured = process.env.PUBLIC_API_URL || process.env.SERVICE_URL_WIREGUARD;
+    if (configured) {
+        return String(configured).replace(/\/$/, '');
+    }
+
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.headers['x-forwarded-host'] || req.get('host') || `localhost:${process.env.API_PORT || process.env.PORT || 5000}`;
+    return `${protocol}://${host}`;
+}
+
+function buildClaimBootstrapScript(claimToken, callbackUrl) {
+    const safeToken = String(claimToken).replace(/"/g, '');
+    return [
+        `:local claimToken "${safeToken}";`,
+        `:local callbackUrl "${callbackUrl}";`,
+        ':local requestUrl ($callbackUrl . "?token=" . $claimToken);',
+        '/tool fetch url=$requestUrl keep-result=no output=none;',
+        ':put "Router claim submitted. Return to the admin panel to adopt this router.";'
+    ].join('\n');
+}
+
+function serializeClaim(claim) {
+    return {
+        id: String(claim._id),
+        user: claim.userId ? {
+            id: String(claim.userId._id || claim.userId),
+            name: claim.userId.name || 'Unknown subscriber',
+            email: claim.userId.email || ''
+        } : null,
+        requestedName: claim.requestedName,
+        serverNode: claim.serverNode || 'wireguard',
+        reason: claim.reason || '',
+        expectedAddressHint: claim.expectedAddressHint || null,
+        status: claim.status,
+        expiresAt: claim.expiresAt,
+        claimedAt: claim.claimedAt || null,
+        adoptedAt: claim.adoptedAt || null,
+        cancelledAt: claim.cancelledAt || null,
+        provisionedRouterId: claim.provisionedRouterId ? String(claim.provisionedRouterId) : null,
+        detected: {
+            sourceIp: claim.detected?.sourceIp || null,
+            userAgent: claim.detected?.userAgent || null,
+            identity: claim.detected?.identity || null,
+            boardName: claim.detected?.boardName || null,
+            serialNumber: claim.detected?.serialNumber || null,
+            routerosVersion: claim.detected?.routerosVersion || null,
+            wanIp: claim.detected?.wanIp || null,
+            lanIp: claim.detected?.lanIp || null,
+            lastSeenAt: claim.detected?.lastSeenAt || null,
+            matchedExpectedAddress: typeof claim.detected?.matchedExpectedAddress === 'boolean' ? claim.detected.matchedExpectedAddress : null
+        },
+        createdAt: claim.createdAt,
+        updatedAt: claim.updatedAt
+    };
 }
 
 function parseRouterKeyValueOutput(output) {
@@ -134,6 +224,15 @@ async function getRouterOr404(req, res) {
     return router;
 }
 
+async function resolveCustomerUser(identifier) {
+    const value = String(identifier || '').trim();
+    if (!value) return null;
+    const query = value.includes('@') ? { email: value.toLowerCase() } : { _id: value };
+    const user = await User.findOne(query);
+    if (!user || user.role !== 'user') return null;
+    return user;
+}
+
 async function audit(req, router, action, reason, metadata = {}) {
     return recordAdminAction({
         req,
@@ -147,6 +246,64 @@ async function audit(req, router, action, reason, metadata = {}) {
 }
 
 function registerAdminRouterRoutes(app) {
+    const handleRouterOnboardingClaim = async (req, res) => {
+        try {
+            const token = String(req.body?.token || req.query?.token || '').trim();
+            if (!token) {
+                return res.status(400).json({ success: false, error: 'Claim token is required' });
+            }
+
+            const claim = await RouterOnboardingClaim.findOne({ tokenHash: RouterOnboardingClaim.hashToken(token) });
+            if (!claim) {
+                return res.status(404).json({ success: false, error: 'Invalid claim token' });
+            }
+
+            markExpiredIfNeeded(claim);
+            if (claim.status === 'expired') {
+                await claim.save();
+                return res.status(410).json({ success: false, error: 'Claim token has expired' });
+            }
+            if (claim.status === 'cancelled') {
+                return res.status(409).json({ success: false, error: 'Claim token has been cancelled' });
+            }
+            if (claim.status === 'adopted') {
+                return res.json({ success: true, status: 'adopted', message: 'Claim already adopted' });
+            }
+
+            const sourceIp = resolveRequestIp(req);
+            const expected = normalizeText(claim.expectedAddressHint);
+            const matchedExpectedAddress = expected ? sourceIp === expected : null;
+            claim.status = 'claimed';
+            claim.claimedAt = claim.claimedAt || new Date();
+            claim.detected = {
+                ...claim.detected,
+                sourceIp,
+                userAgent: normalizeText(req.get('user-agent')),
+                identity: normalizeText(req.body?.identity || req.query?.identity),
+                boardName: normalizeText(req.body?.boardName || req.query?.boardName),
+                serialNumber: normalizeText(req.body?.serialNumber || req.query?.serialNumber),
+                routerosVersion: normalizeText(req.body?.routerosVersion || req.query?.routerosVersion),
+                wanIp: normalizeText(req.body?.wanIp || req.query?.wanIp),
+                lanIp: normalizeText(req.body?.lanIp || req.query?.lanIp),
+                lastSeenAt: new Date(),
+                matchedExpectedAddress
+            };
+            await claim.save();
+
+            return res.json({
+                success: true,
+                status: claim.status,
+                message: 'Router claim accepted. Return to the admin panel to adopt this router.',
+                claimId: String(claim._id)
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to process router claim', details: error.message });
+        }
+    };
+
+    app.get('/api/router-onboarding/claim', handleRouterOnboardingClaim);
+    app.post('/api/router-onboarding/claim', handleRouterOnboardingClaim);
+
     app.get('/api/admin/routers/stats', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW), async (req, res) => {
         try {
             const stats = await getAdminRouterStats();
@@ -171,6 +328,332 @@ function registerAdminRouterRoutes(app) {
         }
     });
 
+    app.get('/api/admin/routers/onboarding/claims', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW), async (req, res) => {
+        try {
+            const query = {};
+            const requestedStatus = String(req.query?.status || '').trim();
+            if (requestedStatus) {
+                query.status = requestedStatus;
+            }
+
+            const claims = await RouterOnboardingClaim.find(query)
+                .populate('userId', 'name email')
+                .sort({ createdAt: -1 })
+                .limit(50);
+
+            let changed = false;
+            for (const claim of claims) {
+                if (['pending', 'claimed'].includes(claim.status) && isExpired(claim)) {
+                    claim.status = 'expired';
+                    await claim.save();
+                    changed = true;
+                }
+            }
+
+            const items = (changed
+                ? await RouterOnboardingClaim.find(query).populate('userId', 'name email').sort({ createdAt: -1 }).limit(50)
+                : claims
+            ).map(serializeClaim);
+
+            return res.json({ success: true, items });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load router onboarding claims', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/discovery/scan', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const session = await startDiscoveryScan({
+                adminUserId: req.adminUser._id,
+                requestedSubnet: normalizeText(req.body?.subnet),
+                reason: normalizeReason(req.body?.reason)
+            });
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                action: 'admin_start_router_discovery_scan',
+                reason: normalizeReason(req.body?.reason),
+                metadata: {
+                    discoverySessionId: session.id,
+                    requestedSubnet: session.requestedSubnet,
+                    source: session.source
+                }
+            });
+
+            return res.status(202).json({ success: true, session });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to start router discovery scan', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/routers/discovery/results', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW), async (req, res) => {
+        try {
+            const sessions = await listDiscoveryResults({ sessionId: req.query?.sessionId });
+            return res.json({ success: true, items: sessions });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load router discovery results', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/discovery/verify', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const sessionId = String(req.body?.sessionId || '').trim();
+            const candidateId = String(req.body?.candidateId || '').trim();
+            const username = String(req.body?.username || '').trim();
+            const password = String(req.body?.password || '');
+            const method = String(req.body?.method || 'auto').trim();
+
+            if (!sessionId || !candidateId || !username || !password) {
+                return res.status(400).json({ success: false, error: 'sessionId, candidateId, username, and password are required' });
+            }
+
+            const result = await verifyDiscoveryCandidate({ sessionId, candidateId, username, password, method });
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                action: 'admin_verify_discovered_router',
+                reason: '',
+                metadata: {
+                    discoverySessionId: sessionId,
+                    candidateId,
+                    ipAddress: result.candidate.ipAddress,
+                    verificationStatus: result.candidate.verification?.status || 'unknown',
+                    verificationMethod: result.candidate.verification?.method || method
+                }
+            });
+
+            return res.json({ success: true, session: result.session, candidate: result.candidate });
+        } catch (error) {
+            const statusCode = /not found/i.test(error.message) ? 404 : (/already/i.test(error.message) ? 409 : 400);
+            return res.status(statusCode).json({ success: false, error: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/discovery/import', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const sessionId = String(req.body?.sessionId || '').trim();
+            const candidateId = String(req.body?.candidateId || '').trim();
+            const targetUser = await resolveCustomerUser(req.body?.userId);
+            const routerName = normalizeText(req.body?.name);
+            const serverNode = String(req.body?.serverNode || 'wireguard').trim() || 'wireguard';
+            const reason = normalizeReason(req.body?.reason);
+
+            if (!sessionId || !candidateId || !targetUser) {
+                return res.status(400).json({ success: false, error: 'sessionId, candidateId, and a valid customer userId/email are required' });
+            }
+
+            const imported = await importDiscoveryCandidate({
+                sessionId,
+                candidateId,
+                userId: String(targetUser._id),
+                name: routerName,
+                serverNode,
+                reason
+            });
+
+            const persistedSession = await RouterDiscoverySession.findById(sessionId);
+            const persistedCandidate = persistedSession?.candidates.id(candidateId);
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: targetUser._id,
+                targetRouterId: imported.router.id,
+                action: 'admin_import_discovered_router',
+                reason,
+                metadata: {
+                    discoverySessionId: sessionId,
+                    candidateId,
+                    ipAddress: imported.candidate.ipAddress,
+                    serialNumber: imported.candidate.verification?.metadata?.serialNumber || null,
+                    importedRouterId: imported.router.id
+                }
+            });
+
+            return res.status(201).json({
+                success: true,
+                message: 'Router imported successfully',
+                router: imported.router,
+                session: imported.session,
+                candidate: imported.candidate,
+                verificationExpiresAt: persistedCandidate?.verification?.expiresAt || null
+            });
+        } catch (error) {
+            const statusCode = /already/i.test(error.message) ? 409 : (/not found/i.test(error.message) ? 404 : 400);
+            return res.status(statusCode).json({ success: false, error: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/onboarding/claims', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const targetUser = await resolveCustomerUser(req.body?.userId);
+            const requestedName = String(req.body?.name || '').trim();
+            const serverNode = String(req.body?.serverNode || 'wireguard').trim() || 'wireguard';
+            const reason = normalizeReason(req.body?.reason);
+            const expectedAddressHint = normalizeText(req.body?.expectedAddressHint);
+            const expiresInHours = Math.min(72, Math.max(1, Number(req.body?.expiresInHours || 24)));
+
+            if (!targetUser) {
+                return res.status(404).json({ success: false, error: 'Target customer not found' });
+            }
+            if (!requestedName) {
+                return res.status(400).json({ success: false, error: 'Router name is required' });
+            }
+
+            const plainToken = crypto.randomBytes(18).toString('base64url');
+            const callbackUrl = `${getPublicApiBaseUrl(req)}/api/router-onboarding/claim`;
+            const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000);
+
+            const claim = await RouterOnboardingClaim.create({
+                userId: targetUser._id,
+                requestedName,
+                serverNode,
+                reason,
+                expectedAddressHint,
+                tokenHash: RouterOnboardingClaim.hashToken(plainToken),
+                expiresAt
+            });
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: targetUser._id,
+                action: 'admin_create_router_onboarding_claim',
+                reason,
+                metadata: {
+                    claimId: claim._id,
+                    requestedName,
+                    serverNode,
+                    expectedAddressHint,
+                    expiresAt
+                }
+            });
+
+            return res.status(201).json({
+                success: true,
+                claim: serializeClaim(await claim.populate('userId', 'name email')),
+                token: plainToken,
+                callbackUrl,
+                bootstrapScript: buildClaimBootstrapScript(plainToken, callbackUrl)
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to create router claim', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/onboarding/claims/:id/adopt', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const claim = await RouterOnboardingClaim.findById(req.params.id).populate('userId');
+            if (!claim) {
+                return res.status(404).json({ success: false, error: 'Router claim not found' });
+            }
+
+            markExpiredIfNeeded(claim);
+            if (claim.status === 'expired') {
+                await claim.save();
+                return res.status(410).json({ success: false, error: 'Claim has expired and can no longer be adopted' });
+            }
+            if (claim.status === 'cancelled') {
+                return res.status(409).json({ success: false, error: 'Cancelled claims cannot be adopted' });
+            }
+            if (claim.status === 'adopted' && claim.provisionedRouterId) {
+                return res.json({ success: true, message: 'Claim already adopted', routerId: String(claim.provisionedRouterId) });
+            }
+            if (claim.status !== 'claimed') {
+                return res.status(400).json({ success: false, error: 'The router has not called home yet. Run the bootstrap script first.' });
+            }
+
+            const routerName = normalizeText(req.body?.name) || claim.requestedName || claim.detected?.identity || `router-${String(claim.userId._id).slice(-6)}`;
+            const created = await createRouterAdmin({
+                userId: String(claim.userId._id),
+                name: routerName,
+                serverNode: claim.serverNode || 'wireguard',
+                notes: `Provisioned from router claim ${String(claim._id)}`
+            });
+
+            created.router.routerboardInfo = {
+                ...(created.router.routerboardInfo || {}),
+                boardName: claim.detected?.boardName || created.router.routerboardInfo?.boardName,
+                model: claim.detected?.identity || created.router.routerboardInfo?.model,
+                serialNumber: claim.detected?.serialNumber || created.router.routerboardInfo?.serialNumber,
+                firmware: claim.detected?.routerosVersion || created.router.routerboardInfo?.firmware,
+                lastChecked: claim.detected?.lastSeenAt || new Date()
+            };
+            if (claim.detected?.sourceIp || claim.detected?.identity) {
+                created.router.adminNotes.push({
+                    body: `Adopted from claim. Source IP: ${claim.detected?.sourceIp || 'unknown'}${claim.detected?.identity ? ` · Identity: ${claim.detected.identity}` : ''}${claim.detected?.serialNumber ? ` · Serial: ${claim.detected.serialNumber}` : ''}`,
+                    category: 'provisioning',
+                    pinned: true,
+                    author: req.adminUser.email || 'system'
+                });
+            }
+            await created.router.save();
+
+            claim.status = 'adopted';
+            claim.adoptedAt = new Date();
+            claim.provisionedRouterId = created.router._id;
+            await claim.save();
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: claim.userId._id,
+                targetRouterId: created.router._id,
+                action: 'admin_adopt_claimed_router',
+                reason: normalizeReason(req.body?.reason) || claim.reason || '',
+                metadata: {
+                    claimId: claim._id,
+                    detectedSourceIp: claim.detected?.sourceIp || null,
+                    detectedIdentity: claim.detected?.identity || null
+                }
+            });
+
+            return res.json({
+                success: true,
+                message: 'Router adopted successfully',
+                router: {
+                    id: String(created.router._id),
+                    name: created.router.name,
+                    vpnIp: created.router.vpnIp,
+                    ports: created.router.ports,
+                    status: created.router.status
+                },
+                claim: serializeClaim(claim)
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to adopt router claim', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/onboarding/claims/:id/cancel', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const claim = await RouterOnboardingClaim.findById(req.params.id).populate('userId', 'name email');
+            if (!claim) {
+                return res.status(404).json({ success: false, error: 'Router claim not found' });
+            }
+            if (claim.status === 'adopted') {
+                return res.status(409).json({ success: false, error: 'Adopted claims cannot be cancelled' });
+            }
+
+            claim.status = 'cancelled';
+            claim.cancelledAt = new Date();
+            await claim.save();
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: claim.userId?._id || claim.userId,
+                action: 'admin_cancel_router_onboarding_claim',
+                reason: normalizeReason(req.body?.reason) || claim.reason || '',
+                metadata: { claimId: claim._id }
+            });
+
+            return res.json({ success: true, message: 'Router claim cancelled', claim: serializeClaim(claim) });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to cancel router claim', details: error.message });
+        }
+    });
+
     app.post('/api/admin/routers', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
         try {
             const userId = String(req.body?.userId || '').trim();
@@ -185,13 +668,13 @@ function registerAdminRouterRoutes(app) {
                 return res.status(400).json({ success: false, error: 'Router name is required' });
             }
 
-            const targetUser = await User.findById(userId).lean();
-            if (!targetUser || targetUser.role !== 'user') {
+            const targetUser = await resolveCustomerUser(userId);
+            if (!targetUser) {
                 return res.status(404).json({ success: false, error: 'Target customer not found' });
             }
 
             const created = await createRouterAdmin({
-                userId,
+                userId: String(targetUser._id),
                 name,
                 serverNode,
                 notes: reason || ''

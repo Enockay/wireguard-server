@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node wireguard-api.js",
     "dev": "node wireguard-api.js",
+    "discovery-agent": "node tools/router-discovery-agent.js",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {

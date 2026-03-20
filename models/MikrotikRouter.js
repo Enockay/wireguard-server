@@ -148,6 +148,45 @@ const mikrotikRouterSchema = new mongoose.Schema({
         serialNumber: String,
         firmware: String,
         lastChecked: Date
+    },
+    discoveryInfo: {
+        localAddress: {
+            type: String,
+            trim: true,
+            index: true
+        },
+        subnet: {
+            type: String,
+            trim: true
+        },
+        hostname: {
+            type: String,
+            trim: true
+        },
+        macAddress: {
+            type: String,
+            trim: true
+        },
+        source: {
+            type: String,
+            trim: true
+        },
+        discoverySessionId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'RouterDiscoverySession',
+            default: null
+        },
+        importedAt: {
+            type: Date,
+            default: null
+        },
+        importedBy: {
+            type: String,
+            trim: true
+        },
+        openPorts: [{
+            type: Number
+        }]
     }
 }, {
     timestamps: true,
