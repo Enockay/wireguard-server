@@ -5,6 +5,12 @@ const { log } = require('../wg-core');
 
 const execAsync = promisify(exec);
 
+function normalizeRouterHost(vpnIp) {
+    const normalized = String(vpnIp || '').trim();
+    if (!normalized) return '';
+    return normalized.split('/')[0].trim();
+}
+
 /**
  * MikroTik RouterOS API Client
  * Connects to MikroTik routers via their VPN IP to retrieve routerboard information
@@ -16,17 +22,18 @@ const execAsync = promisify(exec);
  * Uses ssh command-line tool to connect and execute commands
  */
 async function executeRouterOSCommand(vpnIp, command, username = 'admin', password = '', timeout = 5000) {
+    const host = normalizeRouterHost(vpnIp);
     try {
         // Check if ssh command is available
         try {
             await execAsync('which ssh', { timeout: 1000 });
         } catch (err) {
-            log('error', 'ssh_command_not_found', { vpnIp, error: 'ssh command not available in container' });
+            log('error', 'ssh_command_not_found', { vpnIp: host || vpnIp, error: 'ssh command not available in container' });
             return {
                 success: false,
                 error: 'SSH client not available. Please install openssh-client in the container.',
                 code: 'ENOENT',
-                vpnIp,
+                vpnIp: host || vpnIp,
                 command
             };
         }
@@ -40,13 +47,13 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
             try {
                 await execAsync('which sshpass', { timeout: 1000 });
             } catch (err) {
-                log('warn', 'sshpass_not_found', { vpnIp, message: 'sshpass not available for password-based SSH authentication' });
+                log('warn', 'sshpass_not_found', { vpnIp: host || vpnIp, message: 'sshpass not available for password-based SSH authentication' });
                 return {
                     success: false,
                     error: 'Password-based SSH verification is unavailable because sshpass is not installed in the API environment.',
                     code: 'ESSHPASS',
                     isAuthError: false,
-                    vpnIp,
+                    vpnIp: host || vpnIp,
                     command
                 };
             }
@@ -55,14 +62,14 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
         if (password) {
             // Use sshpass (requires sshpass to be installed)
             // Format: sshpass -p 'password' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 user@host command
-            sshCommand = `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes ${username}@${vpnIp} "${command}"`;
+            sshCommand = `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes ${username}@${host} "${command}"`;
         } else {
             // Use SSH without password (key-based auth or interactive)
             // Note: This will fail if no keys are set up and password auth is disabled
-            sshCommand = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=no -o BatchMode=yes ${username}@${vpnIp} "${command}"`;
+            sshCommand = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=no -o BatchMode=yes ${username}@${host} "${command}"`;
         }
 
-        log('info', 'executing_routeros_command', { vpnIp, command: command.substring(0, 50), method: password ? 'password' : 'key' });
+        log('info', 'executing_routeros_command', { vpnIp: host || vpnIp, command: command.substring(0, 50), method: password ? 'password' : 'key' });
 
         const { stdout, stderr } = await execAsync(sshCommand, {
             timeout,
@@ -70,14 +77,14 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
         });
 
         if (stderr && !stderr.includes('Warning: Permanently added') && !stderr.includes('Host key verification failed')) {
-            log('warn', 'routeros_command_stderr', { vpnIp, stderr: stderr.substring(0, 100) });
+            log('warn', 'routeros_command_stderr', { vpnIp: host || vpnIp, stderr: stderr.substring(0, 100) });
         }
 
         return {
             success: true,
             output: stdout.trim(),
             error: stderr || null,
-            vpnIp,
+            vpnIp: host || vpnIp,
             command
         };
     } catch (error) {
@@ -88,7 +95,7 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
                            error.message.includes('Permission denied (publickey');
         
         log('error', 'routeros_command_error', { 
-            vpnIp, 
+            vpnIp: host || vpnIp, 
             command: command.substring(0, 50),
             error: error.message,
             code: error.code,
@@ -100,7 +107,7 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
             error: error.message,
             code: error.code,
             isAuthError,
-            vpnIp,
+            vpnIp: host || vpnIp,
             command
         };
     }
@@ -200,19 +207,20 @@ function parseRouterOSOutput(output) {
  * Fallback method when SSH is not available
  */
 function checkAPIPortOpen(vpnIp, timeout = 3000) {
+    const host = normalizeRouterHost(vpnIp);
     return new Promise((resolve) => {
         const socket = new net.Socket();
         socket.setTimeout(timeout);
 
         socket.on('connect', () => {
-            log('info', 'mikrotik_api_port_open', { vpnIp });
+            log('info', 'mikrotik_api_port_open', { vpnIp: host || vpnIp });
             socket.destroy();
             resolve({ 
                 success: true,
                 reachable: true, 
                 method: 'api_port_check',
                 apiPortOpen: true,
-                vpnIp,
+                vpnIp: host || vpnIp,
                 timestamp: new Date()
             });
         });
@@ -224,7 +232,7 @@ function checkAPIPortOpen(vpnIp, timeout = 3000) {
                     reachable: false, 
                     error: err.code,
                     apiPortOpen: false,
-                    vpnIp,
+                    vpnIp: host || vpnIp,
                     timestamp: new Date()
                 });
             } else {
@@ -234,7 +242,7 @@ function checkAPIPortOpen(vpnIp, timeout = 3000) {
                     error: err.message,
                     code: err.code,
                     apiPortOpen: false,
-                    vpnIp,
+                    vpnIp: host || vpnIp,
                     timestamp: new Date()
                 });
             }
@@ -247,12 +255,12 @@ function checkAPIPortOpen(vpnIp, timeout = 3000) {
                 reachable: false, 
                 error: 'timeout',
                 apiPortOpen: false,
-                vpnIp,
+                vpnIp: host || vpnIp,
                 timestamp: new Date()
             });
         });
 
-        socket.connect(8728, vpnIp);
+        socket.connect(8728, host);
     });
 }
 
@@ -325,5 +333,6 @@ module.exports = {
     checkRouterActive,
     getRouterboardInfoSSH,
     executeRouterOSCommand,
-    checkAPIPortOpen
+    checkAPIPortOpen,
+    normalizeRouterHost
 };

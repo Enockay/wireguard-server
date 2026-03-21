@@ -55,6 +55,17 @@ const subscriptionSchema = new mongoose.Schema({
         type: String,
         enum: ['manual', 'stripe', 'paypal', 'other'],
         default: 'manual'
+    },
+    servicePlanId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'ServicePlan',
+        default: null,
+        index: true
+    },
+    queueName: {
+        type: String,
+        trim: true,
+        default: ''
     }
 }, {
     timestamps: true,

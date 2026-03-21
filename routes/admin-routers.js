@@ -5,7 +5,11 @@ const User = require('../models/User');
 const RouterDiscoverySession = require('../models/RouterDiscoverySession');
 const { requireAdminPermission } = require('../middleware/admin-auth');
 const { recordAdminAction } = require('../services/admin-audit-service');
-const { executeRouterOSCommand } = require('../services/mikrotik-api-service');
+const { getSystemResource, getInterfaces, pingTest, rebootRouter, resolveRouterManagementHost, executeCommand } = require('../services/routeros-command-service');
+const { rotateCredential, markCredentialVerified } = require('../services/router-credential-service');
+const { execute: executeRouterOperation } = require('../services/router-execution-service');
+const { probeCapabilities } = require('../services/capability-probe-service');
+const { getRouterMetricsHistory } = require('../services/telemetry-service');
 const {
     startDiscoveryScan,
     listDiscoveryResults,
@@ -76,6 +80,32 @@ function getPublicApiBaseUrl(req) {
     const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
     const host = req.headers['x-forwarded-host'] || req.get('host') || `localhost:${process.env.API_PORT || process.env.PORT || 5000}`;
     return `${protocol}://${host}`;
+}
+
+function getRouterManagementHost(router) {
+    return resolveRouterManagementHost(router);
+}
+
+function getActorContext(req) {
+    return {
+        actor: req.adminUser?.email || 'admin',
+        actorType: 'admin',
+        requestId: req.headers['x-request-id'] || null
+    };
+}
+
+function resolveRouterExecutionError(error, fallbackMessage) {
+    const message = error?.message || fallbackMessage;
+    if (message === 'Router not found') {
+        return { status: 404, payload: { success: false, error: message } };
+    }
+    if (message === 'capability_missing' || error?.failureType === 'capability_missing') {
+        return { status: 403, payload: { success: false, error: 'Router capability missing', code: 'capability_missing' } };
+    }
+    if (message === 'unsafe_operation_blocked' || error?.failureType === 'unsafe_operation_blocked') {
+        return { status: 403, payload: { success: false, error: 'Operation blocked by router safety policy', code: 'unsafe_operation_blocked' } };
+    }
+    return { status: 500, payload: { success: false, error: fallbackMessage, details: message } };
 }
 
 function buildClaimBootstrapScript(claimToken, callbackUrl) {
@@ -438,6 +468,7 @@ function registerAdminRouterRoutes(app) {
             const routerName = normalizeText(req.body?.name);
             const serverNode = String(req.body?.serverNode || 'wireguard').trim() || 'wireguard';
             const reason = normalizeReason(req.body?.reason);
+            const connectionMode = String(req.body?.connectionMode || 'wireguard').trim() || 'wireguard';
 
             if (!sessionId || !candidateId || !targetUser) {
                 return res.status(400).json({ success: false, error: 'sessionId, candidateId, and a valid customer userId/email are required' });
@@ -449,7 +480,8 @@ function registerAdminRouterRoutes(app) {
                 userId: String(targetUser._id),
                 name: routerName,
                 serverNode,
-                reason
+                reason,
+                connectionMode
             });
 
             const persistedSession = await RouterDiscoverySession.findById(sessionId);
@@ -474,6 +506,7 @@ function registerAdminRouterRoutes(app) {
                 success: true,
                 message: 'Router imported successfully',
                 router: imported.router,
+                artifacts: imported.artifacts || null,
                 session: imported.session,
                 candidate: imported.candidate,
                 verificationExpiresAt: persistedCandidate?.verification?.expiresAt || null
@@ -736,6 +769,120 @@ function registerAdminRouterRoutes(app) {
         }
     });
 
+    app.post('/api/admin/routers/:id/set-credentials', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const apiUsername = normalizeText(req.body?.apiUsername);
+            const apiPassword = req.body?.apiPassword == null ? null : String(req.body.apiPassword).trim();
+            const apiPortValue = req.body?.apiPort;
+            const apiPort = apiPortValue == null || apiPortValue === '' ? null : Number(apiPortValue);
+
+            if (apiPort != null && (!Number.isInteger(apiPort) || apiPort < 1 || apiPort > 65535)) {
+                return res.status(400).json({ success: false, error: 'API port must be between 1 and 65535' });
+            }
+
+            const nextUsername = apiUsername || 'admin';
+            const nextPort = apiPort != null ? apiPort : (router.apiPort || 8728);
+            let pendingCredential = null;
+
+            router.apiUsername = nextUsername;
+            if (apiPassword != null) {
+                router.apiPassword = apiPassword;
+                pendingCredential = await rotateCredential({
+                    router,
+                    principal: nextUsername,
+                    secret: apiPassword,
+                    transportHint: 'api',
+                    apiPort: nextPort,
+                    createdBy: req.adminUser.email
+                });
+                router.credentialState = router.credentialState || {};
+                router.credentialState.secretRef = pendingCredential._id;
+                router.credentialState.state = 'rotating';
+            }
+            if (apiPort != null) {
+                router.apiPort = nextPort;
+            }
+            await router.save();
+
+            await audit(req, router, 'admin.routers.set_credentials', normalizeReason(req.body?.reason) || 'Updated RouterOS API credentials', {
+                apiUsername: router.apiUsername,
+                apiPort: router.apiPort,
+                hasPassword: Boolean(router.apiPassword)
+            });
+
+            return res.json({
+                success: true,
+                message: 'RouterOS API credentials updated',
+                data: {
+                    apiUsername: router.apiUsername,
+                    apiPort: router.apiPort,
+                    hasPassword: Boolean(router.apiPassword),
+                    credentialState: {
+                        secretConfigured: Boolean(router.credentialState?.secretRef),
+                        state: router.credentialState?.state || 'unknown'
+                    }
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to update router credentials', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/test-connection', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_CONNECTIVITY), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const [resource, interfaces] = await Promise.all([
+                getSystemResource(req.params.id, getActorContext(req)),
+                getInterfaces(req.params.id, getActorContext(req))
+            ]);
+            const capabilities = await probeCapabilities((routerId, operationName, execContext) => executeRouterOperation(
+                routerId,
+                operationName,
+                execContext,
+                getActorContext(req)
+            ), req.params.id);
+
+            if (router.credentialState?.secretRef) {
+                await markCredentialVerified(req.params.id, router.credentialState.secretRef);
+            }
+
+            router.capabilities = { ...(router.capabilities || {}), ...capabilities };
+            router.credentialState = {
+                ...(router.credentialState || {}),
+                state: 'active',
+                lastVerifiedAt: new Date(),
+                verificationFailureCount: 0
+            };
+            await router.save();
+
+            await audit(req, router, 'admin.routers.test_connection', normalizeReason(req.body?.reason) || 'Tested RouterOS API connectivity', {
+                apiPort: router.apiPort || 8728
+            });
+
+            return res.json({
+                success: true,
+                data: {
+                    resource,
+                    interfaces,
+                    capabilities,
+                    credentialState: {
+                        secretConfigured: Boolean(router.credentialState?.secretRef),
+                        state: router.credentialState?.state || 'unknown',
+                        lastVerifiedAt: router.credentialState?.lastVerifiedAt || null
+                    },
+                    testedAt: new Date().toISOString()
+                }
+            });
+        } catch (error) {
+            return res.status(502).json({ success: false, error: 'Failed to connect to router via RouterOS API', details: error.message });
+        }
+    });
+
     app.get('/api/admin/routers/:id/ports', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_DETAILS), async (req, res) => {
         try {
             const ports = await getAdminRouterPorts(req.params.id);
@@ -759,6 +906,19 @@ function registerAdminRouterRoutes(app) {
             return res.json({ success: true, monitoring });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load router monitoring', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/routers/:id/metrics', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_MONITORING), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const hours = Math.min(168, Math.max(1, Number(req.query?.hours || 24)));
+            const metrics = await getRouterMetricsHistory(req.params.id, hours);
+            return res.json({ success: true, metrics, routerId: req.params.id });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load router metrics', details: error.message });
         }
     });
 
@@ -1018,10 +1178,7 @@ function registerAdminRouterRoutes(app) {
                 return res.status(400).json({ success: false, error: 'Router is not online' });
             }
 
-            const result = await executeRouterOSCommand(router.vpnIp, '/system reboot');
-            if (!result.success) {
-                return res.status(500).json({ success: false, error: result.error || 'Failed to send reboot command' });
-            }
+            await rebootRouter(req.params.id, getActorContext(req));
 
             await audit(req, router, 'admin.routers.reboot', normalizeReason(req.body?.reason), {});
             return res.json({ success: true, message: 'Reboot command sent' });
@@ -1031,18 +1188,51 @@ function registerAdminRouterRoutes(app) {
     });
 
     app.post('/api/admin/routers/:id/ping', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.LIVE_OPS), async (req, res) => {
+        let router = null;
+        const requestedAddress = String(req.body?.address || '').trim();
+        const count = Math.max(1, Math.min(10, Number(req.body?.count || 4) || 4));
         try {
-            const router = await getRouterOr404(req, res);
+            router = await getRouterOr404(req, res);
             if (!router) return;
 
-            const result = await executeRouterOSCommand(router.vpnIp, '/ping 10.0.0.1 count=4');
-            if (!result.success) {
-                return res.json({ success: false, reachable: false, error: result.error || 'Ping failed' });
-            }
+            const address = requestedAddress || (router.connectionMode === 'management_only' ? '8.8.8.8' : '10.0.0.1');
+            const result = await pingTest(req.params.id, address, count, getActorContext(req));
+            const historyEntry = {
+                target: address,
+                reachable: result.received > 0,
+                packetsSent: result.sent,
+                packetsReceived: result.received,
+                packetLoss: result.packetLoss,
+                avgRtt: result.avgRtt,
+                error: null,
+                actor: req.adminUser?.email || 'admin',
+                createdAt: new Date()
+            };
 
-            return res.json({ success: true, result: parsePingOutput(result.output) });
+            router.pingHistory = [historyEntry, ...(router.pingHistory || [])].slice(0, 20);
+            await router.save();
+
+            return res.json({
+                success: result.received > 0,
+                result: historyEntry
+            });
         } catch (error) {
-            return res.status(500).json({ success: false, reachable: false, error: error.message });
+            if (router) {
+                const fallbackAddress = requestedAddress || (router.connectionMode === 'management_only' ? '8.8.8.8' : '10.0.0.1');
+                router.pingHistory = [{
+                    target: fallbackAddress,
+                    reachable: false,
+                    packetsSent: count,
+                    packetsReceived: 0,
+                    packetLoss: 100,
+                    avgRtt: null,
+                    error: error.message || 'Ping failed',
+                    actor: req.adminUser?.email || 'admin',
+                    createdAt: new Date()
+                }, ...(router.pingHistory || [])].slice(0, 20);
+                await router.save().catch(() => undefined);
+            }
+            return res.json({ success: false, reachable: false, error: error.message });
         }
     });
 
@@ -1060,16 +1250,26 @@ function registerAdminRouterRoutes(app) {
                 return res.status(400).json({ success: false, error: 'Command is too long' });
             }
 
-            const result = await executeRouterOSCommand(router.vpnIp, command);
+            const breakGlass = Boolean(req.body?.breakGlass);
+            const result = await executeRouterOperation(req.params.id, 'raw_command', {
+                command,
+                breakGlass,
+                metadata: {
+                    reason,
+                    requestedHost: getRouterManagementHost(router)
+                }
+            }, getActorContext(req));
             await audit(req, router, 'admin.routers.run_command', reason, { command });
 
-            if (!result.success) {
-                return res.json({ success: false, error: result.error || 'Command execution failed' });
-            }
-
-            return res.json({ success: true, output: result.output || '' });
+            return res.json({
+                success: true,
+                output: Array.isArray(result.data)
+                    ? JSON.stringify(result.data)
+                    : (result.data || result.records || '')
+            });
         } catch (error) {
-            return res.status(500).json({ success: false, error: 'Failed to run router command', details: error.message });
+            const status = error.failureType === 'unsafe_operation_blocked' || error.message === 'unsafe_operation_blocked' ? 403 : 500;
+            return res.status(status).json({ success: false, error: 'Failed to run router command', details: error.message });
         }
     });
 
@@ -1078,14 +1278,11 @@ function registerAdminRouterRoutes(app) {
             const router = await getRouterOr404(req, res);
             if (!router) return;
 
-            const result = await executeRouterOSCommand(router.vpnIp, '/interface print detail');
-            if (!result.success) {
-                return res.json({ success: false, error: result.error || 'Unable to load interfaces', interfaces: [] });
-            }
-
-            return res.json({ success: true, interfaces: parseInterfacesOutput(result.output) });
+            const interfaces = await getInterfaces(req.params.id, getActorContext(req));
+            return res.json({ success: true, interfaces });
         } catch (error) {
-            return res.status(500).json({ success: false, error: error.message, interfaces: [] });
+            const resolved = resolveRouterExecutionError(error, 'Failed to load interfaces');
+            return res.status(resolved.status).json({ ...resolved.payload, interfaces: [] });
         }
     });
 
@@ -1094,40 +1291,22 @@ function registerAdminRouterRoutes(app) {
             const router = await getRouterOr404(req, res);
             if (!router) return;
 
-            const result = await executeRouterOSCommand(router.vpnIp, '/system resource print');
-            if (!result.success) {
-                return res.json({
-                    success: false,
-                    health: {
-                        uptime: null,
-                        cpuLoad: null,
-                        freeMemory: null,
-                        totalMemory: null,
-                        freeHddSpace: null,
-                        boardName: null,
-                        routerosVersion: null,
-                        reachable: false,
-                        error: result.error || 'Unable to fetch live health'
-                    }
-                });
-            }
-
-            const parsed = parseRouterKeyValueOutput(result.output);
+            const parsed = await getSystemResource(req.params.id, getActorContext(req));
             return res.json({
                 success: true,
                 health: {
                     uptime: parsed.uptime || null,
-                    cpuLoad: parseCpuLoad(parsed.cpuLoad),
-                    freeMemory: parseSizeToBytes(parsed.freeMemory),
-                    totalMemory: parseSizeToBytes(parsed.totalMemory),
-                    freeHddSpace: parseSizeToBytes(parsed.freeHddSpace),
+                    cpuLoad: parsed.cpuLoad ?? null,
+                    freeMemory: parsed.freeMemory ?? null,
+                    totalMemory: parsed.totalMemory ?? null,
+                    freeHddSpace: parsed.freeHddSpace ?? null,
                     boardName: parsed.boardName || null,
                     routerosVersion: parsed.version || null,
                     reachable: true
                 }
             });
         } catch (error) {
-            return res.status(500).json({
+            return res.json({
                 success: false,
                 health: {
                     uptime: null,

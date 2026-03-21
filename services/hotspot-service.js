@@ -1,0 +1,467 @@
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const HotspotUser = require('../models/HotspotUser');
+const HotspotSession = require('../models/HotspotSession');
+const MikrotikRouter = require('../models/MikrotikRouter');
+const { executeCommand } = require('./routeros-command-service');
+
+function toNumber(value) {
+    if (value == null || value === '') return 0;
+    const parsed = Number(String(value).replace(/[^\d.-]/g, ''));
+    return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function toDateOrNull(value) {
+    if (!value) return null;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function escapeRegex(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseDurationToSeconds(value) {
+    if (!value) return 0;
+    if (/^\d+$/.test(String(value).trim())) {
+        return Number(value) || 0;
+    }
+
+    const units = { w: 604800, d: 86400, h: 3600, m: 60, s: 1 };
+    const matches = String(value).toLowerCase().matchAll(/(\d+)([wdhms])/g);
+    let total = 0;
+    for (const match of matches) {
+        total += (Number(match[1]) || 0) * (units[match[2]] || 0);
+    }
+    return total;
+}
+
+function formatDuration(seconds) {
+    const total = Math.max(0, Number(seconds) || 0);
+    if (total <= 0) return undefined;
+
+    const parts = [];
+    let remaining = total;
+    const units = [
+        ['w', 604800],
+        ['d', 86400],
+        ['h', 3600],
+        ['m', 60],
+        ['s', 1]
+    ];
+
+    for (const [suffix, size] of units) {
+        if (remaining >= size) {
+            const count = Math.floor(remaining / size);
+            parts.push(`${count}${suffix}`);
+            remaining -= count * size;
+        }
+    }
+
+    return parts.join('') || undefined;
+}
+
+function serializeHotspotUser(doc, activeUsernames = new Set()) {
+    return {
+        id: String(doc._id),
+        routerId: String(doc.routerId),
+        username: doc.username,
+        profile: doc.profile || 'default',
+        isActive: Boolean(doc.isActive),
+        online: activeUsernames.has(doc.username),
+        bytesIn: doc.bytesIn || 0,
+        bytesOut: doc.bytesOut || 0,
+        dataLimitBytes: doc.dataLimitBytes || 0,
+        timeLimitSeconds: doc.timeLimitSeconds || 0,
+        expiresAt: doc.expiresAt || null,
+        comment: doc.comment || '',
+        routerosId: doc.routerosId || '',
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt
+    };
+}
+
+function serializeHotspotSession(doc) {
+    return {
+        id: String(doc._id),
+        routerId: String(doc.routerId),
+        hotspotUserId: doc.hotspotUserId ? String(doc.hotspotUserId) : null,
+        username: doc.username || '',
+        ip: doc.ip || '',
+        mac: doc.mac || '',
+        uplinkBytes: doc.uplinkBytes || 0,
+        downlinkBytes: doc.downlinkBytes || 0,
+        sessionId: doc.sessionId || '',
+        startedAt: doc.startedAt || doc.createdAt || null,
+        endedAt: doc.endedAt || null,
+        isActive: Boolean(doc.isActive),
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt
+    };
+}
+
+function serializeHotspotProfile(record) {
+    return {
+        name: record.name || 'default',
+        rateLimit: record['rate-limit'] || '',
+        sessionTimeout: record['session-timeout'] || '',
+        idleTimeout: record['idle-timeout'] || ''
+    };
+}
+
+async function ensureRouterExists(routerId) {
+    const router = await MikrotikRouter.findById(routerId).select('_id name');
+    if (!router) {
+        throw new Error('Router not found');
+    }
+    return router;
+}
+
+async function fetchRouterHotspotUserRecord(routerId, username) {
+    const records = await executeCommand(routerId, '/ip/hotspot/user/print', {}, { operationName: 'get_system_resource' });
+    return records.find((item) => item.name === username) || null;
+}
+
+async function syncHotspotUsers(routerId, routerUsers) {
+    if (!routerUsers.length) {
+        return;
+    }
+
+    const operations = routerUsers.map((record) => ({
+        updateOne: {
+            filter: { routerId, username: record.name },
+            update: {
+                $set: {
+                    profile: record.profile || 'default',
+                    comment: record.comment || '',
+                    dataLimitBytes: toNumber(record['limit-bytes-total']),
+                    timeLimitSeconds: parseDurationToSeconds(record['limit-uptime']),
+                    isActive: !['yes', 'true'].includes(String(record.disabled || '').toLowerCase()),
+                    bytesIn: toNumber(record['bytes-in']),
+                    bytesOut: toNumber(record['bytes-out']),
+                    routerosId: record['.id'] || '',
+                    expiresAt: null
+                },
+                $setOnInsert: {
+                    createdBy: 'router-sync'
+                }
+            },
+            upsert: true
+        }
+    }));
+
+    await HotspotUser.bulkWrite(operations, { ordered: false });
+}
+
+async function syncActiveSessions(routerId, activeSessions) {
+    const usernames = [...new Set(activeSessions.map((item) => item.user).filter(Boolean))];
+    const users = usernames.length
+        ? await HotspotUser.find({ routerId, username: { $in: usernames } }).select('_id username')
+        : [];
+    const usersByUsername = new Map(users.map((user) => [user.username, user]));
+    const sessionIds = activeSessions.map((item) => item['.id']).filter(Boolean);
+
+    if (sessionIds.length) {
+        const operations = activeSessions.map((record) => ({
+            updateOne: {
+                filter: { routerId, sessionId: record['.id'] },
+                update: {
+                    $set: {
+                        hotspotUserId: usersByUsername.get(record.user)?._id || null,
+                        username: record.user || '',
+                        ip: record.address || '',
+                        mac: record['mac-address'] || '',
+                        uplinkBytes: toNumber(record['bytes-out']),
+                        downlinkBytes: toNumber(record['bytes-in']),
+                        isActive: true,
+                        endedAt: null
+                    },
+                    $setOnInsert: {
+                        startedAt: toDateOrNull(record['login-time']) || new Date()
+                    }
+                },
+                upsert: true
+            }
+        }));
+
+        await HotspotSession.bulkWrite(operations, { ordered: false });
+    }
+
+    await HotspotSession.updateMany(
+        {
+            routerId,
+            isActive: true,
+            ...(sessionIds.length ? { sessionId: { $nin: sessionIds } } : {})
+        },
+        {
+            $set: {
+                isActive: false,
+                endedAt: new Date()
+            }
+        }
+    );
+}
+
+async function listHotspotUsers(routerId, page = 1, limit = 50, search = '') {
+    await ensureRouterExists(routerId);
+    const [routerUsers, activeSessionRecords] = await Promise.all([
+        executeCommand(routerId, '/ip/hotspot/user/print', {}, { operationName: 'get_system_resource' }),
+        executeCommand(routerId, '/ip/hotspot/active/print', {}, { operationName: 'get_system_resource' }).catch(() => [])
+    ]);
+    await syncHotspotUsers(routerId, routerUsers);
+    await syncActiveSessions(routerId, activeSessionRecords);
+
+    const activeSessions = await HotspotSession.find({ routerId, isActive: true }).select('username');
+    const activeUsernames = new Set(activeSessions.map((session) => session.username).filter(Boolean));
+    const searchRegex = search ? new RegExp(escapeRegex(search), 'i') : null;
+    const filter = {
+        routerId,
+        ...(searchRegex ? { $or: [{ username: searchRegex }, { comment: searchRegex }] } : {})
+    };
+
+    const safePage = Math.max(1, Number(page) || 1);
+    const safeLimit = Math.min(100, Math.max(1, Number(limit) || 50));
+    const total = await HotspotUser.countDocuments(filter);
+    const items = await HotspotUser.find(filter)
+        .sort({ createdAt: -1, username: 1 })
+        .skip((safePage - 1) * safeLimit)
+        .limit(safeLimit);
+
+    return {
+        items: items.map((item) => serializeHotspotUser(item, activeUsernames)),
+        pagination: {
+            page: safePage,
+            limit: safeLimit,
+            total,
+            pages: Math.max(1, Math.ceil(total / safeLimit))
+        }
+    };
+}
+
+async function getHotspotUserDetail(routerId, userId) {
+    const user = await HotspotUser.findOne({ _id: userId, routerId });
+    if (!user) {
+        throw new Error('Hotspot user not found');
+    }
+
+    const sessions = await HotspotSession.find({
+        routerId,
+        $or: [
+            { hotspotUserId: user._id },
+            { username: user.username }
+        ]
+    })
+        .sort({ createdAt: -1 })
+        .limit(10);
+
+    return {
+        ...serializeHotspotUser(user),
+        recentSessions: sessions.map(serializeHotspotSession)
+    };
+}
+
+async function createHotspotUser(routerId, payload) {
+    await ensureRouterExists(routerId);
+    const {
+        username,
+        password,
+        profile = 'default',
+        dataLimitBytes = 0,
+        timeLimitSeconds = 0,
+        expiresAt = null,
+        comment = ''
+    } = payload;
+
+    const attributes = {
+        name: username,
+        password,
+        profile,
+        comment
+    };
+    if (Number(dataLimitBytes) > 0) {
+        attributes['limit-bytes-total'] = String(Math.floor(Number(dataLimitBytes)));
+    }
+    if (Number(timeLimitSeconds) > 0) {
+        attributes['limit-uptime'] = formatDuration(timeLimitSeconds);
+    }
+
+    await executeCommand(routerId, '/ip/hotspot/user/add', attributes, { operationName: 'hotspot_mutation', scope: 'hotspot' });
+    const routerRecord = await fetchRouterHotspotUserRecord(routerId, username);
+    const hashedPassword = password ? await bcrypt.hash(password, 10) : '';
+
+    const user = await HotspotUser.findOneAndUpdate(
+        { routerId, username },
+        {
+            $set: {
+                password: hashedPassword,
+                profile,
+                comment,
+                dataLimitBytes: Number(dataLimitBytes) || 0,
+                timeLimitSeconds: Number(timeLimitSeconds) || 0,
+                expiresAt: toDateOrNull(expiresAt),
+                isActive: true,
+                routerosId: routerRecord?.['.id'] || ''
+            },
+            $setOnInsert: {
+                createdBy: 'admin'
+            }
+        },
+        { new: true, upsert: true }
+    );
+
+    return serializeHotspotUser(user);
+}
+
+async function updateHotspotUser(routerId, routerosId, updates) {
+    await ensureRouterExists(routerId);
+    const routerUser = await HotspotUser.findOne({ routerId, routerosId });
+    if (!routerUser) {
+        throw new Error('Hotspot user not found');
+    }
+
+    const commandAttributes = { '.id': routerosId };
+    const databaseUpdates = {};
+
+    if (updates.username) {
+        commandAttributes.name = updates.username;
+        databaseUpdates.username = updates.username;
+    }
+    if (updates.password) {
+        commandAttributes.password = updates.password;
+        databaseUpdates.password = await bcrypt.hash(updates.password, 10);
+    }
+    if (updates.profile != null) {
+        commandAttributes.profile = updates.profile || 'default';
+        databaseUpdates.profile = updates.profile || 'default';
+    }
+    if (updates.comment != null) {
+        commandAttributes.comment = updates.comment || '';
+        databaseUpdates.comment = updates.comment || '';
+    }
+    if (updates.dataLimitBytes != null) {
+        commandAttributes['limit-bytes-total'] = Number(updates.dataLimitBytes) > 0 ? String(Math.floor(Number(updates.dataLimitBytes))) : '0';
+        databaseUpdates.dataLimitBytes = Number(updates.dataLimitBytes) || 0;
+    }
+    if (updates.timeLimitSeconds != null) {
+        commandAttributes['limit-uptime'] = Number(updates.timeLimitSeconds) > 0 ? formatDuration(updates.timeLimitSeconds) : '0s';
+        databaseUpdates.timeLimitSeconds = Number(updates.timeLimitSeconds) || 0;
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'isActive')) {
+        commandAttributes.disabled = updates.isActive ? 'no' : 'yes';
+        databaseUpdates.isActive = Boolean(updates.isActive);
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'expiresAt')) {
+        databaseUpdates.expiresAt = toDateOrNull(updates.expiresAt);
+    }
+
+    await executeCommand(routerId, '/ip/hotspot/user/set', commandAttributes, { operationName: 'hotspot_mutation', scope: 'hotspot' });
+    const user = await HotspotUser.findOneAndUpdate(
+        { routerId, routerosId },
+        { $set: databaseUpdates },
+        { new: true }
+    );
+
+    return serializeHotspotUser(user);
+}
+
+async function deleteHotspotUser(routerId, routerosId, userId) {
+    await ensureRouterExists(routerId);
+    await executeCommand(routerId, '/ip/hotspot/user/remove', { '.id': routerosId }, { operationName: 'hotspot_mutation', scope: 'hotspot' });
+    await HotspotUser.findOneAndUpdate(
+        { _id: userId, routerId },
+        {
+            $set: {
+                isActive: false
+            }
+        }
+    );
+    return { message: 'Hotspot user deleted' };
+}
+
+async function listActiveSessions(routerId) {
+    await ensureRouterExists(routerId);
+    const records = await executeCommand(routerId, '/ip/hotspot/active/print', {}, { operationName: 'get_system_resource' });
+    await syncActiveSessions(routerId, records);
+    const sessions = await HotspotSession.find({ routerId, isActive: true }).sort({ createdAt: -1 });
+    return sessions.map(serializeHotspotSession);
+}
+
+async function disconnectSession(routerId, sessionId) {
+    await ensureRouterExists(routerId);
+    await executeCommand(routerId, '/ip/hotspot/active/remove', { '.id': sessionId }, { operationName: 'safe_operational', scope: 'hotspot' });
+    await HotspotSession.findOneAndUpdate(
+        { routerId, sessionId },
+        {
+            $set: {
+                isActive: false,
+                endedAt: new Date()
+            }
+        }
+    );
+    return { message: 'Hotspot session disconnected' };
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+    const results = [];
+    let currentIndex = 0;
+
+    async function consume() {
+        while (currentIndex < items.length) {
+            const index = currentIndex;
+            currentIndex += 1;
+            results[index] = await worker(items[index], index);
+        }
+    }
+
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => consume());
+    await Promise.all(workers);
+    return results;
+}
+
+function generateRandomCredential(prefix = 'HS') {
+    const normalizedPrefix = String(prefix || 'HS').replace(/[^a-z0-9_-]/gi, '').slice(0, 8) || 'HS';
+    const suffix = crypto.randomBytes(3).toString('hex');
+    const password = crypto.randomBytes(4).toString('base64url').slice(0, 8);
+    return {
+        username: `${normalizedPrefix}-${suffix}`,
+        password
+    };
+}
+
+async function generateVouchers(routerId, payload) {
+    const count = Math.min(100, Math.max(1, Number(payload.count) || 1));
+    const baseUsers = Array.from({ length: count }, () => generateRandomCredential(payload.prefix));
+
+    const vouchers = await runWithConcurrency(baseUsers, 10, async (item) => {
+        await createHotspotUser(routerId, {
+            username: item.username,
+            password: item.password,
+            profile: payload.profile || 'default',
+            dataLimitBytes: payload.dataLimitBytes || 0,
+            timeLimitSeconds: payload.timeLimitSeconds || 0,
+            expiresAt: payload.expiresAt || null,
+            comment: payload.comment || `Voucher batch ${new Date().toISOString()}`
+        });
+        return item;
+    });
+
+    return vouchers;
+}
+
+async function listProfiles(routerId) {
+    await ensureRouterExists(routerId);
+    const records = await executeCommand(routerId, '/ip/hotspot/user/profile/print', {}, { operationName: 'get_system_resource' });
+    return records.map(serializeHotspotProfile);
+}
+
+module.exports = {
+    listHotspotUsers,
+    getHotspotUserDetail,
+    createHotspotUser,
+    updateHotspotUser,
+    deleteHotspotUser,
+    listActiveSessions,
+    disconnectSession,
+    generateVouchers,
+    listProfiles
+};

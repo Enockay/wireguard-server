@@ -68,6 +68,53 @@ function createRouterRouteMocks(overrides = {}) {
             'middleware/admin-auth.js': ctx.adminAuth,
             'services/admin-audit-service.js': ctx.auditService,
             'services/admin-router-service.js': service,
+            'services/routeros-command-service.js': {
+                async getSystemResource() {
+                    return { cpuLoad: 12, version: '7.16.1', boardName: 'RB5009' };
+                },
+                async getInterfaces() {
+                    return [{ name: 'ether1', type: 'ethernet', running: true, disabled: false, rxBytes: 10, txBytes: 20 }];
+                },
+                async pingTest() {
+                    return { sent: 4, received: 4, packetLoss: 0, avgRtt: 2 };
+                },
+                async rebootRouter() {
+                    return { message: 'Reboot command sent' };
+                },
+                resolveRouterManagementHost() {
+                    return '10.0.0.10';
+                },
+                async executeCommand() {
+                    return [];
+                }
+            },
+            'services/router-credential-service.js': {
+                async rotateCredential() {
+                    return { _id: 'cred-1' };
+                },
+                async markCredentialVerified() {
+                    return true;
+                }
+            },
+            'services/router-execution-service.js': {
+                async execute(routerId, operationName, context) {
+                    if (operationName === 'raw_command' && String(context.command || '').includes('set') && !context.breakGlass) {
+                        const error = new Error('unsafe_operation_blocked');
+                        error.failureType = 'unsafe_operation_blocked';
+                        throw error;
+                    }
+                    return { data: [{ ok: true }] };
+                }
+            },
+            'services/capability-probe-service.js': {
+                async probeCapabilities() {
+                    return {
+                        systemRead: true,
+                        identityRead: true,
+                        interfacesRead: true
+                    };
+                }
+            },
             'models/MikrotikRouter.js': routerModel
         }
     };
@@ -188,5 +235,69 @@ test('admin router action endpoints return expected statuses including move conf
         const deleted = await request('DELETE', `/api/admin/routers/${router._id}`, { body: { reason: 'cleanup' } });
         assert.equal(deleted.response.status, 200);
         assert.ok(ctx.auditCalls.some((call) => call.action === 'admin.routers.delete'));
+    });
+});
+
+test('admin router api credential and connection routes update router state and return telemetry', async () => {
+    const router = createDoc({
+        _id: '507f1f77bcf86cd799439061',
+        name: 'RTR-API',
+        serverNode: 'wireguard',
+        apiUsername: 'admin',
+        apiPassword: '',
+        apiPort: 8728,
+        userId: { _id: '507f1f77bcf86cd799439099' },
+        adminNotes: [],
+        internalFlags: createSubdocCollection([])
+    });
+
+    const { mocks, ctx } = createRouterRouteMocks({ router });
+
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const invalidPort = await request('POST', `/api/admin/routers/${router._id}/set-credentials`, { body: { apiPort: 70000 } });
+        assert.equal(invalidPort.response.status, 400);
+
+        const saved = await request('POST', `/api/admin/routers/${router._id}/set-credentials`, {
+            body: { apiUsername: 'ops-admin', apiPassword: 'secret', apiPort: 8729, reason: 'bootstrap api access' }
+        });
+        assert.equal(saved.response.status, 200);
+        assert.equal(router.apiUsername, 'ops-admin');
+        assert.equal(router.apiPassword, 'secret');
+        assert.equal(router.apiPort, 8729);
+        assert.equal(router.credentialState.secretRef, 'cred-1');
+        assert.equal(saved.json.data.credentialState.secretConfigured, true);
+
+        const tested = await request('POST', `/api/admin/routers/${router._id}/test-connection`, { body: { reason: 'verify live API' } });
+        assert.equal(tested.response.status, 200);
+        assert.equal(tested.json.data.resource.version, '7.16.1');
+        assert.equal(tested.json.data.interfaces.length, 1);
+        assert.equal(tested.json.data.capabilities.systemRead, true);
+        assert.equal(tested.json.data.credentialState.secretConfigured, true);
+        assert.ok(ctx.auditCalls.some((call) => call.action === 'admin.routers.set_credentials'));
+        assert.ok(ctx.auditCalls.some((call) => call.action === 'admin.routers.test_connection'));
+    });
+});
+
+test('admin router raw command route blocks unsafe commands without break-glass', async () => {
+    const router = createDoc({
+        _id: '507f1f77bcf86cd799439071',
+        name: 'RTR-CMD',
+        serverNode: 'wireguard',
+        status: 'active',
+        adminNotes: [],
+        internalFlags: createSubdocCollection([])
+    });
+    const { mocks } = createRouterRouteMocks({ router });
+
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const blocked = await request('POST', `/api/admin/routers/${router._id}/command`, {
+            body: { command: '/queue simple set 0 disabled=yes', reason: 'test' }
+        });
+        assert.equal(blocked.response.status, 403);
+
+        const allowed = await request('POST', `/api/admin/routers/${router._id}/command`, {
+            body: { command: '/queue simple set 0 disabled=yes', reason: 'test', breakGlass: true }
+        });
+        assert.equal(allowed.response.status, 200);
     });
 });

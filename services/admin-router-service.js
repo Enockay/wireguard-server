@@ -5,6 +5,7 @@ const Client = require('../models/Client');
 const Subscription = require('../models/Subscription');
 const Transaction = require('../models/Transaction');
 const AdminAuditLog = require('../models/AdminAuditLog');
+const RouterDiscoverySession = require('../models/RouterDiscoverySession');
 const { allocatePorts, releasePorts } = require('../utils/port-allocator');
 const { generateKeys, getNextAvailableIP } = require('../utils/route-helpers');
 const { startRouterProxy, stopRouterProxy, restartRouterProxy, getProxyStatus } = require('./tcp-proxy-service');
@@ -15,6 +16,7 @@ const { sendRouterDeletedEmail } = require('./email-service');
 const ROUTER_NOTE_CATEGORIES = ['support', 'provisioning', 'monitoring', 'billing', 'abuse', 'infrastructure', 'follow_up'];
 const ROUTER_FLAG_TYPES = ['provisioning_issue', 'unstable', 'under_investigation', 'vip_customer_router', 'billing_hold', 'manual_review'];
 const ROUTER_FLAG_SEVERITIES = ['low', 'medium', 'high'];
+const CLIENT_IP_RETRY_LIMIT = 5;
 const ADMIN_ROUTER_PERMISSIONS = {
     VIEW: 'admin.routers.view',
     VIEW_DETAILS: 'admin.routers.view_details',
@@ -45,6 +47,50 @@ function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function isDuplicateClientIpError(error) {
+    if (!error || error.code !== 11000) return false;
+    if (error.keyPattern?.ip) return true;
+    if (typeof error.message === 'string' && error.message.includes('ip')) return true;
+    return error.keyValue?.ip != null;
+}
+
+async function createWireGuardClientRecord({
+    name,
+    notes,
+    createdBy,
+    dbInitialized = true,
+    preferredIp
+}) {
+    const { privateKey, publicKey } = await generateKeys();
+    let nextPreferredIp = preferredIp;
+
+    for (let attempt = 0; attempt < CLIENT_IP_RETRY_LIMIT; attempt += 1) {
+        const allocatedIp = nextPreferredIp || await getNextAvailableIP(dbInitialized);
+
+        try {
+            const client = new Client({
+                name,
+                ip: allocatedIp,
+                publicKey,
+                privateKey,
+                enabled: true,
+                notes,
+                createdBy
+            });
+
+            await client.save();
+            return client;
+        } catch (error) {
+            if (!isDuplicateClientIpError(error)) {
+                throw error;
+            }
+            nextPreferredIp = null;
+        }
+    }
+
+    throw new Error('Unable to allocate a unique VPN IP after multiple attempts');
+}
+
 function formatPublicKeyFingerprint(key) {
     if (!key || typeof key !== 'string') return null;
     return `${key.slice(0, 8)}...${key.slice(-6)}`;
@@ -60,7 +106,17 @@ function getHandshakeState(client) {
     return (Date.now() - handshake.getTime()) > 180000 ? 'stale' : 'fresh';
 }
 
+function isManagementOnlyRouter(router) {
+    return router?.connectionMode === 'management_only';
+}
+
 function deriveSetupStatus(router, client) {
+    if (isManagementOnlyRouter(router)) {
+        if (router.status === 'inactive') return 'disabled';
+        if (router.provisioningError) return 'failed';
+        if (router.lastApiSuccessAt || router.status === 'active') return 'managed';
+        return 'management_only';
+    }
     if (!client) return 'failed';
     if (router.status === 'inactive') return 'disabled';
     if (router.firstConnectedAt) return 'connected';
@@ -70,6 +126,11 @@ function deriveSetupStatus(router, client) {
 }
 
 function deriveConnectionStatus(router, client) {
+    if (isManagementOnlyRouter(router)) {
+        if (router.status === 'inactive') return 'disabled';
+        if (router.status === 'offline') return 'offline';
+        return router.lastApiSuccessAt || router.status === 'active' ? 'online' : 'pending';
+    }
     if (router.status === 'inactive') return 'disabled';
     if (!client || !client.enabled) return 'peer_disabled';
     if (router.status === 'active') return 'online';
@@ -80,23 +141,24 @@ function deriveConnectionStatus(router, client) {
 function deriveHealthSummary(router, client) {
     const issues = [];
     const handshakeState = getHandshakeState(client);
+    const managementOnly = isManagementOnlyRouter(router);
 
-    if (!router.ports?.winbox || !router.ports?.ssh || !router.ports?.api) {
+    if (!managementOnly && (!router.ports?.winbox || !router.ports?.ssh || !router.ports?.api)) {
         issues.push('missing_ports');
     }
-    if (!client) {
+    if (!managementOnly && !client) {
         issues.push('missing_peer');
     }
-    if (client && !client.enabled) {
+    if (!managementOnly && client && !client.enabled) {
         issues.push('peer_disabled');
     }
     if (router.status === 'offline') {
         issues.push('router_offline');
     }
-    if (handshakeState === 'never') {
+    if (!managementOnly && handshakeState === 'never') {
         issues.push('no_handshake');
     }
-    if (handshakeState === 'stale') {
+    if (!managementOnly && handshakeState === 'stale') {
         issues.push('stale_handshake');
     }
     if (router.provisioningError) {
@@ -163,25 +225,26 @@ function buildCustomerSummary(user, routersOwned = 0, supportSummary = null, sub
 function buildPortsSummary(router) {
     const proxyStatus = getProxyStatus(router._id);
     const ports = router.ports || {};
+    const managementOnly = isManagementOnlyRouter(router);
 
     return {
         winbox: {
             publicPort: ports.winbox || null,
             targetPort: 8291,
-            allocationStatus: ports.winbox ? 'assigned' : 'missing',
-            forwardingStatus: proxyStatus.running ? (proxyStatus.winbox?.listening ? 'listening' : 'not_listening') : 'stopped'
+            allocationStatus: managementOnly ? 'not_required' : (ports.winbox ? 'assigned' : 'missing'),
+            forwardingStatus: managementOnly ? 'not_required' : (proxyStatus.running ? (proxyStatus.winbox?.listening ? 'listening' : 'not_listening') : 'stopped')
         },
         ssh: {
             publicPort: ports.ssh || null,
             targetPort: 22,
-            allocationStatus: ports.ssh ? 'assigned' : 'missing',
-            forwardingStatus: proxyStatus.running ? (proxyStatus.ssh?.listening ? 'listening' : 'not_listening') : 'stopped'
+            allocationStatus: managementOnly ? 'not_required' : (ports.ssh ? 'assigned' : 'missing'),
+            forwardingStatus: managementOnly ? 'not_required' : (proxyStatus.running ? (proxyStatus.ssh?.listening ? 'listening' : 'not_listening') : 'stopped')
         },
         api: {
             publicPort: ports.api || null,
             targetPort: 8728,
-            allocationStatus: ports.api ? 'assigned' : 'missing',
-            forwardingStatus: proxyStatus.running ? (proxyStatus.api?.listening ? 'listening' : 'not_listening') : 'stopped'
+            allocationStatus: managementOnly ? 'not_required' : (ports.api ? 'assigned' : 'missing'),
+            forwardingStatus: managementOnly ? 'not_required' : (proxyStatus.running ? (proxyStatus.api?.listening ? 'listening' : 'not_listening') : 'stopped')
         },
         proxyStatus
     };
@@ -190,13 +253,14 @@ function buildPortsSummary(router) {
 function buildMonitoringSummary(router, client) {
     const lastHandshake = getLastHandshakeDate(client);
     const health = deriveHealthSummary(router, client);
+    const managementOnly = isManagementOnlyRouter(router);
 
     return {
         online: router.status === 'active',
         status: router.status,
         lastSeen: router.lastSeen || null,
-        lastHandshake: lastHandshake || null,
-        handshakeState: getHandshakeState(client),
+        lastHandshake: managementOnly ? null : (lastHandshake || null),
+        handshakeState: managementOnly ? 'management_only' : getHandshakeState(client),
         transferRx: client?.transferRx || 0,
         transferTx: client?.transferTx || 0,
         uptime: router.routerboardInfo?.uptime || null,
@@ -213,23 +277,84 @@ function buildMonitoringSummary(router, client) {
 
 function buildConnectivitySummary(router, client) {
     const lastHandshake = getLastHandshakeDate(client);
+    const managementOnly = isManagementOnlyRouter(router);
     return {
+        connectionMode: router.connectionMode || 'wireguard',
+        managementMode: router.managementMode || (managementOnly ? 'management_only' : 'fully_managed'),
         peerId: client ? String(client._id) : null,
         peerEnabled: Boolean(client?.enabled),
         peerName: client?.name || null,
-        serverNode: router.serverNode || 'wireguard',
-        vpnIp: router.vpnIp,
-        allowedIPs: client?.allowedIPs || router.vpnIp,
+        serverNode: managementOnly ? 'management-only' : (router.serverNode || 'wireguard'),
+        vpnIp: router.vpnIp || router.discoveryInfo?.localAddress || null,
+        allowedIPs: managementOnly ? [] : (client?.allowedIPs || router.vpnIp),
         publicKeyFingerprint: formatPublicKeyFingerprint(client?.publicKey),
-        tunnelStatus: deriveConnectionStatus(router, client),
-        lastHandshake: lastHandshake || null,
-        handshakeState: getHandshakeState(client),
+        tunnelStatus: managementOnly ? 'management_only' : deriveConnectionStatus(router, client),
+        lastHandshake: managementOnly ? null : (lastHandshake || null),
+        handshakeState: managementOnly ? 'management_only' : getHandshakeState(client),
         transferRx: client?.transferRx || 0,
         transferTx: client?.transferTx || 0,
         peerCreatedAt: client?.createdAt || null,
-        configGenerationStatus: router.lastSetupGeneratedAt ? 'generated' : (client ? 'available' : 'missing'),
-        rekeyEligible: Boolean(client),
-        reconciliationState: client ? (client.enabled ? 'managed' : 'disabled') : 'missing'
+        configGenerationStatus: managementOnly ? 'not_required' : (router.lastSetupGeneratedAt ? 'generated' : (client ? 'available' : 'missing')),
+        rekeyEligible: managementOnly ? false : Boolean(client),
+        reconciliationState: managementOnly ? 'management_only' : (client ? (client.enabled ? 'managed' : 'disabled') : 'missing'),
+        endpointHealthSummary: router.endpointHealthSummary || 'unknown',
+        endpoints: (router.managementEndpoints || []).map((endpoint) => ({
+            id: endpoint.id,
+            kind: endpoint.kind,
+            host: endpoint.host,
+            port: endpoint.port,
+            transport: endpoint.transport,
+            priority: endpoint.priority,
+            enabled: endpoint.enabled !== false,
+            health: endpoint.health || 'unknown',
+            authScope: endpoint.authScope || 'unknown',
+            lastSuccessAt: endpoint.lastSuccessAt || null,
+            lastFailureAt: endpoint.lastFailureAt || null,
+            failureType: endpoint.failureType || null,
+            latencyMs: endpoint.latencyMs || null
+        }))
+    };
+}
+
+function buildApiAccessSummary(router) {
+    const preferredEndpoint = (router.managementEndpoints || [])
+        .filter((endpoint) => endpoint.enabled !== false && ['api', 'api_ssl', 'rest_https'].includes(endpoint.transport))
+        .sort((a, b) => (a.priority || 999) - (b.priority || 999))[0];
+    const hasCredentials = Boolean(router.credentialState?.secretRef || (router.apiUsername || '').trim() || (router.apiPassword || '').trim());
+    const lastSuccessAt = router.lastApiSuccessAt || null;
+    const lastErrorAt = router.lastApiErrorAt || null;
+    return {
+        username: router.apiUsername || 'admin',
+        apiPort: preferredEndpoint?.port || router.apiPort || 8728,
+        hasPassword: Boolean(router.apiPassword),
+        hasCredentials,
+        credentialState: {
+            secretConfigured: Boolean(router.credentialState?.secretRef),
+            state: router.credentialState?.state || (hasCredentials ? 'active' : 'unknown'),
+            lastVerifiedAt: router.credentialState?.lastVerifiedAt || null,
+            lastRotatedAt: router.credentialState?.lastRotatedAt || null,
+            nextRotationDueAt: router.credentialState?.nextRotationDueAt || null,
+            verificationFailureCount: Number(router.credentialState?.verificationFailureCount || 0)
+        },
+        routerosVersion: router.routerosVersion || router.routerboardInfo?.firmware || null,
+        lastSuccessAt,
+        lastErrorAt,
+        lastError: router.lastApiError || null,
+        state: lastSuccessAt ? 'healthy' : (lastErrorAt ? 'failing' : (hasCredentials ? 'pending' : 'unconfigured'))
+    };
+}
+
+function normalizePingHistoryItem(item = {}) {
+    return {
+        target: item.target || '',
+        reachable: Boolean(item.reachable),
+        packetsSent: item.packetsSent ?? null,
+        packetsReceived: item.packetsReceived ?? null,
+        packetLoss: item.packetLoss ?? null,
+        avgRtt: item.avgRtt ?? null,
+        error: item.error || null,
+        actor: item.actor || 'system',
+        createdAt: item.createdAt || null
     };
 }
 
@@ -279,21 +404,34 @@ function buildRouterListItem(router, related) {
         name: router.name,
         customer: owner ? buildCustomerSummary(owner, related.userRouterCounts.get(String(owner._id)) || 0, null, subscription) : null,
         status: router.status,
+        connectionMode: router.connectionMode || 'wireguard',
+        managementMode: router.managementMode || (router.connectionMode === 'management_only' ? 'management_only' : 'fully_managed'),
         setupStatus: deriveSetupStatus(router, client),
         connectionStatus: deriveConnectionStatus(router, client),
-        vpnIp: router.vpnIp,
+        vpnIp: router.vpnIp || router.discoveryInfo?.localAddress || null,
         serverNode: router.serverNode || 'wireguard',
         winboxPort: router.ports?.winbox || null,
         sshPort: router.ports?.ssh || null,
         apiPort: router.ports?.api || null,
-        location: router.routerboardInfo?.boardName || null,
+        location: router.routerboardInfo?.boardName || router.routerboardInfo?.model || router.discoveryInfo?.hostname || null,
         lastSeen: router.lastSeen || null,
         lastHandshake: getLastHandshakeDate(client),
         healthSummary: health,
         createdAt: router.createdAt,
         billingState: subscription?.status || 'none',
         issueFlags: (router.internalFlags || []).map((flag) => flag.flag),
-        unhealthy: monitoring.health.state !== 'healthy'
+        unhealthy: monitoring.health.state !== 'healthy',
+        apiConnectivity: buildApiAccessSummary(router),
+        endpointHealthSummary: router.endpointHealthSummary || 'unknown',
+        capabilitySummary: {
+            interfacesRead: Boolean(router.capabilities?.interfacesRead),
+            queuesRead: Boolean(router.capabilities?.queuesRead),
+            hotspotRead: Boolean(router.capabilities?.hotspotRead),
+            pppoeRead: Boolean(router.capabilities?.pppoeRead),
+            firewallRead: Boolean(router.capabilities?.firewallRead),
+            routesRead: Boolean(router.capabilities?.routesRead),
+            wireguardRead: Boolean(router.capabilities?.wireguardRead)
+        }
     };
 }
 
@@ -441,7 +579,7 @@ async function getAdminRouterStats() {
         offlineRouters: items.filter((item) => item.connectionStatus === 'offline').length,
         pendingSetupRouters: items.filter((item) => ['pending', 'awaiting_connection'].includes(item.setupStatus)).length,
         failedProvisioningRouters: items.filter((item) => item.setupStatus === 'failed').length,
-        routersWithoutPorts: items.filter((item) => !item.winboxPort || !item.sshPort || !item.apiPort).length,
+        routersWithoutPorts: items.filter((item) => item.connectionMode !== 'management_only' && (!item.winboxPort || !item.sshPort || !item.apiPort)).length,
         routersWithUnhealthyTunnelState: items.filter((item) => item.unhealthy).length,
         routersByServerNode: byServerNode,
         routersWithActiveAlerts: items.filter((item) => item.issueFlags.length > 0 || item.unhealthy).length
@@ -584,14 +722,17 @@ function buildRouterActivity(bundle) {
 
 function buildProvisioningSummary(bundle) {
     const { router, client } = bundle;
+    const managementOnly = isManagementOnlyRouter(router);
     return {
         state: deriveSetupStatus(router, client),
-        configGenerationStatus: client ? 'available' : 'missing_peer',
+        configGenerationStatus: managementOnly ? 'not_required' : (client ? 'available' : 'missing_peer'),
         provisioningError: router.provisioningError || null,
         assignedResources: {
             vpnIp: router.vpnIp,
-            serverNode: router.serverNode || 'wireguard',
-            ports: router.ports
+            localAddress: router.discoveryInfo?.localAddress || null,
+            serverNode: managementOnly ? 'management-only' : (router.serverNode || 'wireguard'),
+            ports: router.ports,
+            openPorts: router.discoveryInfo?.openPorts || []
         },
         timestamps: {
             createdAt: router.createdAt,
@@ -607,16 +748,17 @@ function buildDiagnostics(bundle) {
     const { router, client, subscription } = bundle;
     const proxyStatus = getProxyStatus(router._id);
     const issues = [];
+    const managementOnly = isManagementOnlyRouter(router);
 
-    if (!client) issues.push({ code: 'missing_peer', severity: 'critical', message: 'Router does not have a linked WireGuard client.' });
-    if (client && router.vpnIp !== client.ip) issues.push({ code: 'vpn_ip_mismatch', severity: 'critical', message: 'Router VPN IP does not match linked WireGuard client IP.' });
-    if (!router.ports?.winbox || !router.ports?.ssh || !router.ports?.api) issues.push({ code: 'missing_ports', severity: 'critical', message: 'Router is missing one or more public access ports.' });
-    if (client && !client.enabled) issues.push({ code: 'peer_disabled', severity: 'warning', message: 'Linked WireGuard peer is disabled.' });
+    if (!managementOnly && !client) issues.push({ code: 'missing_peer', severity: 'critical', message: 'Router does not have a linked WireGuard client.' });
+    if (!managementOnly && client && router.vpnIp !== client.ip) issues.push({ code: 'vpn_ip_mismatch', severity: 'critical', message: 'Router VPN IP does not match linked WireGuard client IP.' });
+    if (!managementOnly && (!router.ports?.winbox || !router.ports?.ssh || !router.ports?.api)) issues.push({ code: 'missing_ports', severity: 'critical', message: 'Router is missing one or more public access ports.' });
+    if (!managementOnly && client && !client.enabled) issues.push({ code: 'peer_disabled', severity: 'warning', message: 'Linked WireGuard peer is disabled.' });
     if (router.status === 'offline') issues.push({ code: 'router_offline', severity: 'warning', message: 'Router is marked offline.' });
-    if (getHandshakeState(client) === 'never') issues.push({ code: 'no_handshake', severity: 'warning', message: 'Router has not reported a WireGuard handshake yet.' });
-    if (getHandshakeState(client) === 'stale') issues.push({ code: 'stale_handshake', severity: 'warning', message: 'Router handshake is stale.' });
-    if (router.status !== 'inactive' && !proxyStatus.running) issues.push({ code: 'proxy_not_running', severity: 'warning', message: 'Router TCP proxy is not currently running.' });
-    if (!subscription) issues.push({ code: 'missing_subscription', severity: 'warning', message: 'Router does not have an associated subscription.' });
+    if (!managementOnly && getHandshakeState(client) === 'never') issues.push({ code: 'no_handshake', severity: 'warning', message: 'Router has not reported a WireGuard handshake yet.' });
+    if (!managementOnly && getHandshakeState(client) === 'stale') issues.push({ code: 'stale_handshake', severity: 'warning', message: 'Router handshake is stale.' });
+    if (!managementOnly && router.status !== 'inactive' && !proxyStatus.running) issues.push({ code: 'proxy_not_running', severity: 'warning', message: 'Router TCP proxy is not currently running.' });
+    if (!managementOnly && !subscription) issues.push({ code: 'missing_subscription', severity: 'warning', message: 'Router does not have an associated subscription.' });
     if (router.provisioningError) issues.push({ code: 'provisioning_error', severity: 'critical', message: router.provisioningError });
 
     return {
@@ -624,10 +766,10 @@ function buildDiagnostics(bundle) {
         issues,
         proxyStatus,
         recommendedActions: [
-            issues.some((issue) => issue.code === 'missing_ports') ? 'reassign_ports' : null,
-            issues.some((issue) => issue.code === 'missing_peer') ? 'reprovision' : null,
-            issues.some((issue) => issue.code === 'stale_handshake') ? 'reset_peer' : null,
-            issues.some((issue) => issue.code === 'proxy_not_running') ? 'reactivate' : null
+            !managementOnly && issues.some((issue) => issue.code === 'missing_ports') ? 'reassign_ports' : null,
+            !managementOnly && issues.some((issue) => issue.code === 'missing_peer') ? 'reprovision' : null,
+            !managementOnly && issues.some((issue) => issue.code === 'stale_handshake') ? 'reset_peer' : null,
+            !managementOnly && issues.some((issue) => issue.code === 'proxy_not_running') ? 'reactivate' : null
         ].filter(Boolean)
     };
 }
@@ -646,16 +788,78 @@ async function getAdminRouterDetail(routerId) {
             id: String(router._id),
             name: router.name,
             vpnIp: router.vpnIp,
+            connectionMode: router.connectionMode || 'wireguard',
+            managementMode: router.managementMode || (router.connectionMode === 'management_only' ? 'management_only' : 'fully_managed'),
             serverNode: router.serverNode || 'wireguard',
             status: router.status,
             setupStatus: deriveSetupStatus(router, client),
             connectionStatus: deriveConnectionStatus(router, client),
+            localAddress: router.discoveryInfo?.localAddress || null,
+            hostname: router.discoveryInfo?.hostname || null,
+            macAddress: router.discoveryInfo?.macAddress || null,
+            discoverySource: router.discoveryInfo?.source || null,
+            openPorts: router.discoveryInfo?.openPorts || [],
+            boardName: router.routerboardInfo?.boardName || null,
+            model: router.routerboardInfo?.model || null,
+            serialNumber: router.routerboardInfo?.serialNumber || null,
+            routerosVersion: router.routerosVersion || router.routerboardInfo?.firmware || null,
             createdAt: router.createdAt,
             updatedAt: router.updatedAt
+        },
+        policy: {
+            defaultMaxClass: router.safetyPolicy?.defaultMaxClass || 'read_only',
+            allowNetworkCoreWrites: Boolean(router.safetyPolicy?.allowNetworkCoreWrites),
+            allowBootstrap: Boolean(router.safetyPolicy?.allowBootstrap),
+            approvedScopes: router.safetyPolicy?.approvedScopes || [],
+            breakGlassRequiredFor: router.safetyPolicy?.breakGlassRequiredFor || []
+        },
+        capabilities: {
+            probedAt: router.capabilities?.probedAt || null,
+            systemRead: Boolean(router.capabilities?.systemRead),
+            identityRead: Boolean(router.capabilities?.identityRead),
+            interfacesRead: Boolean(router.capabilities?.interfacesRead),
+            queuesRead: Boolean(router.capabilities?.queuesRead),
+            hotspotRead: Boolean(router.capabilities?.hotspotRead),
+            pppoeRead: Boolean(router.capabilities?.pppoeRead),
+            firewallRead: Boolean(router.capabilities?.firewallRead),
+            routesRead: Boolean(router.capabilities?.routesRead),
+            wireguardRead: Boolean(router.capabilities?.wireguardRead),
+            logsRead: Boolean(router.capabilities?.logsRead),
+            queueWrite: Boolean(router.capabilities?.queueWrite),
+            hotspotWrite: Boolean(router.capabilities?.hotspotWrite),
+            pppoeWrite: Boolean(router.capabilities?.pppoeWrite),
+            firewallWrite: Boolean(router.capabilities?.firewallWrite),
+            routesWrite: Boolean(router.capabilities?.routesWrite),
+            interfaceWrite: Boolean(router.capabilities?.interfaceWrite),
+            wireguardWrite: Boolean(router.capabilities?.wireguardWrite),
+            reboot: Boolean(router.capabilities?.reboot)
         },
         customer: owner ? buildCustomerSummary(owner, ownerRouters.length, null, subscription) : null,
         accessPorts: buildPortsSummary(router),
         connectivity: buildConnectivitySummary(router, client),
+        discovery: {
+            localAddress: router.discoveryInfo?.localAddress || null,
+            subnet: router.discoveryInfo?.subnet || null,
+            hostname: router.discoveryInfo?.hostname || null,
+            macAddress: router.discoveryInfo?.macAddress || null,
+            source: router.discoveryInfo?.source || null,
+            openPorts: router.discoveryInfo?.openPorts || [],
+            importedAt: router.discoveryInfo?.importedAt || null
+        },
+        apiAccess: buildApiAccessSummary(router),
+        pingHistory: (router.pingHistory || [])
+            .slice()
+            .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime())
+            .slice(0, 10)
+            .map(normalizePingHistoryItem),
+        failureState: {
+            current: router.failureState?.current || null,
+            firstFailedAt: router.failureState?.firstFailedAt || null,
+            lastFailedAt: router.failureState?.lastFailedAt || null,
+            lastError: router.failureState?.lastError || null,
+            failingEndpointId: router.failureState?.failingEndpointId || null,
+            failingTransport: router.failureState?.failingTransport || null
+        },
         monitoring,
         provisioning: buildProvisioningSummary(bundle),
         billing: {
@@ -799,20 +1003,12 @@ async function createRouterAdmin({ userId, name, serverNode = 'wireguard', notes
     let wireguardClient = null;
     let router = null;
     try {
-        const { privateKey, publicKey } = await generateKeys();
-        const allocatedIp = await getNextAvailableIP(dbInitialized);
-
-        wireguardClient = new Client({
+        wireguardClient = await createWireGuardClientRecord({
             name: `router-${trimmedName.toLowerCase().replace(/[^a-z0-9_-]/g, '-')}-${owner._id}`,
-            ip: allocatedIp,
-            publicKey,
-            privateKey,
-            enabled: true,
             notes: `MikroTik router: ${trimmedName}`,
-            createdBy: String(owner._id)
+            createdBy: String(owner._id),
+            dbInitialized
         });
-
-        await wireguardClient.save();
 
         try {
             await attachPeerToWireGuard(wireguardClient);
@@ -824,13 +1020,23 @@ async function createRouterAdmin({ userId, name, serverNode = 'wireguard', notes
             userId: owner._id,
             name: trimmedName,
             wireguardClientId: wireguardClient._id,
-            vpnIp: allocatedIp,
+            vpnIp: wireguardClient.ip,
+            connectionMode: 'wireguard',
+            managementMode: 'fully_managed',
             serverNode: String(serverNode || 'wireguard').trim() || 'wireguard',
             ports,
             status: 'pending',
             lastSetupGeneratedAt: new Date(),
             lastReconfiguredAt: new Date(),
-            notes: notes || ''
+            notes: notes || '',
+            safetyPolicy: {
+                defaultMaxClass: 'network_core_mutation',
+                allowPublicEndpointWrites: false,
+                allowNetworkCoreWrites: true,
+                allowBootstrap: true,
+                breakGlassRequiredFor: ['bootstrap_mutation'],
+                approvedScopes: ['queues', 'hotspot', 'pppoe', 'firewall', 'routes', 'interfaces']
+            }
         });
 
         await router.save();
@@ -865,6 +1071,54 @@ async function createRouterAdmin({ userId, name, serverNode = 'wireguard', notes
     }
 }
 
+async function createManagementOnlyRouterAdmin({ userId, name, notes = '' }) {
+    const owner = await User.findById(userId);
+    if (!owner || owner.role !== 'user') {
+        throw new Error('Target user not found');
+    }
+
+    const trimmedName = String(name || '').trim();
+    if (!trimmedName) {
+        throw new Error('Router name is required');
+    }
+
+    const existingRouter = await MikrotikRouter.findOne({ userId: owner._id, name: trimmedName }).lean();
+    if (existingRouter) {
+        throw new Error('A router with this name already exists for the selected customer');
+    }
+
+    const router = new MikrotikRouter({
+        userId: owner._id,
+        name: trimmedName,
+        wireguardClientId: null,
+        vpnIp: null,
+        connectionMode: 'management_only',
+        managementMode: 'management_only',
+        serverNode: 'management-only',
+        ports: {},
+        status: 'active',
+        lastSeen: new Date(),
+        notes: notes || '',
+        safetyPolicy: {
+            defaultMaxClass: 'safe_operational',
+            allowPublicEndpointWrites: false,
+            allowNetworkCoreWrites: false,
+            allowBootstrap: false,
+            breakGlassRequiredFor: ['service_mutation', 'network_core_mutation', 'bootstrap_mutation'],
+            approvedScopes: []
+        }
+    });
+
+    await router.save();
+
+    return {
+        router,
+        client: null,
+        owner,
+        artifacts: null
+    };
+}
+
 async function ensureRouterHasPorts(router) {
     if (router.ports?.winbox && router.ports?.ssh && router.ports?.api) {
         return router.ports;
@@ -882,16 +1136,12 @@ async function ensureRouterHasClient(router, dbInitialized = true) {
     }
 
     const ownerId = router.userId?._id || router.userId;
-    const { privateKey, publicKey } = await generateKeys();
-    const allocatedIp = router.vpnIp || await getNextAvailableIP(dbInitialized);
-    const client = await Client.create({
+    const client = await createWireGuardClientRecord({
         name: `router-${router.name.toLowerCase()}-${String(ownerId)}`,
-        ip: allocatedIp,
-        publicKey,
-        privateKey,
-        enabled: true,
         notes: `MikroTik router: ${router.name}`,
-        createdBy: String(ownerId)
+        createdBy: String(ownerId),
+        dbInitialized,
+        preferredIp: router.vpnIp || null
     });
 
     router.wireguardClientId = client._id;
@@ -1075,7 +1325,33 @@ async function deleteRouterAdmin(routerId) {
     }
 
     stopRouterProxy(router._id);
-    await releasePorts(router._id);
+    if (router.ports?.winbox || router.ports?.ssh || router.ports?.api) {
+        await releasePorts(router._id);
+    }
+
+    await RouterDiscoverySession.updateMany(
+        {},
+        {
+            $unset: {
+                'candidates.$[imported].importedRouterId': 1,
+                'candidates.$[imported].importedAt': 1,
+                'candidates.$[duplicate].verification.readiness.duplicateRouterId': 1
+            },
+            $set: {
+                'candidates.$[imported].verification.status': 'verified',
+                'candidates.$[duplicate].verification.status': 'verified'
+            },
+            $pull: {
+                'candidates.$[duplicate].verification.readiness.reasons': 'Router appears to already be onboarded'
+            }
+        },
+        {
+            arrayFilters: [
+                { 'imported.importedRouterId': router._id },
+                { 'duplicate.verification.readiness.duplicateRouterId': router._id }
+            ]
+        }
+    ).catch(() => undefined);
 
     await router.deleteOne();
 
@@ -1110,6 +1386,7 @@ module.exports = {
     getAdminRouterNotes,
     getAdminRouterFlags,
     createRouterAdmin,
+    createManagementOnlyRouterAdmin,
     generateRouterSetupArtifacts,
     disableRouter,
     reactivateRouter,

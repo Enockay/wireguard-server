@@ -6,7 +6,7 @@ const { generateKeys, getNextAvailableIP } = require('../utils/route-helpers');
 const { authenticateToken } = require('./auth');
 const { log } = require('../wg-core');
 const { sendRouterCreatedEmail, sendRouterOnlineEmail } = require('../services/email-service');
-const { createSubscription, getUserBillingSummary } = require('../services/billing-service');
+const { createSubscription, getUserBillingSummary, activatePendingSubscriptionsForRouter } = require('../services/billing-service');
 const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive } = require('../wg-core');
 const { startRouterProxy } = require('../services/tcp-proxy-service');
 
@@ -389,6 +389,26 @@ async function updateRouterStatus(routerId, isOnline, routerboardInfo = null) {
                     log('error', 'proxy_start_failed_on_online', { 
                         routerId, 
                         error: proxyError.message 
+                    });
+                }
+            }
+
+            // Send email if router just came online
+            if (wasOffline) {
+                try {
+                    const deferredActivation = await activatePendingSubscriptionsForRouter(router._id);
+                    if (deferredActivation.activated || deferredActivation.failed) {
+                        log('info', 'router_subscription_activation_processed', {
+                            routerId,
+                            activated: deferredActivation.activated,
+                            skipped: deferredActivation.skipped,
+                            failed: deferredActivation.failed
+                        });
+                    }
+                } catch (activationError) {
+                    log('warn', 'router_subscription_activation_failed', {
+                        routerId,
+                        error: activationError.message
                     });
                 }
             }

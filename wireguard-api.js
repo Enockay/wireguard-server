@@ -18,7 +18,9 @@ const {
     isValidCidr,
     runWgCommand,
     waitForWireGuard,
-    validateKeepalive
+    validateKeepalive,
+    isWgUnavailableError,
+    isWgRuntimeAvailable
 } = require("./wg-core");
 const { loadClientsFromDatabase } = require("./utils/route-helpers");
 
@@ -43,7 +45,12 @@ const registerAdminLogRoutes = require("./routes/admin-logs");
 const registerAdminSupportRoutes = require("./routes/admin-support");
 const registerAdminManagementRoutes = require("./routes/admin-management");
 const registerAdminServicePlanRoutes = require("./routes/admin-service-plans");
+const registerHotspotRoutes = require("./routes/hotspot");
+const registerPppoeRoutes = require("./routes/pppoe");
+const registerQueueRoutes = require("./routes/queues");
 const { requestLogger } = require("./middleware/request-logger");
+const { runTelemetryPolling } = require("./services/telemetry-service");
+const { createWebSocketServer, broadcastRouterMetric, broadcastRouterStatus } = require("./services/websocket-service");
 
 // Allow running API without a WireGuard interface present (e.g. local dev).
 // When disabled, we skip wg0 readiness checks and wg-dependent background jobs.
@@ -114,6 +121,7 @@ if (clientDir) {
 
 // Initialize MongoDB connection
 let dbInitialized = false;
+let telemetryIntervalId = null;
 
 // Register all routes (pass getter function so routes can check current state)
 registerAuthRoutes(app); // No auth required for signup/login
@@ -135,6 +143,9 @@ registerAdminLogRoutes(app); // Admin logs, audit trail, and security management
 registerAdminSupportRoutes(app); // Admin support and ticket management
 registerAdminManagementRoutes(app); // Admin account management
 registerAdminServicePlanRoutes(app); // Admin settings and service plan management
+registerHotspotRoutes(app); // Admin hotspot management
+registerPppoeRoutes(app); // Admin PPPoE management
+registerQueueRoutes(app); // Admin queue management
 (async () => {
     try {
         await db.connect();
@@ -160,6 +171,9 @@ registerAdminServicePlanRoutes(app); // Admin settings and service plan manageme
         // Start billing processing job (runs daily)
         startBillingJob();
 
+        // Start telemetry polling once the database is ready.
+        startTelemetryPollingJob();
+
         // Initialize TCP proxies for all active routers
         if (dbInitialized) {
             setTimeout(async () => {
@@ -181,7 +195,7 @@ registerAdminServicePlanRoutes(app); // Admin settings and service plan manageme
 // Reduces N*2 DB round-trips (findOne + updateOne per peer) to just 2
 // (one find, one bulkWrite) per 30-second cycle.
 async function updateClientStatistics() {
-    if (!dbInitialized) {
+    if (!dbInitialized || !isWgRuntimeAvailable()) {
         return;
     }
     
@@ -249,14 +263,14 @@ async function updateClientStatistics() {
         }
     } catch (error) {
         // Silently fail - WireGuard might not be running
-        if (error.message && !error.message.includes('No such device')) {
+        if (error.message && !error.message.includes('No such device') && !isWgUnavailableError(error)) {
             log('error', 'stats_update_error', { error: error.message });
         }
     }
 }
 
 async function cleanupDisabledPeers() {
-    if (!dbInitialized) return;
+    if (!dbInitialized || !isWgRuntimeAvailable()) return;
     
     try {
         const wgDump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
@@ -289,14 +303,14 @@ async function cleanupDisabledPeers() {
             });
         }
     } catch (error) {
-        if (error.message && !error.message.includes('No such device')) {
+        if (error.message && !error.message.includes('No such device') && !isWgUnavailableError(error)) {
             log('error', 'cleanup_disabled_error', { error: error.message });
         }
     }
 }
 
 async function reconcilePeers() {
-    if (!dbInitialized) return;
+    if (!dbInitialized || !isWgRuntimeAvailable()) return;
 
     try {
         // 1. Get set of public keys currently in kernel
@@ -368,7 +382,7 @@ async function reconcilePeers() {
         }
         } catch (error) {
         // Silently ignore if WireGuard interface doesn't exist yet
-        if (error.message && !error.message.includes('No such device')) {
+        if (error.message && !error.message.includes('No such device') && !isWgUnavailableError(error)) {
             log('error', 'reconcile_error', { error: error.message });
         }
     }
@@ -376,6 +390,10 @@ async function reconcilePeers() {
 
 // Start background jobs for statistics, disabled-peer cleanup, and reconciliation
 function startStatisticsUpdateJob() {
+    if (!isWgRuntimeAvailable()) {
+        log('warn', 'wg_jobs_skipped', { reason: 'WireGuard runtime unavailable at startup' });
+        return;
+    }
     // Run statistics update immediately, then every 30 seconds (read-only)
     updateClientStatistics();
     setInterval(updateClientStatistics, STATS_UPDATE_INTERVAL);
@@ -416,6 +434,34 @@ function startBillingJob() {
     log('info', 'billing_job_scheduled', { interval: '24 hours' });
 }
 
+function startTelemetryPollingJob() {
+    if (telemetryIntervalId) {
+        return;
+    }
+
+    const pollTelemetry = async () => {
+        try {
+            if (!dbInitialized) return;
+            const result = await runTelemetryPolling();
+            result.results
+                .filter((item) => item.success && item.metric)
+                .forEach((item) => broadcastRouterMetric(item.routerId, item.metric));
+        } catch (error) {
+            log('error', 'telemetry_polling_error', { error: error.message });
+        }
+    };
+
+    setTimeout(() => {
+        void pollTelemetry();
+    }, 10000);
+
+    telemetryIntervalId = setInterval(() => {
+        void pollTelemetry();
+    }, 60000);
+
+    log('info', 'telemetry_polling_started', { intervalSec: 60 });
+}
+
 // Router status monitoring (checks every 5 minutes)
 function startRouterStatusMonitoring() {
     if (!WG_ENABLED) return;
@@ -428,7 +474,7 @@ function startRouterStatusMonitoring() {
             if (!dbInitialized) return;
 
             // Get all active routers
-            const routers = await MikrotikRouter.find({ status: { $in: ['pending', 'active', 'offline'] } })
+            const routers = await MikrotikRouter.find({ status: { $in: ['active', 'offline'] } })
                 .populate('wireguardClientId');
 
             log('info', 'router_status_check_started', { count: routers.length });
@@ -459,6 +505,7 @@ function startRouterStatusMonitoring() {
 
                     // Update router status and store routerboard info
                     await updateRouterStatus(router._id, isActive, routerboardInfo);
+                    broadcastRouterStatus(router._id, isActive ? 'online' : 'offline');
 
                     if (isActive) {
                         log('info', 'router_status_check_success', {
@@ -483,6 +530,7 @@ function startRouterStatusMonitoring() {
                     });
                     // Mark as offline if check fails
                     await updateRouterStatus(router._id, false);
+                    broadcastRouterStatus(router._id, 'offline');
                 }
 
                 // Small delay between checks to avoid overwhelming the system
@@ -506,7 +554,7 @@ function startRouterStatusMonitoring() {
 const PORT = process.env.PORT || 5000;
 // Bind to 0.0.0.0 to make it accessible from outside the container
 // This is especially important when using network_mode: "service:wireguard"
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     log('info', 'server_started', { port: PORT, host: '0.0.0.0' });
     
     // Start router status monitoring if WireGuard is enabled
@@ -516,3 +564,5 @@ app.listen(PORT, '0.0.0.0', () => {
         }, 10000); // Wait 10 seconds for DB to be ready
     }
 });
+
+createWebSocketServer(server);

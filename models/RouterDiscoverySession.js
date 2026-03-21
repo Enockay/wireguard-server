@@ -1,5 +1,47 @@
 const mongoose = require('mongoose');
 
+const verificationInterfaceSchema = new mongoose.Schema({
+    name: {
+        type: String,
+        default: 'unknown'
+    },
+    type: {
+        type: String,
+        default: 'unknown'
+    },
+    running: {
+        type: Boolean,
+        default: false
+    },
+    disabled: {
+        type: Boolean,
+        default: false
+    },
+    comment: {
+        type: String,
+        default: ''
+    }
+}, { _id: false });
+
+const verificationMetadataSchema = new mongoose.Schema({
+    identity: { type: String, default: null },
+    boardName: { type: String, default: null },
+    serialNumber: { type: String, default: null },
+    routerosVersion: { type: String, default: null },
+    firmware: { type: String, default: null },
+    model: { type: String, default: null },
+    macAddress: { type: String, default: null },
+    interfaces: {
+        type: [verificationInterfaceSchema],
+        default: []
+    },
+    interfaceCount: { type: Number, default: 0 },
+    raw: {
+        type: mongoose.Schema.Types.Mixed,
+        default: null
+    }
+}, { _id: false });
+
 const verificationSchema = new mongoose.Schema({
     status: {
         type: String,
@@ -19,26 +61,25 @@ const verificationSchema = new mongoose.Schema({
         type: Date,
         default: null
     },
-    metadata: {
-        identity: { type: String, default: null },
-        boardName: { type: String, default: null },
-        serialNumber: { type: String, default: null },
-        routerosVersion: { type: String, default: null },
-        firmware: { type: String, default: null },
-        model: { type: String, default: null },
-        macAddress: { type: String, default: null },
-        interfaces: [{
-            name: String,
+    credentials: {
+        username: {
             type: String,
-            running: Boolean,
-            disabled: Boolean,
-            comment: String
-        }],
-        interfaceCount: { type: Number, default: 0 },
-        raw: {
-            type: mongoose.Schema.Types.Mixed,
+            trim: true,
+            default: null
+        },
+        credentialSecretRef: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'RouterCredential',
+            default: null
+        },
+        apiPort: {
+            type: Number,
             default: null
         }
+    },
+    metadata: {
+        type: verificationMetadataSchema,
+        default: null
     },
     readiness: {
         status: {

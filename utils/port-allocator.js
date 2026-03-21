@@ -1,9 +1,10 @@
 const MikrotikRouter = require('../models/MikrotikRouter');
 const { log } = require('../wg-core');
 
-// Port ranges - All 4-digit ports (1000-9999)
+// Port ranges - keep them above 1024 so the API process does not need root
+// privileges just to bind the proxy listeners.
 const PORT_RANGES = {
-    winbox: { start: 1000, end: 3333 },   // 1000-3333 for Winbox
+    winbox: { start: 1024, end: 3333 },   // 1024-3333 for Winbox
     ssh: { start: 3334, end: 6666 },      // 3334-6666 for SSH
     api: { start: 6667, end: 9999 }       // 6667-9999 for API
 };

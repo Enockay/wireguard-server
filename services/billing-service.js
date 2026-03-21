@@ -1,6 +1,7 @@
 const Subscription = require('../models/Subscription');
 const User = require('../models/User');
 const MikrotikRouter = require('../models/MikrotikRouter');
+const ServicePlan = require('../models/ServicePlan');
 const { log } = require('../wg-core');
 
 // Pricing configuration (per router per month)
@@ -102,6 +103,8 @@ async function createSubscription(userId, routerId) {
             });
         }
 
+        const fallbackPlan = await ServicePlan.findOne({ isActive: true }).sort({ price: 1 }).lean().catch(() => null);
+
         const subscription = new Subscription({
             userId,
             routerId,
@@ -111,10 +114,14 @@ async function createSubscription(userId, routerId) {
             currentPeriodStart,
             currentPeriodEnd,
             trialEndsAt,
-            nextBillingDate: currentPeriodEnd
+            nextBillingDate: currentPeriodEnd,
+            servicePlanId: fallbackPlan?._id || null
         });
 
         await subscription.save();
+        await activateSubscriptionOnRouter(subscription).catch((error) => {
+            log('warn', 'subscription_queue_activation_failed', { subscriptionId: subscription._id, routerId, error: error.message });
+        });
 
         log('info', 'subscription_created', {
             userId,
@@ -166,6 +173,9 @@ async function processBilling(subscriptionId) {
             subscription.lastPaymentDate = new Date();
 
             await subscription.save();
+            await reactivateSubscriptionOnRouter(subscription).catch((error) => {
+                log('warn', 'subscription_queue_reactivation_failed', { subscriptionId, error: error.message });
+            });
 
             log('info', 'trial_to_paid', {
                 subscriptionId,
@@ -187,6 +197,9 @@ async function processBilling(subscriptionId) {
         subscription.status = 'active';
 
         await subscription.save();
+        await reactivateSubscriptionOnRouter(subscription).catch((error) => {
+            log('warn', 'subscription_queue_reactivation_failed', { subscriptionId, error: error.message });
+        });
 
         log('info', 'billing_processed', {
             subscriptionId,
@@ -263,6 +276,9 @@ async function cancelSubscription(subscriptionId, userId) {
         subscription.status = 'canceled';
         subscription.canceledAt = new Date();
         await subscription.save();
+        await suspendSubscriptionOnRouter(subscription).catch((error) => {
+            log('warn', 'subscription_queue_suspension_failed', { subscriptionId, error: error.message });
+        });
 
         log('info', 'subscription_canceled', { subscriptionId, userId });
 
@@ -316,11 +332,146 @@ async function getUserBillingSummary(userId) {
     }
 }
 
+async function getSubscriptionRouterAndPlan(subscription) {
+    const [router, servicePlan] = await Promise.all([
+        MikrotikRouter.findById(subscription.routerId).select('_id vpnIp status firstConnectedAt lastSeen'),
+        subscription.servicePlanId ? ServicePlan.findById(subscription.servicePlanId) : null
+    ]);
+    return { router, servicePlan };
+}
+
+function isRouterReadyForQueueActivation(router) {
+    if (!router?.vpnIp) {
+        return false;
+    }
+    return router.status === 'active' || Boolean(router.firstConnectedAt || router.lastSeen);
+}
+
+async function activateSubscriptionOnRouter(subscription) {
+    const { applyPlanToSubscriber } = require('./queue-service');
+    const { router, servicePlan } = await getSubscriptionRouterAndPlan(subscription);
+    if (!router || !servicePlan) {
+        return null;
+    }
+    if (!isRouterReadyForQueueActivation(router)) {
+        log('info', 'subscription_queue_activation_deferred', {
+            subscriptionId: subscription._id,
+            routerId: router._id,
+            reason: 'router_not_reachable_yet'
+        });
+        return { deferred: true };
+    }
+    const subscriberIp = router.vpnIp;
+    if (!subscriberIp) {
+        return null;
+    }
+    const queue = await applyPlanToSubscriber(router._id, subscriberIp, servicePlan, subscription._id);
+    subscription.queueName = queue.name;
+    await subscription.save().catch(() => undefined);
+    return queue;
+}
+
+async function suspendSubscriptionOnRouter(subscription) {
+    const { removePlanFromSubscriber } = require('./queue-service');
+    const router = await MikrotikRouter.findById(subscription.routerId).select('_id vpnIp');
+    if (!router?.vpnIp) {
+        return null;
+    }
+    await removePlanFromSubscriber(router._id, router.vpnIp).catch(() => undefined);
+    await executeRouterBlocklistAdd(router._id, router.vpnIp, `suspended-sub-${subscription._id}`);
+    return { blocked: true };
+}
+
+async function reactivateSubscriptionOnRouter(subscription) {
+    const { applyPlanToSubscriber } = require('./queue-service');
+    const { router, servicePlan } = await getSubscriptionRouterAndPlan(subscription);
+    if (!router?.vpnIp || !servicePlan) {
+        return null;
+    }
+    if (!isRouterReadyForQueueActivation(router)) {
+        log('info', 'subscription_queue_reactivation_deferred', {
+            subscriptionId: subscription._id,
+            routerId: router._id,
+            reason: 'router_not_reachable_yet'
+        });
+        return { deferred: true };
+    }
+    await executeRouterBlocklistRemove(router._id, router.vpnIp);
+    const queue = await applyPlanToSubscriber(router._id, router.vpnIp, servicePlan, subscription._id);
+    subscription.queueName = queue.name;
+    await subscription.save().catch(() => undefined);
+    return queue;
+}
+
+async function activatePendingSubscriptionsForRouter(routerId) {
+    const subscriptions = await Subscription.find({
+        routerId,
+        status: { $in: ['trial', 'active'] }
+    }).sort({ createdAt: 1 });
+
+    let activated = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const subscription of subscriptions) {
+        if (subscription.queueName) {
+            skipped += 1;
+            continue;
+        }
+
+        try {
+            const result = await activateSubscriptionOnRouter(subscription);
+            if (result?.deferred) {
+                skipped += 1;
+                continue;
+            }
+            if (result) {
+                activated += 1;
+            } else {
+                skipped += 1;
+            }
+        } catch (error) {
+            failed += 1;
+            log('warn', 'subscription_queue_activation_retry_failed', {
+                subscriptionId: subscription._id,
+                routerId,
+                error: error.message
+            });
+        }
+    }
+
+    return { activated, skipped, failed };
+}
+
+async function executeRouterBlocklistAdd(routerId, subscriberIp, comment) {
+    const { executeCommand } = require('./routeros-command-service');
+    return executeCommand(routerId, '/ip/firewall/address-list/add', {
+        list: 'blocked',
+        address: subscriberIp,
+        comment
+    }, { operationName: 'firewall_mutation', scope: 'firewall' });
+}
+
+async function executeRouterBlocklistRemove(routerId, subscriberIp) {
+    const { executeCommand } = require('./routeros-command-service');
+    const entries = await executeCommand(routerId, '/ip/firewall/address-list/print', {
+        '?list': 'blocked',
+        '?address': subscriberIp
+    }, { operationName: 'get_system_resource' }).catch(() => []);
+    await Promise.all((entries || [])
+        .filter((entry) => entry['.id'])
+        .map((entry) => executeCommand(routerId, '/ip/firewall/address-list/remove', { '.id': entry['.id'] }, { operationName: 'firewall_mutation', scope: 'firewall' })));
+}
+
 module.exports = {
     createSubscription,
     processBilling,
     processAllDueSubscriptions,
     cancelSubscription,
     getUserBillingSummary,
+    activateSubscriptionOnRouter,
+    activatePendingSubscriptionsForRouter,
+    suspendSubscriptionOnRouter,
+    reactivateSubscriptionOnRouter,
     PRICING
 };

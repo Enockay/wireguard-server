@@ -29,7 +29,6 @@ const servicePlanSchema = new mongoose.Schema({
     collection: 'service_plans'
 });
 
-servicePlanSchema.index({ name: 1 });
 servicePlanSchema.index({ isActive: 1, planType: 1 });
 
 module.exports = mongoose.model('ServicePlan', servicePlanSchema);

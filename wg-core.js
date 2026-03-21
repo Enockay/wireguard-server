@@ -15,6 +15,8 @@ class WgMutex {
 }
 
 const wgLock = new WgMutex();
+let wgRuntimeAvailable = true;
+let wgRuntimeDisableLogged = false;
 
 // Structured JSON logger used across the service
 function log(level, msg, data = {}) {
@@ -25,6 +27,27 @@ function log(level, msg, data = {}) {
         ...data
     };
     console[level === "error" ? "error" : "log"](JSON.stringify(entry));
+}
+
+function isWgPermissionDeniedError(error) {
+    const message = String(error?.message || error || '');
+    return /operation not permitted|permission denied/i.test(message);
+}
+
+function isWgUnavailableError(error) {
+    return Boolean(error && (error.code === 'EWGDISABLED' || isWgPermissionDeniedError(error)));
+}
+
+function disableWgRuntime(reason) {
+    wgRuntimeAvailable = false;
+    if (!wgRuntimeDisableLogged) {
+        wgRuntimeDisableLogged = true;
+        log('warn', 'wg_runtime_disabled', { reason });
+    }
+}
+
+function isWgRuntimeAvailable() {
+    return wgRuntimeAvailable;
 }
 
 // Shared timing / behaviour constants
@@ -78,10 +101,18 @@ function runCommand(command) {
 // Direct binary execution for wg commands (no shell)
 function runWgCommand(args) {
     return new Promise((resolve, reject) => {
+        if (!wgRuntimeAvailable) {
+            const err = new Error('WireGuard runtime is unavailable');
+            err.code = 'EWGDISABLED';
+            return reject(err);
+        }
         execFile("wg", args, { timeout: 10000 }, (error, stdout, stderr) => {
             if (error) {
                 const err = new Error(stderr.trim() || error.message);
                 err.code = error.code;
+                if (isWgPermissionDeniedError(err)) {
+                    disableWgRuntime(err.message);
+                }
                 log("error", "wg_cmd_error", { subcommand: args[0], error: err.message });
                 return reject(err);
             }
@@ -93,10 +124,16 @@ function runWgCommand(args) {
 // Wait for WireGuard interface with exponential backoff
 async function waitForWireGuard(maxRetries = 10) {
     for (let i = 0; i < maxRetries; i++) {
+        if (!wgRuntimeAvailable) {
+            return false;
+        }
         try {
             await runWgCommand(["show", "wg0"]);
             return true;
         } catch (e) {
+            if (isWgUnavailableError(e)) {
+                return false;
+            }
             const delay = Math.min(2000 * (i + 1), 15000);
             log("info", "wg_wait_retry", { attempt: i + 1, maxRetries, delayMs: delay });
             await new Promise(r => setTimeout(r, delay));
@@ -110,6 +147,7 @@ let cachedServerPublicKey = null;
 
 async function getServerPublicKey() {
     if (cachedServerPublicKey) return cachedServerPublicKey;
+    if (!wgRuntimeAvailable) return "REPLACE_WITH_SERVER_PUBLIC_KEY";
 
     // Method 1: wg show wg0 public-key
     try {
@@ -121,6 +159,9 @@ async function getServerPublicKey() {
         }
         log("warn", "server_pubkey_invalid", { raw: key, method: "public-key" });
     } catch (error) {
+        if (isWgUnavailableError(error)) {
+            return "REPLACE_WITH_SERVER_PUBLIC_KEY";
+        }
         log("warn", "server_pubkey_cmd_failed", { method: "public-key", error: error.message });
     }
 
@@ -139,6 +180,9 @@ async function getServerPublicKey() {
             log("warn", "server_pubkey_invalid", { raw: key, method: "dump", fieldCount: fields.length });
         }
     } catch (error) {
+        if (isWgUnavailableError(error)) {
+            return "REPLACE_WITH_SERVER_PUBLIC_KEY";
+        }
         log("warn", "server_pubkey_cmd_failed", { method: "dump", error: error.message });
     }
 
@@ -172,6 +216,9 @@ module.exports = {
     runWgCommand,
     waitForWireGuard,
     getServerPublicKey,
-    getServerEndpoint
+    getServerEndpoint,
+    isWgPermissionDeniedError,
+    isWgUnavailableError,
+    isWgRuntimeAvailable,
+    disableWgRuntime
 };
-
