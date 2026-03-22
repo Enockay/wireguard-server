@@ -1,10 +1,16 @@
 # Environment variables
 .env
+.env.*
 
 # Private keys
 private.key
 public.key
 *.key
+privatekey
+publickey
+
+# Dependencies
+node_modules/
 
 # macOS
 .DS_Store
@@ -13,4 +19,3 @@ public.key
 Thumbs.db
 ehthumbs.db
 Desktop.ini
-
