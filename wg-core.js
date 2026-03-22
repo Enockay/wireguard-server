@@ -17,6 +17,7 @@ class WgMutex {
 const wgLock = new WgMutex();
 let wgRuntimeAvailable = true;
 let wgRuntimeDisableLogged = false;
+const WIREGUARD_INTERFACE = String(process.env.WIREGUARD_INTERFACE || 'wg0').trim() || 'wg0';
 
 // Structured JSON logger used across the service
 function log(level, msg, data = {}) {
@@ -128,7 +129,7 @@ async function waitForWireGuard(maxRetries = 10) {
             return false;
         }
         try {
-            await runWgCommand(["show", "wg0"]);
+            await runWgCommand(["show", WIREGUARD_INTERFACE]);
             return true;
         } catch (e) {
             if (isWgUnavailableError(e)) {
@@ -151,7 +152,7 @@ async function getServerPublicKey() {
 
     // Method 1: wg show wg0 public-key
     try {
-        const key = (await wgLock.run(() => runWgCommand(["show", "wg0", "public-key"]))).trim();
+        const key = (await wgLock.run(() => runWgCommand(["show", WIREGUARD_INTERFACE, "public-key"]))).trim();
         if (isValidWgKey(key)) {
             cachedServerPublicKey = key;
             log("info", "server_pubkey_cached", { method: "public-key", key: key.substring(0, 8) + "..." });
@@ -167,7 +168,7 @@ async function getServerPublicKey() {
 
     // Method 2: wg show wg0 dump (first line, second field)
     try {
-        const dump = (await wgLock.run(() => runWgCommand(["show", "wg0", "dump"]))).trim();
+        const dump = (await wgLock.run(() => runWgCommand(["show", WIREGUARD_INTERFACE, "dump"]))).trim();
         const firstLine = dump.split("\n")[0];
         if (firstLine) {
             const fields = firstLine.split("\t");
@@ -202,6 +203,7 @@ module.exports = {
 
     // constants
     KEEPALIVE_TIME,
+    WIREGUARD_INTERFACE,
     STARTING_CLIENT_IP,
     STATS_UPDATE_INTERVAL,
     CLEANUP_INTERVAL,

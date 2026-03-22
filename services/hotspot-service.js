@@ -23,12 +23,19 @@ function escapeRegex(value) {
 
 function parseDurationToSeconds(value) {
     if (!value) return 0;
-    if (/^\d+$/.test(String(value).trim())) {
-        return Number(value) || 0;
+    const normalized = String(value).trim();
+    if (!normalized) return 0;
+    if (/^\d+$/.test(normalized)) {
+        return Number(normalized) || 0;
+    }
+    if (/^\d{1,3}:\d{2}(?::\d{2})?$/.test(normalized)) {
+        const parts = normalized.split(':').map((part) => Number(part) || 0);
+        if (parts.length === 3) return (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+        if (parts.length === 2) return (parts[0] * 60) + parts[1];
     }
 
     const units = { w: 604800, d: 86400, h: 3600, m: 60, s: 1 };
-    const matches = String(value).toLowerCase().matchAll(/(\d+)([wdhms])/g);
+    const matches = normalized.toLowerCase().matchAll(/(\d+)([wdhms])/g);
     let total = 0;
     for (const match of matches) {
         total += (Number(match[1]) || 0) * (units[match[2]] || 0);
@@ -82,6 +89,10 @@ function serializeHotspotUser(doc, activeUsernames = new Set()) {
 }
 
 function serializeHotspotSession(doc) {
+    const uptimeSeconds = doc.uptimeSeconds || 0;
+    const averageUplinkBps = uptimeSeconds > 0 ? Math.round((doc.uplinkBytes || 0) / uptimeSeconds) : 0;
+    const averageDownlinkBps = uptimeSeconds > 0 ? Math.round((doc.downlinkBytes || 0) / uptimeSeconds) : 0;
+
     return {
         id: String(doc._id),
         routerId: String(doc.routerId),
@@ -91,6 +102,18 @@ function serializeHotspotSession(doc) {
         mac: doc.mac || '',
         uplinkBytes: doc.uplinkBytes || 0,
         downlinkBytes: doc.downlinkBytes || 0,
+        currentUplinkBps: doc.currentUplinkBps || 0,
+        currentDownlinkBps: doc.currentDownlinkBps || 0,
+        uptimeSeconds,
+        sessionTimeLeftSeconds: doc.sessionTimeLeftSeconds || 0,
+        idleTimeoutSeconds: doc.idleTimeoutSeconds || 0,
+        keepaliveTimeoutSeconds: doc.keepaliveTimeoutSeconds || 0,
+        server: doc.server || 'default',
+        hostName: doc.hostName || '',
+        deviceLabel: doc.deviceLabel || doc.hostName || doc.mac || doc.ip || '',
+        profile: doc.profile || '',
+        averageUplinkBps,
+        averageDownlinkBps,
         sessionId: doc.sessionId || '',
         startedAt: doc.startedAt || doc.createdAt || null,
         endedAt: doc.endedAt || null,
@@ -120,6 +143,26 @@ async function ensureRouterExists(routerId) {
 async function fetchRouterHotspotUserRecord(routerId, username) {
     const records = await executeCommand(routerId, '/ip/hotspot/user/print', {}, { operationName: 'get_system_resource' });
     return records.find((item) => item.name === username) || null;
+}
+
+async function fetchDhcpLeases(routerId) {
+    const records = await executeCommand(routerId, '/ip/dhcp-server/lease/print', {}, { operationName: 'get_system_resource' }).catch(() => []);
+    const byIp = new Map();
+    const byMac = new Map();
+
+    for (const record of records || []) {
+        const lease = {
+            address: record.address || '',
+            mac: String(record['mac-address'] || '').toUpperCase(),
+            hostName: record['host-name'] || '',
+            comment: record.comment || ''
+        };
+
+        if (lease.address && !byIp.has(lease.address)) byIp.set(lease.address, lease);
+        if (lease.mac && !byMac.has(lease.mac)) byMac.set(lease.mac, lease);
+    }
+
+    return { byIp, byMac };
 }
 
 async function syncHotspotUsers(routerId, routerUsers) {
@@ -153,36 +196,65 @@ async function syncHotspotUsers(routerId, routerUsers) {
     await HotspotUser.bulkWrite(operations, { ordered: false });
 }
 
-async function syncActiveSessions(routerId, activeSessions) {
+async function syncActiveSessions(routerId, activeSessions, dhcpLeases = { byIp: new Map(), byMac: new Map() }) {
     const usernames = [...new Set(activeSessions.map((item) => item.user).filter(Boolean))];
     const users = usernames.length
-        ? await HotspotUser.find({ routerId, username: { $in: usernames } }).select('_id username')
+        ? await HotspotUser.find({ routerId, username: { $in: usernames } }).select('_id username profile')
         : [];
     const usersByUsername = new Map(users.map((user) => [user.username, user]));
     const sessionIds = activeSessions.map((item) => item['.id']).filter(Boolean);
+    const existingSessions = sessionIds.length
+        ? await HotspotSession.find({ routerId, sessionId: { $in: sessionIds } }).select('sessionId uplinkBytes downlinkBytes updatedAt')
+        : [];
+    const existingBySessionId = new Map(existingSessions.map((session) => [session.sessionId, session]));
 
     if (sessionIds.length) {
-        const operations = activeSessions.map((record) => ({
-            updateOne: {
-                filter: { routerId, sessionId: record['.id'] },
-                update: {
-                    $set: {
-                        hotspotUserId: usersByUsername.get(record.user)?._id || null,
-                        username: record.user || '',
-                        ip: record.address || '',
-                        mac: record['mac-address'] || '',
-                        uplinkBytes: toNumber(record['bytes-out']),
-                        downlinkBytes: toNumber(record['bytes-in']),
-                        isActive: true,
-                        endedAt: null
+        const operations = activeSessions.map((record) => {
+            const sessionId = record['.id'];
+            const ip = record.address || '';
+            const mac = String(record['mac-address'] || '').toUpperCase();
+            const lease = dhcpLeases.byIp.get(ip) || dhcpLeases.byMac.get(mac) || null;
+            const uplinkBytes = toNumber(record['bytes-out']);
+            const downlinkBytes = toNumber(record['bytes-in']);
+            const previous = existingBySessionId.get(sessionId);
+            const elapsedSeconds = previous?.updatedAt ? Math.max(1, Math.round((Date.now() - new Date(previous.updatedAt).getTime()) / 1000)) : 0;
+            const currentUplinkBps = elapsedSeconds && previous ? Math.max(0, Math.round((uplinkBytes - (previous.uplinkBytes || 0)) / elapsedSeconds)) : 0;
+            const currentDownlinkBps = elapsedSeconds && previous ? Math.max(0, Math.round((downlinkBytes - (previous.downlinkBytes || 0)) / elapsedSeconds)) : 0;
+            const hostName = record['host-name'] || lease?.hostName || '';
+            const deviceLabel = hostName || lease?.comment || record['caller-id'] || record['mac-address'] || record.address || '';
+
+            return {
+                updateOne: {
+                    filter: { routerId, sessionId },
+                    update: {
+                        $set: {
+                            hotspotUserId: usersByUsername.get(record.user)?._id || null,
+                            username: record.user || '',
+                            ip,
+                            mac: record['mac-address'] || '',
+                            uplinkBytes,
+                            downlinkBytes,
+                            currentUplinkBps,
+                            currentDownlinkBps,
+                            uptimeSeconds: parseDurationToSeconds(record.uptime),
+                            sessionTimeLeftSeconds: parseDurationToSeconds(record['session-time-left']),
+                            idleTimeoutSeconds: parseDurationToSeconds(record['idle-timeout']),
+                            keepaliveTimeoutSeconds: parseDurationToSeconds(record['keepalive-timeout']),
+                            server: record.server || record['server'] || 'default',
+                            hostName,
+                            deviceLabel,
+                            profile: record.profile || usersByUsername.get(record.user)?.profile || 'default',
+                            isActive: true,
+                            endedAt: null
+                        },
+                        $setOnInsert: {
+                            startedAt: toDateOrNull(record['login-time']) || new Date(Date.now() - (parseDurationToSeconds(record.uptime) * 1000))
+                        }
                     },
-                    $setOnInsert: {
-                        startedAt: toDateOrNull(record['login-time']) || new Date()
-                    }
-                },
-                upsert: true
-            }
-        }));
+                    upsert: true
+                }
+            };
+        });
 
         await HotspotSession.bulkWrite(operations, { ordered: false });
     }
@@ -204,12 +276,13 @@ async function syncActiveSessions(routerId, activeSessions) {
 
 async function listHotspotUsers(routerId, page = 1, limit = 50, search = '') {
     await ensureRouterExists(routerId);
-    const [routerUsers, activeSessionRecords] = await Promise.all([
+    const [routerUsers, activeSessionRecords, dhcpLeases] = await Promise.all([
         executeCommand(routerId, '/ip/hotspot/user/print', {}, { operationName: 'get_system_resource' }),
-        executeCommand(routerId, '/ip/hotspot/active/print', {}, { operationName: 'get_system_resource' }).catch(() => [])
+        executeCommand(routerId, '/ip/hotspot/active/print', {}, { operationName: 'get_system_resource' }).catch(() => []),
+        fetchDhcpLeases(routerId)
     ]);
     await syncHotspotUsers(routerId, routerUsers);
-    await syncActiveSessions(routerId, activeSessionRecords);
+    await syncActiveSessions(routerId, activeSessionRecords, dhcpLeases);
 
     const activeSessions = await HotspotSession.find({ routerId, isActive: true }).select('username');
     const activeUsernames = new Set(activeSessions.map((session) => session.username).filter(Boolean));
@@ -380,8 +453,11 @@ async function deleteHotspotUser(routerId, routerosId, userId) {
 
 async function listActiveSessions(routerId) {
     await ensureRouterExists(routerId);
-    const records = await executeCommand(routerId, '/ip/hotspot/active/print', {}, { operationName: 'get_system_resource' });
-    await syncActiveSessions(routerId, records);
+    const [records, dhcpLeases] = await Promise.all([
+        executeCommand(routerId, '/ip/hotspot/active/print', {}, { operationName: 'get_system_resource' }),
+        fetchDhcpLeases(routerId)
+    ]);
+    await syncActiveSessions(routerId, records, dhcpLeases);
     const sessions = await HotspotSession.find({ routerId, isActive: true }).sort({ createdAt: -1 });
     return sessions.map(serializeHotspotSession);
 }

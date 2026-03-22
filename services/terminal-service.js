@@ -7,7 +7,7 @@ function safeSend(ws, payload) {
 }
 
 function startSshSession(ws, routerId, credentials) {
-    const { host, username = 'admin', password = '' } = credentials || {};
+    const { host, port = 22, username = 'admin', password = '' } = credentials || {};
     const client = new Client();
 
     client.on('ready', () => {
@@ -62,13 +62,13 @@ function startSshSession(ws, routerId, credentials) {
     });
 
     client.on('error', (error) => {
-        log('warn', 'router_terminal_error', { routerId, host, error: error.message });
+        log('warn', 'router_terminal_error', { routerId, host, port, error: error.message });
         safeSend(ws, { type: 'error', message: error.message || 'SSH connection failed' });
     });
 
     client.connect({
         host,
-        port: 22,
+        port,
         username,
         password,
         readyTimeout: 5000

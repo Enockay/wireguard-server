@@ -31,6 +31,50 @@ const hotspotSessionSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
+    currentUplinkBps: {
+        type: Number,
+        default: 0
+    },
+    currentDownlinkBps: {
+        type: Number,
+        default: 0
+    },
+    uptimeSeconds: {
+        type: Number,
+        default: 0
+    },
+    sessionTimeLeftSeconds: {
+        type: Number,
+        default: 0
+    },
+    idleTimeoutSeconds: {
+        type: Number,
+        default: 0
+    },
+    keepaliveTimeoutSeconds: {
+        type: Number,
+        default: 0
+    },
+    server: {
+        type: String,
+        trim: true,
+        default: ''
+    },
+    hostName: {
+        type: String,
+        trim: true,
+        default: ''
+    },
+    deviceLabel: {
+        type: String,
+        trim: true,
+        default: ''
+    },
+    profile: {
+        type: String,
+        trim: true,
+        default: ''
+    },
     sessionId: {
         type: String,
         trim: true

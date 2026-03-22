@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const { log } = require('../wg-core');
 const MikrotikRouter = require('../models/MikrotikRouter');
 const { stripCidrSuffix } = require('./routeros-command-service');
+const { getResolvedCredential } = require('./router-credential-service');
 const { startSshSession } = require('./terminal-service');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
@@ -55,6 +56,42 @@ function safeSend(ws, payload) {
     ws.send(JSON.stringify(payload));
 }
 
+function getEndpointHealthRank(endpoint) {
+    const rank = {
+        healthy: 0,
+        degraded: 1,
+        unknown: 2,
+        stale: 3,
+        unreachable: 4
+    };
+    return rank[endpoint?.health] ?? 9;
+}
+
+function resolveTerminalSshEndpoint(router) {
+    const endpoints = Array.isArray(router?.managementEndpoints) ? router.managementEndpoints : [];
+    const preferredSshEndpoint = [...endpoints]
+        .filter((endpoint) => endpoint?.enabled !== false && endpoint?.transport === 'ssh' && endpoint?.host)
+        .sort((a, b) => {
+            const healthDiff = getEndpointHealthRank(a) - getEndpointHealthRank(b);
+            if (healthDiff !== 0) return healthDiff;
+            return (a.priority || 999) - (b.priority || 999);
+        })[0];
+
+    if (preferredSshEndpoint) {
+        return {
+            host: preferredSshEndpoint.host,
+            port: preferredSshEndpoint.port || 22
+        };
+    }
+
+    const localHost = stripCidrSuffix(router?.discoveryInfo?.localAddress);
+    const vpnHost = stripCidrSuffix(router?.vpnIp);
+    const host = (router?.status !== 'active' && localHost) || vpnHost || localHost || '';
+    const port = router?.ports?.ssh || 22;
+
+    return host ? { host, port } : null;
+}
+
 function createWebSocketServer(httpServer) {
     if (webSocketServer) {
         return webSocketServer;
@@ -86,17 +123,32 @@ function createWebSocketServer(httpServer) {
             }
 
             MikrotikRouter.findById(routerId)
-                .select('_id vpnIp apiUsername apiPassword')
-                .then((router) => {
-                    const host = stripCidrSuffix(router?.vpnIp);
-                    if (!router || !host) {
+                .select('_id vpnIp apiUsername apiPassword credentialState discoveryInfo.localAddress managementEndpoints ports.ssh status')
+                .then(async (router) => {
+                    if (!router) {
                         ws.close(4004, 'Router not found');
                         return;
                     }
+
+                    const credential = await getResolvedCredential(router);
+                    if (!credential) {
+                        safeSend(ws, { type: 'error', message: 'No router credentials configured' });
+                        ws.close(1011, 'Terminal setup failed');
+                        return;
+                    }
+
+                    const sshEndpoint = resolveTerminalSshEndpoint(router);
+                    if (!sshEndpoint?.host) {
+                        safeSend(ws, { type: 'error', message: 'No reachable SSH endpoint configured for this router' });
+                        ws.close(1011, 'Terminal setup failed');
+                        return;
+                    }
+
                     startSshSession(ws, routerId, {
-                        host,
-                        username: router.apiUsername || 'admin',
-                        password: router.apiPassword || ''
+                        host: sshEndpoint.host,
+                        port: sshEndpoint.port,
+                        username: credential.username || 'admin',
+                        password: credential.password || ''
                     });
                 })
                 .catch((error) => {

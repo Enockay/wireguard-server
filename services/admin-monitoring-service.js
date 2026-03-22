@@ -178,6 +178,43 @@ function buildRouterOperationalState(router) {
     };
 }
 
+function stripCidr(value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) return '';
+    return normalized.split('/')[0].trim();
+}
+
+function buildRouterClientFallbackMaps(routers = [], clients = []) {
+    const clientById = new Map();
+    const clientByVpnIp = new Map();
+
+    for (const client of clients) {
+        if (!client) continue;
+        const id = client._id ? String(client._id) : '';
+        if (id) clientById.set(id, client);
+
+        const ip = stripCidr(client.ip);
+        if (ip && !clientByVpnIp.has(ip)) {
+            clientByVpnIp.set(ip, client);
+        }
+    }
+
+    const clientByRouterId = new Map();
+    for (const router of routers) {
+        if (!router) continue;
+        const explicitClient = router.wireguardClientId && typeof router.wireguardClientId === 'object'
+            ? router.wireguardClientId
+            : clientById.get(String(router.wireguardClientId || ''));
+
+        const fallbackClient = explicitClient || clientByVpnIp.get(stripCidr(router.vpnIp));
+        if (fallbackClient?._id) {
+            clientByRouterId.set(String(router._id), fallbackClient);
+        }
+    }
+
+    return clientByRouterId;
+}
+
 function normalizeIncidentNote(note) {
     return {
         id: String(note._id),
@@ -235,7 +272,7 @@ function normalizeIncident(incident) {
 
 async function loadMonitoringDataset() {
     await ensureLocalVpnServer();
-    const [routers, users, tickets, subscriptions, serversResult] = await Promise.all([
+    const [routers, users, tickets, subscriptions, serversResult, clients] = await Promise.all([
         MikrotikRouter.find({})
             .populate('userId', 'name email isActive emailVerified')
             .populate('wireguardClientId')
@@ -244,10 +281,17 @@ async function loadMonitoringDataset() {
         User.find({}, 'name email isActive emailVerified').lean(),
         SupportTicket.find({}).lean(),
         Subscription.find({}).lean(),
-        listAdminVpnServers({ page: 1, limit: 1000 })
+        listAdminVpnServers({ page: 1, limit: 1000 }),
+        Client.find({}).lean()
     ]);
 
-    const routerStates = routers.map(buildRouterOperationalState);
+    const clientByRouterId = buildRouterClientFallbackMaps(routers, clients);
+    const hydratedRouters = routers.map((router) => ({
+        ...router,
+        wireguardClientId: router.wireguardClientId || clientByRouterId.get(String(router._id)) || null
+    }));
+
+    const routerStates = hydratedRouters.map(buildRouterOperationalState);
     const openTickets = tickets.filter((ticket) => ['open', 'in_progress'].includes(ticket.status));
     const subscriptionByRouterId = new Map(subscriptions.map((item) => [String(item.routerId), item]));
     const serverItems = serversResult.items || [];
@@ -267,9 +311,10 @@ async function loadMonitoringDataset() {
     }
 
     return {
-        routers,
+        routers: hydratedRouters,
         routerStates,
         users,
+        clients,
         usersById,
         tickets,
         openTickets,

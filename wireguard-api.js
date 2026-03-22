@@ -14,6 +14,7 @@ const {
     STATS_UPDATE_INTERVAL,
     CLEANUP_INTERVAL,
     RECONCILE_INTERVAL,
+    WIREGUARD_INTERFACE,
     isValidWgKey,
     isValidCidr,
     runWgCommand,
@@ -216,7 +217,7 @@ async function updateClientStatistics() {
     
     try {
         // Single wg dump via execFile (Phase 4.3)
-        const wgDump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
+        const wgDump = await wgLock.run(() => runWgCommand(['show', WIREGUARD_INTERFACE, 'dump']));
         const lines = wgDump.trim().split('\n').filter(l => l.trim());
 
         // Build a map of publicKey -> stats from wg dump
@@ -225,10 +226,11 @@ async function updateClientStatistics() {
             const parts = line.split('\t');
             if (parts.length < 7) continue;
             peerStats.set(parts[0].trim(), {
-                endpoint: parts[1],
-                lastHandshake: parts[3],
-                transferRx: parts[4],
-                transferTx: parts[5]
+                endpoint: parts[2],
+                allowedIps: parts[3],
+                lastHandshake: parts[4],
+                transferRx: parts[5],
+                transferTx: parts[6]
             });
         }
 

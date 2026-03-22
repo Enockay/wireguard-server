@@ -4,7 +4,7 @@ const VpnServer = require('../models/VpnServer');
 const Client = require('../models/Client');
 const MikrotikRouter = require('../models/MikrotikRouter');
 const { loadClientsFromDatabase } = require('../utils/route-helpers');
-const { wgLock, runWgCommand, getServerPublicKey, getServerEndpoint, log } = require('../wg-core');
+const { wgLock, runWgCommand, getServerPublicKey, getServerEndpoint, log, WIREGUARD_INTERFACE } = require('../wg-core');
 
 const execFileAsync = promisify(execFile);
 const LOCAL_NODE_ID = 'wireguard';
@@ -67,7 +67,7 @@ async function getLocalRuntimeMetrics() {
     let error = null;
 
     try {
-        const dump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
+        const dump = await wgLock.run(() => runWgCommand(['show', WIREGUARD_INTERFACE, 'dump']));
         peers = parseWgDump(dump);
         interfaceUp = true;
     } catch (runtimeError) {
@@ -123,12 +123,12 @@ async function syncLocalServerHealth(server) {
 
 async function restartLocalWireGuard() {
     try {
-        await execFileAsync('wg-quick', ['down', 'wg0']);
+        await execFileAsync('wg-quick', ['down', WIREGUARD_INTERFACE]);
     } catch (error) {
         log('warn', 'wg_quick_down_failed', { error: error.message });
     }
 
-    await execFileAsync('wg-quick', ['up', 'wg0']);
+    await execFileAsync('wg-quick', ['up', WIREGUARD_INTERFACE]);
     await loadClientsFromDatabase(true);
 }
 

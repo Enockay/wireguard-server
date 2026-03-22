@@ -24,9 +24,9 @@ async function listDhcpLeases(routerId) {
         routerosId: record['.id'] || '',
         address: record.address || '',
         macAddress: record['mac-address'] || '',
-        hostname: record.host-name || '',
+        hostname: record['host-name'] || '',
         status: record.status || '',
-        expiresAt: record.expires-after || record['expires-after'] || null,
+        expiresAt: record['expires-after'] || null,
         activeAddress: record['active-address'] || '',
         clientId: record['client-id'] || ''
     }));
