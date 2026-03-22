@@ -36,6 +36,11 @@ const {
     applyGracePeriod,
     removeGracePeriod
 } = require('../services/admin-billing-service');
+const {
+    checkAndEnforceSubscriptions,
+    enforceSubscriptionSuspension,
+    handlePaymentConfirmed
+} = require('../services/billing-enforcement-service');
 
 function normalizeReason(value) {
     return value ? String(value).trim() : '';
@@ -82,6 +87,16 @@ async function audit(req, targetUserId, action, reason, metadata = {}) {
 }
 
 function registerAdminBillingRoutes(app) {
+    app.post('/api/admin/billing/enforce', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const report = await checkAndEnforceSubscriptions();
+            await audit(req, null, 'admin_billing_enforce', normalizeReason(req.body?.reason), report);
+            return res.json({ success: true, message: 'Billing enforcement completed', report });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to run billing enforcement', details: error.message });
+        }
+    });
+
     app.get('/api/admin/billing/overview', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.VIEW_OVERVIEW), async (req, res) => {
         try {
             const overview = await getBillingOverview();
@@ -624,6 +639,58 @@ function registerAdminBillingRoutes(app) {
             return res.json({ success: true, message: 'Account reactivated after billing resolution', billingReactivatedAt: updated.billingReactivatedAt });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to reactivate account', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/billing/subscriptions/:id/suspend', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const subscription = await Subscription.findById(req.params.id);
+            if (!subscription) {
+                return res.status(404).json({ success: false, error: 'Subscription not found' });
+            }
+            const updated = await enforceSubscriptionSuspension(subscription, {
+                reason: normalizeReason(req.body?.reason) || 'Manually suspended by admin'
+            });
+            await audit(req, updated.userId, 'admin_suspend_subscription', normalizeReason(req.body?.reason), {
+                subscriptionId: updated._id
+            });
+            return res.json({
+                success: true,
+                message: 'Subscription suspended',
+                subscriptionId: String(updated._id),
+                status: updated.status
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to suspend subscription', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/billing/subscriptions/:id/reactivate', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const subscription = await Subscription.findById(req.params.id);
+            if (!subscription) {
+                return res.status(404).json({ success: false, error: 'Subscription not found' });
+            }
+            const amount = normalizeAmount(req.body?.amount) || subscription.pricePerMonth || 0;
+            const updated = await handlePaymentConfirmed(
+                subscription._id,
+                amount,
+                req.body?.paymentMethod || 'manual',
+                normalizeReason(req.body?.reference) || `manual-reactivation-${subscription._id}`,
+                { source: 'admin_manual_reactivate' }
+            );
+            await audit(req, updated.userId, 'admin_reactivate_subscription', normalizeReason(req.body?.reason), {
+                subscriptionId: updated._id,
+                amount
+            });
+            return res.json({
+                success: true,
+                message: 'Subscription reactivated',
+                subscriptionId: String(updated._id),
+                status: updated.status
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to reactivate subscription', details: error.message });
         }
     });
 

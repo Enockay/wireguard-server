@@ -4,12 +4,14 @@ const crypto = require('crypto');
 const { log } = require('../wg-core');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email-service');
 const UserSession = require('../models/UserSession');
-const { recordSecurityEvent, createUserSession, touchSession, getRequestIp, getRequestUserAgent } = require('../services/security-event-service');
+const { recordSecurityEvent, createUserSession, touchSession, revokeSession, getRequestIp, getRequestUserAgent } = require('../services/security-event-service');
 const { verifyTotpCode } = require('../utils/totp');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
 const TWO_FACTOR_CHALLENGE_EXPIRY = '10m';
+const AUTH_COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'mikrotik_admin_session';
+const REMEMBER_DEVICE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
 
 function buildSessionUser(user) {
     return {
@@ -27,18 +29,75 @@ function createSessionToken({ user, sessionId }) {
     );
 }
 
-function createTwoFactorChallengeToken({ user, req }) {
+function createTwoFactorChallengeToken({ user, req, rememberDevice = false }) {
     return jwt.sign(
         {
             userId: user._id,
             email: user.email,
             purpose: '2fa_login',
+            rememberDevice: Boolean(rememberDevice),
             ipAddress: getRequestIp(req),
             userAgent: getRequestUserAgent(req),
         },
         JWT_SECRET,
         { expiresIn: TWO_FACTOR_CHALLENGE_EXPIRY }
     );
+}
+
+function parseCookies(cookieHeader = '') {
+    return String(cookieHeader || '')
+        .split(';')
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .reduce((cookies, part) => {
+            const separatorIndex = part.indexOf('=');
+            if (separatorIndex === -1) return cookies;
+            const key = part.slice(0, separatorIndex).trim();
+            const value = part.slice(separatorIndex + 1).trim();
+            if (key) {
+                cookies[key] = decodeURIComponent(value);
+            }
+            return cookies;
+        }, {});
+}
+
+function getTokenExpiry(token) {
+    const decoded = jwt.decode(token);
+    if (!decoded || typeof decoded !== 'object' || !decoded.exp) {
+        return null;
+    }
+
+    return new Date(decoded.exp * 1000).toISOString();
+}
+
+function setAuthCookie(res, token, rememberDevice = false) {
+    res.cookie(AUTH_COOKIE_NAME, token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        path: '/',
+        ...(rememberDevice ? { maxAge: REMEMBER_DEVICE_MAX_AGE_MS } : {})
+    });
+}
+
+function clearAuthCookie(res) {
+    res.clearCookie(AUTH_COOKIE_NAME, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        path: '/'
+    });
+}
+
+function resolveAuthToken(req) {
+    const authHeader = req.headers['authorization'];
+    const bearerToken = authHeader && authHeader.split(' ')[1];
+    if (bearerToken) {
+        return bearerToken;
+    }
+
+    const cookies = parseCookies(req.headers.cookie || '');
+    return cookies[AUTH_COOKIE_NAME] || null;
 }
 
 function registerAuthRoutes(app) {
@@ -286,7 +345,7 @@ function registerAuthRoutes(app) {
     // User login
     app.post('/api/auth/login', async (req, res) => {
         try {
-            const { email, password } = req.body;
+            const { email, password, rememberDevice = false } = req.body;
 
             if (!email || !password) {
                 return res.status(400).json({
@@ -378,7 +437,7 @@ function registerAuthRoutes(app) {
                     message: 'Two-factor authentication required',
                     data: {
                         requiresTwoFactor: true,
-                        challengeToken: createTwoFactorChallengeToken({ user, req }),
+                        challengeToken: createTwoFactorChallengeToken({ user, req, rememberDevice }),
                         user: buildSessionUser(user),
                     }
                 });
@@ -402,13 +461,14 @@ function registerAuthRoutes(app) {
             });
 
             const token = createSessionToken({ user, sessionId: session.sessionId });
+            setAuthCookie(res, token, rememberDevice);
 
             res.json({
                 success: true,
                 message: 'Login successful',
                 data: {
                     user: buildSessionUser(user),
-                    token
+                    sessionExpiresAt: getTokenExpiry(token)
                 }
             });
         } catch (error) {
@@ -449,6 +509,7 @@ function registerAuthRoutes(app) {
                 });
             }
 
+            const rememberDevice = Boolean(challenge.rememberDevice);
             const user = await User.findById(challenge.userId).select('+twoFactorSecret');
             if (!user) {
                 return res.status(404).json({
@@ -519,12 +580,15 @@ function registerAuthRoutes(app) {
                 metadata: { twoFactorVerified: true }
             });
 
+            const token = createSessionToken({ user, sessionId: session.sessionId });
+            setAuthCookie(res, token, rememberDevice);
+
             res.json({
                 success: true,
                 message: 'Two-factor login successful',
                 data: {
                     user: buildSessionUser(user),
-                    token: createSessionToken({ user, sessionId: session.sessionId }),
+                    sessionExpiresAt: getTokenExpiry(token),
                 }
             });
         } catch (error) {
@@ -570,13 +634,36 @@ function registerAuthRoutes(app) {
 
             res.json({
                 success: true,
-                user: userData
+                user: userData,
+                sessionExpiresAt: req.user.exp ? new Date(req.user.exp * 1000).toISOString() : null,
             });
         } catch (error) {
             log('error', 'get_user_error', { error: error.message, stack: error.stack });
             res.status(500).json({
                 success: false,
                 error: 'Failed to get user',
+                details: error.message
+            });
+        }
+    });
+
+    app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+        try {
+            if (req.user?.sid) {
+                await revokeSession(req.user.sid, req.user.email || 'system', 'User logged out', req.user.userId || null);
+            }
+
+            clearAuthCookie(res);
+
+            return res.json({
+                success: true,
+                message: 'Logged out successfully'
+            });
+        } catch (error) {
+            log('error', 'logout_error', { error: error.message });
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to logout',
                 details: error.message
             });
         }
@@ -706,8 +793,7 @@ function registerAuthRoutes(app) {
 
 // Middleware to verify JWT token
 function authenticateToken(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+    const token = resolveAuthToken(req);
 
     if (!token) {
         return res.status(401).json({

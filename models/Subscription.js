@@ -16,7 +16,7 @@ const subscriptionSchema = new mongoose.Schema({
     },
     status: {
         type: String,
-        enum: ['trial', 'active', 'past_due', 'canceled', 'expired'],
+        enum: ['trial', 'active', 'past_due', 'suspended', 'canceled', 'expired'],
         default: 'trial',
         index: true
     },
@@ -62,6 +62,11 @@ const subscriptionSchema = new mongoose.Schema({
         default: null,
         index: true
     },
+    subscriberIp: {
+        type: String,
+        trim: true,
+        default: ''
+    },
     queueName: {
         type: String,
         trim: true,
@@ -79,7 +84,7 @@ subscriptionSchema.index({ nextBillingDate: 1 });
 
 // Check if subscription is active
 subscriptionSchema.methods.isActive = function() {
-    if (this.status === 'canceled' || this.status === 'expired') {
+    if (['canceled', 'expired', 'suspended'].includes(this.status)) {
         return false;
     }
     return new Date() < this.currentPeriodEnd;

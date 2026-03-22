@@ -351,6 +351,7 @@ async function updateRouterStatus(routerId, isOnline, routerboardInfo = null) {
     try {
         const router = await MikrotikRouter.findById(routerId).populate('userId');
         if (!router) return;
+        const { notifyRouterOffline } = require('../services/notification-service');
 
         const wasOffline = router.status !== 'active';
         const now = new Date();
@@ -437,6 +438,14 @@ async function updateRouterStatus(routerId, isOnline, routerboardInfo = null) {
             // Keep routerboard info but mark last checked
             if (router.routerboardInfo) {
                 router.routerboardInfo.lastChecked = now;
+            }
+            if (!wasOffline && router.userId) {
+                await notifyRouterOffline(router.userId, router).catch((error) => {
+                    log('warn', 'router_offline_notification_failed', {
+                        routerId,
+                        error: error.message
+                    });
+                });
             }
         }
 

@@ -1,8 +1,12 @@
 const { WebSocketServer } = require('ws');
 const jwt = require('jsonwebtoken');
 const { log } = require('../wg-core');
+const MikrotikRouter = require('../models/MikrotikRouter');
+const { stripCidrSuffix } = require('./routeros-command-service');
+const { startSshSession } = require('./terminal-service');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const AUTH_COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'mikrotik_admin_session';
 const connections = new Map();
 let webSocketServer = null;
 
@@ -12,6 +16,37 @@ function parseTokenFromUrl(url = '') {
         return parsed.searchParams.get('token');
     } catch (error) {
         return null;
+    }
+}
+
+function parseCookies(cookieHeader = '') {
+    return String(cookieHeader || '')
+        .split(';')
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .reduce((cookies, part) => {
+            const separatorIndex = part.indexOf('=');
+            if (separatorIndex === -1) return cookies;
+            const key = part.slice(0, separatorIndex).trim();
+            const value = part.slice(separatorIndex + 1).trim();
+            if (key) {
+                cookies[key] = decodeURIComponent(value);
+            }
+            return cookies;
+        }, {});
+}
+
+function resolveWebSocketToken(req) {
+    const cookies = parseCookies(req.headers.cookie || '');
+    return cookies[AUTH_COOKIE_NAME] || parseTokenFromUrl(req.url || '');
+}
+
+function resolveUrlPath(url = '') {
+    try {
+        const parsed = new URL(url, 'http://localhost');
+        return parsed.pathname || '/';
+    } catch (error) {
+        return '/';
     }
 }
 
@@ -25,10 +60,11 @@ function createWebSocketServer(httpServer) {
         return webSocketServer;
     }
 
-    webSocketServer = new WebSocketServer({ server: httpServer, path: '/ws' });
+    webSocketServer = new WebSocketServer({ server: httpServer });
 
     webSocketServer.on('connection', (ws, req) => {
-        const token = parseTokenFromUrl(req.url || '');
+        const path = resolveUrlPath(req.url || '');
+        const token = resolveWebSocketToken(req);
         if (!token) {
             ws.close(4001, 'Authentication required');
             return;
@@ -39,6 +75,39 @@ function createWebSocketServer(httpServer) {
             decoded = jwt.verify(token, JWT_SECRET);
         } catch (error) {
             ws.close(4001, 'Invalid token');
+            return;
+        }
+
+        if (path.startsWith('/ws/terminal/')) {
+            const routerId = path.split('/').filter(Boolean).pop();
+            if (!routerId) {
+                ws.close(4004, 'Router not found');
+                return;
+            }
+
+            MikrotikRouter.findById(routerId)
+                .select('_id vpnIp apiUsername apiPassword')
+                .then((router) => {
+                    const host = stripCidrSuffix(router?.vpnIp);
+                    if (!router || !host) {
+                        ws.close(4004, 'Router not found');
+                        return;
+                    }
+                    startSshSession(ws, routerId, {
+                        host,
+                        username: router.apiUsername || 'admin',
+                        password: router.apiPassword || ''
+                    });
+                })
+                .catch((error) => {
+                    safeSend(ws, { type: 'error', message: error.message || 'Failed to start terminal session' });
+                    ws.close(1011, 'Terminal setup failed');
+                });
+            return;
+        }
+
+        if (path !== '/ws') {
+            ws.close(4004, 'Unknown websocket path');
             return;
         }
 
@@ -82,7 +151,7 @@ function createWebSocketServer(httpServer) {
         });
     });
 
-    log('info', 'websocket_server_started', { path: '/ws' });
+    log('info', 'websocket_server_started', { paths: ['/ws', '/ws/terminal/:routerId'] });
     return webSocketServer;
 }
 

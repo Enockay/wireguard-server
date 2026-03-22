@@ -61,7 +61,14 @@ async function fetchRouterQueue(routerId, name) {
 }
 
 async function syncQueues(routerId, records) {
-    if (!records.length) return;
+    const activeRouterosIds = records
+        .map((record) => String(record['.id'] || '').trim())
+        .filter(Boolean);
+
+    if (!records.length) {
+        await RouterQueue.updateMany({ routerId, isActive: true }, { $set: { isActive: false } });
+        return;
+    }
 
     const operations = records.map((record) => {
         const parsed = parseMaxLimit(record['max-limit']);
@@ -92,6 +99,10 @@ async function syncQueues(routerId, records) {
     });
 
     await RouterQueue.bulkWrite(operations, { ordered: false });
+    await RouterQueue.updateMany(
+        { routerId, routerosId: { $nin: activeRouterosIds } },
+        { $set: { isActive: false } }
+    );
 }
 
 async function listQueues(routerId, page = 1, limit = 50) {
@@ -199,6 +210,8 @@ async function updateQueue(routerId, routerosId, updates) {
                 ...(updates.comment != null ? { comment: updates.comment || '' } : {}),
                 maxDownloadKbps: nextDownload,
                 maxUploadKbps: nextUpload,
+                ...(updates.linkedSubscriptionId !== undefined ? { linkedSubscriptionId: updates.linkedSubscriptionId || null } : {}),
+                ...(updates.linkedServicePlanId !== undefined ? { linkedServicePlanId: updates.linkedServicePlanId || null } : {}),
                 queueType: nextType,
                 pcqDownloadProfile: nextPcqDownload || '',
                 pcqUploadProfile: nextPcqUpload || ''
@@ -235,14 +248,24 @@ async function applyPlanToSubscriber(routerId, subscriberIp, servicePlanOrId, su
 
     const existing = await RouterQueue.findOne({ routerId, target: subscriberIp, isActive: true }).sort({ createdAt: -1 });
     if (existing?.routerosId) {
-        return updateQueue(routerId, existing.routerosId, {
+        const updatedQueue = await updateQueue(routerId, existing.routerosId, {
             maxDownloadKbps: servicePlan.speedDownloadKbps || 0,
             maxUploadKbps: servicePlan.speedUploadKbps || 0,
             comment: existing.comment || `Applied from service plan ${servicePlan.name}`,
+            linkedSubscriptionId: subscriptionId || existing.linkedSubscriptionId || null,
+            linkedServicePlanId: servicePlan._id || servicePlan.id || null,
         });
+        if (subscriptionId) {
+            await Subscription.findByIdAndUpdate(subscriptionId, {
+                servicePlanId: servicePlan._id || servicePlan.id || null,
+                subscriberIp,
+                queueName: updatedQueue.name
+            }).catch(() => undefined);
+        }
+        return updatedQueue;
     }
 
-    return createQueue(routerId, {
+    const createdQueue = await createQueue(routerId, {
         name: `sub-${subscriptionId || subscriberIp.replace(/[^\w-]/g, '-')}`,
         target: subscriberIp,
         maxDownloadKbps: servicePlan.speedDownloadKbps || 0,
@@ -251,6 +274,14 @@ async function applyPlanToSubscriber(routerId, subscriberIp, servicePlanOrId, su
         linkedSubscriptionId: subscriptionId || null,
         linkedServicePlanId: servicePlan._id || servicePlan.id || null
     });
+    if (subscriptionId) {
+        await Subscription.findByIdAndUpdate(subscriptionId, {
+            servicePlanId: servicePlan._id || servicePlan.id || null,
+            subscriberIp,
+            queueName: createdQueue.name
+        }).catch(() => undefined);
+    }
+    return createdQueue;
 }
 
 async function removePlanFromSubscriber(routerId, subscriberIp) {

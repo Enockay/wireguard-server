@@ -48,9 +48,18 @@ const registerAdminServicePlanRoutes = require("./routes/admin-service-plans");
 const registerHotspotRoutes = require("./routes/hotspot");
 const registerPppoeRoutes = require("./routes/pppoe");
 const registerQueueRoutes = require("./routes/queues");
+const registerFirewallRoutes = require("./routes/firewall");
+const registerNetworkConfigRoutes = require("./routes/network-config");
+const registerPaymentRoutes = require("./routes/payments");
+const registerBackupRoutes = require("./routes/backup");
 const { requestLogger } = require("./middleware/request-logger");
 const { runTelemetryPolling } = require("./services/telemetry-service");
 const { createWebSocketServer, broadcastRouterMetric, broadcastRouterStatus } = require("./services/websocket-service");
+const { checkAndEnforceSubscriptions } = require("./services/billing-enforcement-service");
+const Subscription = require("./models/Subscription");
+const User = require("./models/User");
+const MikrotikRouter = require("./models/MikrotikRouter");
+const { notifySubscriptionExpiring } = require("./services/notification-service");
 
 // Allow running API without a WireGuard interface present (e.g. local dev).
 // When disabled, we skip wg0 readiness checks and wg-dependent background jobs.
@@ -146,6 +155,10 @@ registerAdminServicePlanRoutes(app); // Admin settings and service plan manageme
 registerHotspotRoutes(app); // Admin hotspot management
 registerPppoeRoutes(app); // Admin PPPoE management
 registerQueueRoutes(app); // Admin queue management
+registerFirewallRoutes(app); // Admin firewall management
+registerNetworkConfigRoutes(app); // Admin network configuration management
+registerPaymentRoutes(app); // Payment gateway integrations
+registerBackupRoutes(app); // Router config backups
 (async () => {
     try {
         await db.connect();
@@ -170,6 +183,8 @@ registerQueueRoutes(app); // Admin queue management
 
         // Start billing processing job (runs daily)
         startBillingJob();
+        startBillingEnforcementJob();
+        startExpiryReminderJob();
 
         // Start telemetry polling once the database is ready.
         startTelemetryPollingJob();
@@ -432,6 +447,71 @@ function startBillingJob() {
     setInterval(processBilling, 24 * 60 * 60 * 1000); // 24 hours
 
     log('info', 'billing_job_scheduled', { interval: '24 hours' });
+}
+
+function startBillingEnforcementJob() {
+    const runEnforcement = async () => {
+        try {
+            if (!dbInitialized) return;
+            await checkAndEnforceSubscriptions();
+        } catch (error) {
+            log('error', 'billing_enforcement_job_error', { error: error.message });
+        }
+    };
+
+    setTimeout(() => {
+        void runEnforcement();
+    }, 30 * 1000);
+    setInterval(runEnforcement, 6 * 60 * 60 * 1000);
+
+    log('info', 'billing_enforcement_job_started', { interval: '6 hours' });
+}
+
+function startExpiryReminderJob() {
+    const runReminderSweep = async () => {
+        try {
+            if (!dbInitialized) return;
+
+            const now = new Date();
+            const dayWindows = [3, 1];
+
+            for (const daysLeft of dayWindows) {
+                const start = new Date(now);
+                start.setHours(0, 0, 0, 0);
+                start.setDate(start.getDate() + daysLeft);
+                const end = new Date(start);
+                end.setDate(end.getDate() + 1);
+
+                const subscriptions = await Subscription.find({
+                    status: { $in: ['active', 'trial'] },
+                    currentPeriodEnd: { $gte: start, $lt: end }
+                }).select('_id userId routerId');
+
+                for (const subscription of subscriptions) {
+                    const [user, router] = await Promise.all([
+                        User.findById(subscription.userId).select('_id name email phone currency'),
+                        MikrotikRouter.findById(subscription.routerId).select('_id name vpnIp')
+                    ]);
+                    if (!user || !router) {
+                        continue;
+                    }
+                    await notifySubscriptionExpiring(user, router, daysLeft).catch((error) => {
+                        log('warn', 'subscription_expiry_notification_failed', {
+                            subscriptionId: subscription._id,
+                            daysLeft,
+                            error: error.message
+                        });
+                    });
+                }
+            }
+        } catch (error) {
+            log('error', 'expiry_reminder_job_error', { error: error.message });
+        }
+    };
+
+    void runReminderSweep();
+    setInterval(runReminderSweep, 24 * 60 * 60 * 1000);
+    log('info', 'expiry_reminder_job_started', { interval: '24 hours' });
 }
 
 function startTelemetryPollingJob() {

@@ -582,6 +582,122 @@ Open Billing: ${paymentUrl}
     });
 }
 
+async function sendSubscriptionSuspendedEmail(user, payload = {}) {
+    const billingUrl = `${FRONTEND_URL}${payload.paymentUrl || '/billing'}`;
+    const htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #c0392b; color: white; padding: 20px; text-align: center; }
+                .content { padding: 20px; background-color: #f9f9f9; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #c0392b; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+                .info-box { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #c0392b; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Subscription Suspended</h1>
+                </div>
+                <div class="content">
+                    <p>Hello ${user.name},</p>
+                    <p>Your subscription has been suspended because payment could not be confirmed in time.</p>
+                    <div class="info-box">
+                        <p><strong>Subscription:</strong> ${payload.subscriptionId || 'Active subscription'}</p>
+                        <p><strong>Reason:</strong> ${payload.reason || 'Outstanding payment'}</p>
+                        <p><strong>Reference date:</strong> ${payload.nextBillingDate ? new Date(payload.nextBillingDate).toISOString() : 'Immediate action required'}</p>
+                    </div>
+                    <a href="${billingUrl}" class="button">Resolve Billing</a>
+                </div>
+            </div>
+        </body>
+        </html>
+    `;
+
+    const textContent = `
+Subscription Suspended
+
+Hello ${user.name},
+
+Your subscription has been suspended because payment could not be confirmed in time.
+
+Subscription: ${payload.subscriptionId || 'Active subscription'}
+Reason: ${payload.reason || 'Outstanding payment'}
+Reference date: ${payload.nextBillingDate ? new Date(payload.nextBillingDate).toISOString() : 'Immediate action required'}
+
+Resolve billing: ${billingUrl}
+    `;
+
+    return sendEmail({
+        to: user.email,
+        subject: 'Subscription Suspended - Blackie Networks',
+        htmlContent,
+        textContent
+    });
+}
+
+async function sendPaymentConfirmedEmail(user, payload = {}) {
+    const billingUrl = `${FRONTEND_URL}/billing`;
+    const htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #1f8b4c; color: white; padding: 20px; text-align: center; }
+                .content { padding: 20px; background-color: #f9f9f9; }
+                .button { display: inline-block; padding: 12px 24px; background-color: #1f8b4c; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+                .info-box { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #1f8b4c; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Payment Confirmed</h1>
+                </div>
+                <div class="content">
+                    <p>Hello ${user.name},</p>
+                    <p>We have confirmed your payment and your subscription has been restored.</p>
+                    <div class="info-box">
+                        <p><strong>Plan:</strong> ${payload.planName || 'Subscription'}</p>
+                        <p><strong>Amount:</strong> ${payload.currency || user.currency || 'KES'} ${Number(payload.amount || 0).toFixed(2)}</p>
+                        <p><strong>Reference:</strong> ${payload.reference || 'Payment confirmed'}</p>
+                        <p><strong>Next billing date:</strong> ${payload.nextBillingDate ? new Date(payload.nextBillingDate).toISOString() : 'Updated'}</p>
+                    </div>
+                    <a href="${billingUrl}" class="button">Open Billing</a>
+                </div>
+            </div>
+        </body>
+        </html>
+    `;
+
+    const textContent = `
+Payment Confirmed
+
+Hello ${user.name},
+
+We have confirmed your payment and your subscription has been restored.
+
+Plan: ${payload.planName || 'Subscription'}
+Amount: ${payload.currency || user.currency || 'KES'} ${Number(payload.amount || 0).toFixed(2)}
+Reference: ${payload.reference || 'Payment confirmed'}
+Next billing date: ${payload.nextBillingDate ? new Date(payload.nextBillingDate).toISOString() : 'Updated'}
+
+Open Billing: ${billingUrl}
+    `;
+
+    return sendEmail({
+        to: user.email,
+        subject: 'Payment Confirmed - Blackie Networks',
+        htmlContent,
+        textContent
+    });
+}
+
 async function sendSupportTicketUpdateEmail(user, payload = {}) {
     const supportUrl = `${FRONTEND_URL}/support`;
     const subjectLine = payload.subjectLine || `Support Ticket Update: ${payload.ticketSubject || 'Your support request'}`;
@@ -651,5 +767,7 @@ module.exports = {
     sendRouterOnlineEmail,
     sendRouterDeletedEmail,
     sendBillingReminderEmail,
+    sendSubscriptionSuspendedEmail,
+    sendPaymentConfirmedEmail,
     sendSupportTicketUpdateEmail
 };

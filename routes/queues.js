@@ -98,6 +98,7 @@ function registerQueueRoutes(app) {
             if (subscriptionId) {
                 await Subscription.findByIdAndUpdate(subscriptionId, {
                     servicePlanId: servicePlan._id,
+                    subscriberIp,
                     queueName: data.name
                 }).catch(() => undefined);
             }

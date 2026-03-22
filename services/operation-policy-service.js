@@ -16,6 +16,7 @@ const OPERATION_DEFINITIONS = {
     queue_mutation: { commandClass: 'service_mutation', capability: 'queueWrite', snapshot: true, scope: 'queues', allowRaw: false },
     hotspot_mutation: { commandClass: 'service_mutation', capability: 'hotspotWrite', snapshot: true, scope: 'hotspot', allowRaw: false },
     pppoe_mutation: { commandClass: 'service_mutation', capability: 'pppoeWrite', snapshot: true, scope: 'pppoe', allowRaw: false },
+    interfaces_mutation: { commandClass: 'service_mutation', capability: 'interfaceWrite', snapshot: true, scope: 'interfaces', allowRaw: false },
     firewall_mutation: { commandClass: 'network_core_mutation', capability: 'firewallWrite', snapshot: true, scope: 'firewall', allowRaw: false },
     routes_mutation: { commandClass: 'network_core_mutation', capability: 'routesWrite', snapshot: true, scope: 'routes', allowRaw: false },
     bootstrap_mutation: { commandClass: 'bootstrap_mutation', capability: null, snapshot: true, scope: 'bootstrap', allowRaw: false },
