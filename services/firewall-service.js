@@ -126,6 +126,17 @@ async function addNatRule(routerId, ruleData) {
     return { message: 'NAT rule added' };
 }
 
+async function updateNatRule(routerId, routerosId, updates) {
+    const mapped = mapToRouterOs(updates);
+    await executeCommand(routerId, '/ip/firewall/nat/set', { '.id': routerosId, ...mapped }, {
+        operationName: 'firewall_mutation',
+        scope: 'firewall'
+    });
+
+    const rules = await listNatRules(routerId);
+    return rules.find((rule) => rule.routerosId === routerosId || rule.id === routerosId) || { message: 'NAT rule updated' };
+}
+
 async function deleteNatRule(routerId, routerosId) {
     await executeCommand(routerId, '/ip/firewall/nat/remove', { '.id': routerosId }, {
         operationName: 'firewall_mutation',
@@ -181,6 +192,7 @@ module.exports = {
     toggleFilterRule,
     listNatRules,
     addNatRule,
+    updateNatRule,
     deleteNatRule,
     listAddressLists,
     addToAddressList,

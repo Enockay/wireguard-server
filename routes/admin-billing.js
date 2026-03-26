@@ -4,6 +4,44 @@ const Subscription = require('../models/Subscription');
 const Transaction = require('../models/Transaction');
 const { requireAdminPermission } = require('../middleware/admin-auth');
 const { recordAdminAction } = require('../services/admin-audit-service');
+
+function escapePdfText(value) {
+    return String(value ?? '').replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+}
+
+function buildSimplePdf(lines) {
+    const content = [
+        'BT',
+        '/F1 12 Tf',
+        '50 780 Td',
+        '16 TL',
+        ...lines.flatMap((line, index) => (index === 0 ? [`(${escapePdfText(line)}) Tj`] : ['T*', `(${escapePdfText(line)}) Tj`])),
+        'ET'
+    ].join('\n');
+
+    const objects = [
+        '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj',
+        '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj',
+        '3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj',
+        '4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj',
+        `5 0 obj << /Length ${Buffer.byteLength(content, 'utf8')} >> stream\n${content}\nendstream endobj`
+    ];
+
+    let pdf = '%PDF-1.4\n';
+    const offsets = [0];
+    for (const object of objects) {
+        offsets.push(Buffer.byteLength(pdf, 'utf8'));
+        pdf += `${object}\n`;
+    }
+    const xrefOffset = Buffer.byteLength(pdf, 'utf8');
+    pdf += `xref\n0 ${objects.length + 1}\n`;
+    pdf += '0000000000 65535 f \n';
+    for (let index = 1; index < offsets.length; index += 1) {
+        pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`;
+    }
+    pdf += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+    return Buffer.from(pdf, 'utf8');
+}
 const {
     ADMIN_BILLING_PERMISSIONS,
     BILLING_NOTE_CATEGORIES,
@@ -283,21 +321,23 @@ function registerAdminBillingRoutes(app) {
                 return res.status(404).json({ success: false, error: 'Invoice not found' });
             }
             const user = await User.findById(invoice.userId).lean();
-            return res.json({
-                success: true,
-                invoiceData: {
-                    ispName: 'Blackie Networks',
-                    transactionId: invoice.transactionId,
-                    subscriberName: user?.name || 'Unknown subscriber',
-                    subscriberEmail: user?.email || 'Unknown email',
-                    amount: invoice.amount,
-                    currency: invoice.currency || 'USD',
-                    status: invoice.status,
-                    description: invoice.description,
-                    dueDate: invoice.dueDate || null,
-                    createdAt: invoice.createdAt
-                }
-            });
+            const pdf = buildSimplePdf([
+                process.env.COMPANY_NAME || 'Blackie Networks',
+                'Invoice',
+                '',
+                `Invoice #: ${invoice.transactionId || String(invoice._id)}`,
+                `Subscriber: ${user?.name || 'Unknown subscriber'}`,
+                `Email: ${user?.email || 'Unknown email'}`,
+                `Amount: ${invoice.amount} ${invoice.currency || 'USD'}`,
+                `Status: ${invoice.status || 'pending'}`,
+                `Description: ${invoice.description || 'Subscription charge'}`,
+                `Created: ${invoice.createdAt ? new Date(invoice.createdAt).toISOString() : 'N/A'}`,
+                `Due: ${invoice.dueDate ? new Date(invoice.dueDate).toISOString() : 'N/A'}`
+            ]);
+
+            res.setHeader('Content-Type', 'application/pdf');
+            res.setHeader('Content-Disposition', `attachment; filename="invoice-${invoice.transactionId || invoice._id}.pdf"`);
+            return res.send(pdf);
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to prepare invoice download', details: error.message });
         }

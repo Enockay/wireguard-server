@@ -5,6 +5,7 @@ const MonitoringIncident = require("../models/MonitoringIncident");
 const SupportTicket = require("../models/SupportTicket");
 const Transaction = require("../models/Transaction");
 const AdminAuditLog = require("../models/AdminAuditLog");
+const { requireAdmin } = require('../middleware/admin-auth');
 const {
     wgLock,
     log,
@@ -368,7 +369,7 @@ function registerAdminRoutes(app, getDbInitialized) {
     });
 
     // Get TCP proxy status (admin)
-    app.get("/api/admin/proxy/status", async (req, res) => {
+    app.get("/api/admin/proxy/status", requireAdmin, async (req, res) => {
         try {
             const { getAllActiveProxies, getProxyStatus } = require('../services/tcp-proxy-service');
             const MikrotikRouter = require('../models/MikrotikRouter');
@@ -409,7 +410,7 @@ function registerAdminRoutes(app, getDbInitialized) {
     });
 
     // Test proxy connectivity (admin)
-    app.post("/api/admin/proxy/test", async (req, res) => {
+    app.post("/api/admin/proxy/test", requireAdmin, async (req, res) => {
         try {
             const { routerId, portType } = req.body;
             

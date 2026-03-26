@@ -327,6 +327,51 @@ async function createProfile(routerId, payload) {
     };
 }
 
+async function updateProfile(routerId, profileId, payload) {
+    await ensureRouterExists(routerId);
+    const records = await executeCommand(routerId, '/ppp/profile/print', {}, { operationName: 'get_system_resource' });
+    const profile = records.find((item) => item['.id'] === profileId || item.name === profileId);
+    if (!profile) {
+        throw new Error('PPPoE profile not found');
+    }
+
+    const nextName = payload.name != null ? String(payload.name || '').trim() : profile.name || 'default';
+    const nextLocalAddress = payload.localAddress != null ? payload.localAddress || '' : profile['local-address'] || '';
+    const nextRemoteAddress = payload.remoteAddress != null ? payload.remoteAddress || '' : profile['remote-address'] || '';
+    const nextRateLimit = payload.rateLimit != null ? payload.rateLimit || '' : profile['rate-limit'] || '';
+    const nextComment = payload.comment != null ? payload.comment || '' : profile.comment || '';
+
+    await executeCommand(routerId, '/ppp/profile/set', {
+        '.id': profile['.id'],
+        name: nextName,
+        'local-address': nextLocalAddress,
+        'remote-address': nextRemoteAddress,
+        'rate-limit': nextRateLimit,
+        comment: nextComment
+    }, { operationName: 'pppoe_mutation', scope: 'pppoe' });
+
+    return {
+        id: profile['.id'] || '',
+        name: nextName,
+        localAddress: nextLocalAddress,
+        remoteAddress: nextRemoteAddress,
+        rateLimit: nextRateLimit,
+        comment: nextComment
+    };
+}
+
+async function deleteProfile(routerId, profileId) {
+    await ensureRouterExists(routerId);
+    const records = await executeCommand(routerId, '/ppp/profile/print', {}, { operationName: 'get_system_resource' });
+    const profile = records.find((item) => item['.id'] === profileId || item.name === profileId);
+    if (!profile) {
+        throw new Error('PPPoE profile not found');
+    }
+
+    await executeCommand(routerId, '/ppp/profile/remove', { '.id': profile['.id'] }, { operationName: 'pppoe_mutation', scope: 'pppoe' });
+    return { message: 'PPPoE profile deleted' };
+}
+
 module.exports = {
     listPppoeSecrets,
     createPppoeSecret,
@@ -335,5 +380,7 @@ module.exports = {
     listActiveSessions,
     disconnectSession,
     listProfiles,
-    createProfile
+    createProfile,
+    updateProfile,
+    deleteProfile
 };

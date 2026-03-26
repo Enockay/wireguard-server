@@ -9,7 +9,9 @@ const {
     listActiveSessions,
     disconnectSession,
     generateVouchers,
-    listProfiles
+    listProfiles,
+    listVouchers,
+    revokeVoucher
 } = require('../services/hotspot-service');
 
 function resolveRouterFeatureError(error, notFoundMessage = 'Router not found') {
@@ -91,10 +93,44 @@ function registerHotspotRoutes(app) {
 
     app.post('/api/admin/routers/:routerId/hotspot/vouchers', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
         try {
-            const data = await generateVouchers(req.params.routerId, req.body || {});
+            const data = await generateVouchers(req.params.routerId, {
+                ...(req.body || {}),
+                createdBy: req.adminUser?.email || 'admin'
+            });
             return res.status(201).json({ success: true, data });
         } catch (error) {
             const resolved = resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.get('/api/admin/routers/:routerId/hotspot/vouchers', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_DETAILS), async (req, res) => {
+        try {
+            const result = await listVouchers(req.params.routerId, req.query || {});
+            return res.json({
+                success: true,
+                vouchers: result.items,
+                total: result.pagination.total,
+                page: result.pagination.page,
+                limit: result.pagination.limit
+            });
+        } catch (error) {
+            const resolved = resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.delete('/api/admin/routers/:routerId/hotspot/vouchers/:voucherId', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            await revokeVoucher(req.params.routerId, req.params.voucherId);
+            return res.json({ success: true });
+        } catch (error) {
+            if (error.statusCode === 409) {
+                return res.status(409).json({ success: false, error: error.message });
+            }
+            const resolved = error.message === 'Voucher not found'
+                ? { status: 404, payload: { success: false, error: error.message } }
+                : resolveRouterFeatureError(error);
             return res.status(resolved.status).json(resolved.payload);
         }
     });

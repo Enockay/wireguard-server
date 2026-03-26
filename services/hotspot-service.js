@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const HotspotUser = require('../models/HotspotUser');
 const HotspotSession = require('../models/HotspotSession');
+const HotspotVoucher = require('../models/HotspotVoucher');
 const MikrotikRouter = require('../models/MikrotikRouter');
 const { executeCommand } = require('./routeros-command-service');
 
@@ -129,6 +130,31 @@ function serializeHotspotProfile(record) {
         rateLimit: record['rate-limit'] || '',
         sessionTimeout: record['session-timeout'] || '',
         idleTimeout: record['idle-timeout'] || ''
+    };
+}
+
+function serializeVoucher(doc) {
+    const isExpired = doc.expiresAt && new Date(doc.expiresAt).getTime() < Date.now();
+    const status = doc.status === 'unused' && isExpired ? 'expired' : doc.status;
+
+    return {
+        id: String(doc._id),
+        routerId: String(doc.routerId),
+        hotspotUserId: doc.hotspotUserId ? String(doc.hotspotUserId) : null,
+        username: doc.username,
+        password: doc.password,
+        profile: doc.profile || 'default',
+        dataLimitBytes: doc.dataLimitBytes || 0,
+        timeLimitSeconds: doc.timeLimitSeconds || 0,
+        comment: doc.comment || '',
+        batchId: doc.batchId || '',
+        status,
+        expiresAt: doc.expiresAt || null,
+        usedAt: doc.usedAt || null,
+        revokedAt: doc.revokedAt || null,
+        createdBy: doc.createdBy || 'system',
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt
     };
 }
 
@@ -507,9 +533,10 @@ function generateRandomCredential(prefix = 'HS') {
 async function generateVouchers(routerId, payload) {
     const count = Math.min(100, Math.max(1, Number(payload.count) || 1));
     const baseUsers = Array.from({ length: count }, () => generateRandomCredential(payload.prefix));
+    const batchId = `router-${routerId}-${Date.now()}`;
 
     const vouchers = await runWithConcurrency(baseUsers, 10, async (item) => {
-        await createHotspotUser(routerId, {
+        const user = await createHotspotUser(routerId, {
             username: item.username,
             password: item.password,
             profile: payload.profile || 'default',
@@ -518,10 +545,103 @@ async function generateVouchers(routerId, payload) {
             expiresAt: payload.expiresAt || null,
             comment: payload.comment || `Voucher batch ${new Date().toISOString()}`
         });
+        await HotspotVoucher.findOneAndUpdate(
+            { routerId, username: item.username },
+            {
+                $set: {
+                    hotspotUserId: user.id,
+                    password: item.password,
+                    profile: payload.profile || 'default',
+                    dataLimitBytes: payload.dataLimitBytes || 0,
+                    timeLimitSeconds: payload.timeLimitSeconds || 0,
+                    comment: payload.comment || `Voucher batch ${new Date().toISOString()}`,
+                    batchId,
+                    status: 'unused',
+                    expiresAt: toDateOrNull(payload.expiresAt),
+                    usedAt: null,
+                    revokedAt: null,
+                    createdBy: payload.createdBy || 'admin'
+                }
+            },
+            { new: true, upsert: true }
+        );
         return item;
     });
 
     return vouchers;
+}
+
+async function listVouchers(routerId, { status = '', page = 1, limit = 50 } = {}) {
+    await ensureRouterExists(routerId);
+    const safePage = Math.max(1, Number(page) || 1);
+    const safeLimit = Math.min(100, Math.max(1, Number(limit) || 50));
+    const query = { routerId };
+
+    if (status && ['unused', 'used', 'expired', 'revoked'].includes(String(status))) {
+        if (status === 'expired') {
+            query.status = 'unused';
+            query.expiresAt = { $lt: new Date() };
+        } else {
+            query.status = String(status);
+        }
+    }
+
+    const [items, total] = await Promise.all([
+        HotspotVoucher.find(query)
+            .sort({ createdAt: -1 })
+            .skip((safePage - 1) * safeLimit)
+            .limit(safeLimit),
+        HotspotVoucher.countDocuments(query)
+    ]);
+
+    return {
+        items: items.map(serializeVoucher),
+        pagination: {
+            page: safePage,
+            limit: safeLimit,
+            total,
+            pages: Math.max(1, Math.ceil(total / safeLimit))
+        }
+    };
+}
+
+async function revokeVoucher(routerId, voucherId) {
+    await ensureRouterExists(routerId);
+    const voucher = await HotspotVoucher.findOne({ _id: voucherId, routerId });
+    if (!voucher) {
+        throw new Error('Voucher not found');
+    }
+    if (voucher.status === 'used') {
+        const error = new Error('Used vouchers cannot be revoked');
+        error.statusCode = 409;
+        throw error;
+    }
+
+    voucher.status = 'revoked';
+    voucher.revokedAt = new Date();
+    await voucher.save();
+
+    const hotspotUser = await HotspotUser.findOne({
+        routerId,
+        $or: [
+            { _id: voucher.hotspotUserId || null },
+            { username: voucher.username }
+        ]
+    });
+
+    if (hotspotUser?.routerosId) {
+        await executeCommand(routerId, '/ip/hotspot/user/set', {
+            '.id': hotspotUser.routerosId,
+            disabled: 'yes'
+        }, { operationName: 'hotspot_mutation', scope: 'hotspot' }).catch(() => {});
+    }
+
+    if (hotspotUser) {
+        hotspotUser.isActive = false;
+        await hotspotUser.save();
+    }
+
+    return { message: 'Voucher revoked' };
 }
 
 async function listProfiles(routerId) {
@@ -539,5 +659,7 @@ module.exports = {
     listActiveSessions,
     disconnectSession,
     generateVouchers,
-    listProfiles
+    listProfiles,
+    listVouchers,
+    revokeVoucher
 };

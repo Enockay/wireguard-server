@@ -36,6 +36,10 @@ async function audit(req, targetUserId, action, reason, metadata = {}) {
 }
 
 function registerAdminManagementRoutes(app) {
+    app.get('/api/admin/resellers', requireAdmin, async (_req, res) => {
+        return res.status(501).json({ success: false, error: 'Not implemented' });
+    });
+
     app.get('/api/admin/management/admins', requireAdmin, async (req, res) => {
         try {
             if (!canManageAdmins(req.adminUser)) {

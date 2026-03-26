@@ -8,7 +8,9 @@ const {
     listActiveSessions,
     disconnectSession,
     listProfiles,
-    createProfile
+    createProfile,
+    updateProfile,
+    deleteProfile
 } = require('../services/pppoe-service');
 const PppoeSecret = require('../models/PppoeSecret');
 
@@ -124,6 +126,30 @@ function registerPppoeRoutes(app) {
             return res.status(201).json({ success: true, data });
         } catch (error) {
             const resolved = resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.put('/api/admin/routers/:routerId/pppoe/profiles/:profileId', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const data = await updateProfile(req.params.routerId, req.params.profileId, req.body || {});
+            return res.json({ success: true, data });
+        } catch (error) {
+            const resolved = error.message === 'PPPoE profile not found'
+                ? { status: 404, payload: { success: false, error: error.message } }
+                : resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.delete('/api/admin/routers/:routerId/pppoe/profiles/:profileId', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const data = await deleteProfile(req.params.routerId, req.params.profileId);
+            return res.json({ success: true, data });
+        } catch (error) {
+            const resolved = error.message === 'PPPoE profile not found'
+                ? { status: 404, payload: { success: false, error: error.message } }
+                : resolveRouterFeatureError(error);
             return res.status(resolved.status).json(resolved.payload);
         }
     });

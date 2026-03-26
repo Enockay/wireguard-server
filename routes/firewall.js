@@ -8,6 +8,7 @@ const {
     toggleFilterRule,
     listNatRules,
     addNatRule,
+    updateNatRule,
     deleteNatRule,
     listAddressLists,
     addToAddressList,
@@ -95,6 +96,16 @@ function registerFirewallRoutes(app) {
         try {
             const data = await addNatRule(req.params.routerId, req.body || {});
             return res.status(201).json({ success: true, data });
+        } catch (error) {
+            const resolved = resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.put('/api/admin/routers/:routerId/firewall/nat/:ruleId', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const data = await updateNatRule(req.params.routerId, req.params.ruleId, req.body || {});
+            return res.json({ success: true, data });
         } catch (error) {
             const resolved = resolveRouterFeatureError(error);
             return res.status(resolved.status).json(resolved.payload);
