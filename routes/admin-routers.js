@@ -11,6 +11,10 @@ const { execute: executeRouterOperation } = require('../services/router-executio
 const { probeCapabilities } = require('../services/capability-probe-service');
 const { getRouterMetricsHistory } = require('../services/telemetry-service');
 const {
+    discoverDownstreamMikrotiks,
+    getLatestDownstreamDiscoveryRun
+} = require('../services/downstream-mikrotik-discovery-service');
+const {
     startDiscoveryScan,
     listDiscoveryResults,
     verifyDiscoveryCandidate,
@@ -33,6 +37,7 @@ const {
     getAdminRouterNotes,
     getAdminRouterFlags,
     createRouterAdmin,
+    trackRouterRuntimePeer,
     generateRouterSetupArtifacts,
     disableRouter,
     reactivateRouter,
@@ -766,6 +771,121 @@ function registerAdminRouterRoutes(app) {
             return res.json({ success: true, connectivity });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load router connectivity', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/routers/:id/downstream-mikrotiks', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_DETAILS), async (req, res) => {
+        try {
+            const run = await getLatestDownstreamDiscoveryRun(req.params.id);
+            if (!run) {
+                return res.status(404).json({ success: false, error: 'No downstream MikroTik discovery run found for this router' });
+            }
+            return res.json({ success: true, data: run });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load downstream MikroTik discovery', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/downstream-mikrotiks/discover', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_DETAILS), async (req, res) => {
+        try {
+            const result = await discoverDownstreamMikrotiks(req.params.id, {
+                enableNeighborDiscovery: req.body?.enableNeighborDiscovery,
+                enableRouteInspection: req.body?.enableRouteInspection,
+                enableSubnetProbe: req.body?.enableSubnetProbe,
+                maxProbeTargets: req.body?.maxProbeTargets,
+                timeoutMs: req.body?.timeoutMs,
+                scanDepth: req.body?.scanDepth,
+                allowedSubnetCidrs: req.body?.allowedSubnetCidrs,
+                excludeCidrs: req.body?.excludeCidrs,
+                dryRun: req.body?.dryRun,
+                portPreferences: req.body?.portPreferences
+            }, getActorContext(req));
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetRouterId: req.params.id,
+                action: 'admin_discover_downstream_mikrotiks',
+                reason: normalizeReason(req.body?.reason) || 'Triggered downstream MikroTik discovery',
+                metadata: {
+                    dryRun: Boolean(req.body?.dryRun),
+                    discoveredRouterCount: result.discoveredRouterCount,
+                    candidateSubnetCount: result.candidateSubnetCount,
+                    probedTargetCount: result.probedTargetCount
+                }
+            });
+
+            return res.json({ success: true, data: result });
+        } catch (error) {
+            if (error.message === 'Router not found') {
+                return res.status(404).json({ success: false, error: error.message });
+            }
+            if (error.code === 'discovery_already_running') {
+                return res.status(409).json({ success: false, error: error.message, code: error.code });
+            }
+            return res.status(500).json({ success: false, error: 'Failed to discover downstream MikroTik routers', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/wireguard/runtime-peers/:peerId/track', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const name = String(req.body?.name || '').trim();
+            const reason = normalizeReason(req.body?.reason);
+
+            if (!name) {
+                return res.status(400).json({ success: false, error: 'Router name is required' });
+            }
+
+            const result = await trackRouterRuntimePeer({
+                routerId: req.params.id,
+                peerId: req.params.peerId,
+                name,
+                reason,
+                actor: req.adminUser?.email || 'admin'
+            });
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: result.createdRouter.userId?._id || result.createdRouter.userId || null,
+                targetRouterId: result.createdRouter._id,
+                action: 'admin_track_router_runtime_peer',
+                reason,
+                metadata: {
+                    sourceRouterId: String(result.sourceRouter._id),
+                    sourceRouterName: result.sourceRouter.name || null,
+                    runtimePeerId: result.runtimePeer.id || null,
+                    runtimePeerInterface: result.runtimePeer.interface || null,
+                    runtimePeerPublicKey: result.runtimePeer.publicKey || null
+                }
+            });
+
+            return res.status(201).json({
+                success: true,
+                message: 'Runtime WireGuard peer is now tracked as a management-only router',
+                data: {
+                    id: String(result.createdRouter._id),
+                    name: result.createdRouter.name,
+                    connectionMode: result.createdRouter.connectionMode || 'management_only',
+                    status: result.createdRouter.status
+                }
+            });
+        } catch (error) {
+            if (error.message === 'Router not found') {
+                return res.status(404).json({ success: false, error: error.message });
+            }
+            if (error.message === 'Runtime WireGuard peer not found') {
+                return res.status(404).json({ success: false, error: error.message });
+            }
+            if (error.code === 'runtime_peer_already_tracked') {
+                return res.status(409).json({
+                    success: false,
+                    error: error.message,
+                    code: error.code,
+                    trackedRouterIds: error.routerIds || []
+                });
+            }
+            return res.status(500).json({ success: false, error: 'Failed to track runtime WireGuard peer', details: error.message });
         }
     });
 

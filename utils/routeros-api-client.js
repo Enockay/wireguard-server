@@ -58,6 +58,43 @@ class RouterOsApiClient {
         }
     }
 
+    async waitForChunk() {
+        return await new Promise((resolve, reject) => {
+            if (!this.socket) {
+                reject(new Error('RouterOS API socket is not connected'));
+                return;
+            }
+
+            const cleanup = () => {
+                this.socket.off('data', handleData);
+                this.socket.off('error', handleError);
+                this.socket.off('timeout', handleTimeout);
+                this.socket.off('close', handleClose);
+            };
+            const handleData = (chunk) => {
+                cleanup();
+                resolve(chunk);
+            };
+            const handleError = (error) => {
+                cleanup();
+                reject(error);
+            };
+            const handleTimeout = () => {
+                cleanup();
+                reject(new Error('RouterOS API timeout'));
+            };
+            const handleClose = () => {
+                cleanup();
+                reject(new Error('RouterOS API socket closed before response was received'));
+            };
+
+            this.socket.once('data', handleData);
+            this.socket.once('error', handleError);
+            this.socket.once('timeout', handleTimeout);
+            this.socket.once('close', handleClose);
+        });
+    }
+
     async writeSentence(words) {
         const chunks = words.map((word) => {
             const payload = Buffer.from(String(word), 'utf8');
@@ -82,11 +119,7 @@ class RouterOsApiClient {
                 }
             }
 
-            const chunk = await new Promise((resolve, reject) => {
-                this.socket.once('data', resolve);
-                this.socket.once('error', reject);
-                this.socket.once('timeout', () => reject(new Error('RouterOS API timeout')));
-            });
+            const chunk = await this.waitForChunk();
             this.buffer = Buffer.concat([this.buffer, chunk]);
         }
     }
@@ -146,5 +179,6 @@ async function executeRouterOsApiCommand({ host, port = 8728, username, password
 }
 
 module.exports = {
+    RouterOsApiClient,
     executeRouterOsApiCommand
 };

@@ -18,6 +18,7 @@ function buildDefaultEndpoints(router, credential) {
     const vpnHost = stripCidrSuffix(router.vpnIp);
     const localHost = stripCidrSuffix(router.discoveryInfo?.localAddress);
     const openPorts = Array.isArray(router.discoveryInfo?.openPorts) ? router.discoveryInfo.openPorts : [];
+    const prefersRemoteManagement = router.connectionMode !== 'management_only' && router.status === 'active';
 
     if (localHost && openPorts.includes(8728)) {
         endpoints.push({
@@ -27,7 +28,7 @@ function buildDefaultEndpoints(router, credential) {
             port: 8728,
             transport: 'api',
             source: 'derived',
-            priority: 1,
+            priority: prefersRemoteManagement ? 25 : 1,
             enabled: true,
             allowInsecureTls: false,
             hostValidation: 'strict',
@@ -37,7 +38,7 @@ function buildDefaultEndpoints(router, credential) {
         });
     }
 
-    if (!endpoints.length && vpnHost) {
+    if (vpnHost) {
         endpoints.push({
             id: 'derived-wireguard-api',
             kind: 'wireguard_api',
@@ -45,7 +46,7 @@ function buildDefaultEndpoints(router, credential) {
             port: credential?.apiPort || router.apiPort || 8728,
             transport: 'api',
             source: 'derived',
-            priority: 10,
+            priority: prefersRemoteManagement ? 1 : 10,
             enabled: true,
             allowInsecureTls: false,
             hostValidation: 'strict',
@@ -63,7 +64,7 @@ function buildDefaultEndpoints(router, credential) {
             port: credential?.apiPort || router.apiPort || 8728,
             transport: 'api',
             source: 'derived',
-            priority: router.status === 'active' ? 30 : 5,
+            priority: prefersRemoteManagement ? 35 : 5,
             enabled: true,
             allowInsecureTls: false,
             hostValidation: 'strict',

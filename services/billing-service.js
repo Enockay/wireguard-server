@@ -342,11 +342,35 @@ async function getSubscriptionRouterAndPlan(subscription) {
 }
 
 function normalizeSubscriberIp(value) {
-    return String(value || '').trim();
+    return String(value || '').trim().split('/')[0].trim();
+}
+
+function getRouterManagementIp(router) {
+    return normalizeSubscriberIp(router?.vpnIp);
+}
+
+function ensureSafeSubscriberIp(subscription, router, candidateIp, source) {
+    const subscriberIp = normalizeSubscriberIp(candidateIp);
+    if (!subscriberIp) {
+        return '';
+    }
+
+    const routerManagementIp = getRouterManagementIp(router);
+    if (routerManagementIp && subscriberIp === routerManagementIp) {
+        log('error', 'billing_subscriber_ip_matches_router_vpn_ip', {
+            subscriptionId: subscription?._id,
+            routerId: router?._id,
+            subscriberIp,
+            source
+        });
+        return '';
+    }
+
+    return subscriberIp;
 }
 
 async function resolveSubscriptionSubscriberIp(subscription, router) {
-    const explicitSubscriberIp = normalizeSubscriberIp(subscription.subscriberIp);
+    const explicitSubscriberIp = ensureSafeSubscriberIp(subscription, router, subscription.subscriberIp, 'subscription');
     if (explicitSubscriberIp) {
         return explicitSubscriberIp;
     }
@@ -360,11 +384,19 @@ async function resolveSubscriptionSubscriberIp(subscription, router) {
             ]
         }).sort({ updatedAt: -1, createdAt: -1 });
         if (linkedQueue?.target) {
-            return normalizeSubscriberIp(linkedQueue.target);
+            return ensureSafeSubscriberIp(subscription, router, linkedQueue.target, 'linked_queue');
         }
     }
 
-    return normalizeSubscriberIp(router?.vpnIp);
+    if (getRouterManagementIp(router)) {
+        log('error', 'billing_subscriber_ip_missing', {
+            subscriptionId: subscription?._id,
+            routerId: router?._id,
+            reason: 'subscriber_ip_required_to_avoid_blocking_management_tunnel'
+        });
+    }
+
+    return '';
 }
 
 function isRouterReadyForQueueActivation(router) {

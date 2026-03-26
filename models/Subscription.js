@@ -51,6 +51,10 @@ const subscriptionSchema = new mongoose.Schema({
     lastPaymentDate: {
         type: Date
     },
+    enforcedAt: {
+        type: Date,
+        default: null
+    },
     paymentMethod: {
         type: String,
         enum: ['manual', 'stripe', 'paypal', 'other'],

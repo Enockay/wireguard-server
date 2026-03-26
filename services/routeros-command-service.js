@@ -9,7 +9,20 @@ function stripCidrSuffix(value) {
 
 function resolveRouterManagementHost(router) {
     const endpoints = Array.isArray(router?.managementEndpoints) ? router.managementEndpoints : [];
-    const preferred = endpoints.find((endpoint) => endpoint.enabled !== false && endpoint.health !== 'unreachable');
+    const prefersRemoteManagement = router?.connectionMode !== 'management_only' && router?.status === 'active';
+    const healthRank = { healthy: 0, degraded: 1, unknown: 2, stale: 3, unreachable: 4 };
+    const preferred = [...endpoints]
+        .filter((endpoint) => endpoint.enabled !== false && endpoint.health !== 'unreachable')
+        .sort((a, b) => {
+            const aRemote = prefersRemoteManagement && ['wireguard_api', 'public_api_tls'].includes(a?.kind);
+            const bRemote = prefersRemoteManagement && ['wireguard_api', 'public_api_tls'].includes(b?.kind);
+            if (aRemote !== bRemote) {
+                return aRemote ? -1 : 1;
+            }
+            const healthDiff = (healthRank[a?.health] ?? 9) - (healthRank[b?.health] ?? 9);
+            if (healthDiff !== 0) return healthDiff;
+            return (a?.priority || 999) - (b?.priority || 999);
+        })[0];
     if (preferred?.host) return preferred.host;
 
     const vpnHost = stripCidrSuffix(router?.vpnIp);

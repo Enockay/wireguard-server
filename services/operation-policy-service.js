@@ -10,6 +10,7 @@ const OPERATION_DEFINITIONS = {
     get_system_resource: { commandClass: 'read_only', capability: 'systemRead', snapshot: false, allowRaw: false },
     get_interfaces: { commandClass: 'read_only', capability: 'interfacesRead', snapshot: false, allowRaw: false },
     get_logs: { commandClass: 'read_only', capability: 'logsRead', snapshot: false, allowRaw: false },
+    topology_discovery: { commandClass: 'read_only', capability: 'systemRead', snapshot: false, allowRaw: false },
     ping: { commandClass: 'read_only', capability: 'systemRead', snapshot: false, allowRaw: false },
     safe_operational: { commandClass: 'safe_operational', capability: 'systemRead', snapshot: false, allowRaw: false },
     reboot: { commandClass: 'safe_operational', capability: 'reboot', snapshot: false, allowRaw: false },

@@ -12,6 +12,8 @@ const { startRouterProxy, stopRouterProxy, restartRouterProxy, getProxyStatus } 
 const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive, getServerEndpoint, getServerPublicKey } = require('../wg-core');
 const { createSubscription } = require('./billing-service');
 const { sendRouterDeletedEmail } = require('./email-service');
+const { execute: executeRouterOperation } = require('./router-execution-service');
+const { getLatestDownstreamDiscoveryRun } = require('./downstream-mikrotik-discovery-service');
 
 const ROUTER_NOTE_CATEGORIES = ['support', 'provisioning', 'monitoring', 'billing', 'abuse', 'infrastructure', 'follow_up'];
 const ROUTER_FLAG_TYPES = ['provisioning_issue', 'unstable', 'under_investigation', 'vip_customer_router', 'billing_hold', 'manual_review'];
@@ -108,6 +110,413 @@ function getHandshakeState(client) {
 
 function isManagementOnlyRouter(router) {
     return router?.connectionMode === 'management_only';
+}
+
+function resolveOwnerTunnelContext(router, ownerRouters = []) {
+    const currentRouterId = String(router?._id || '');
+    const candidates = (ownerRouters || [])
+        .filter((candidate) => String(candidate?._id || '') !== currentRouterId)
+        .filter((candidate) => candidate?.connectionMode !== 'management_only')
+        .map((candidate) => ({
+            router: candidate,
+            client: candidate?.wireguardClientId || null
+        }))
+        .filter((candidate) => candidate.client);
+
+    if (!candidates.length) return null;
+
+    candidates.sort((left, right) => {
+        const leftHandshake = getLastHandshakeDate(left.client)?.getTime() || 0;
+        const rightHandshake = getLastHandshakeDate(right.client)?.getTime() || 0;
+        if (leftHandshake !== rightHandshake) return rightHandshake - leftHandshake;
+        const leftOnline = left.router?.status === 'active' ? 1 : 0;
+        const rightOnline = right.router?.status === 'active' ? 1 : 0;
+        if (leftOnline !== rightOnline) return rightOnline - leftOnline;
+        return new Date(right.router?.createdAt || 0).getTime() - new Date(left.router?.createdAt || 0).getTime();
+    });
+
+    const selected = candidates[0];
+    return {
+        router: selected.router,
+        client: selected.client
+    };
+}
+
+function buildOwnerTunnelSummary(router, ownerTunnelContext) {
+    if (!ownerTunnelContext?.client || !ownerTunnelContext?.router) return null;
+    const ownerClient = ownerTunnelContext.client;
+    const ownerRouter = ownerTunnelContext.router;
+    return {
+        source: 'owner_wireguard',
+        sourceRouterId: String(ownerRouter._id),
+        sourceRouterName: ownerRouter.name || null,
+        peerId: String(ownerClient._id),
+        peerName: ownerClient.name || null,
+        peerEnabled: Boolean(ownerClient.enabled),
+        serverNode: ownerRouter.serverNode || 'wireguard',
+        vpnIp: ownerClient.ip || ownerRouter.vpnIp || null,
+        publicKeyFingerprint: formatPublicKeyFingerprint(ownerClient.publicKey),
+        lastHandshake: getLastHandshakeDate(ownerClient) || null,
+        handshakeState: getHandshakeState(ownerClient),
+        transferRx: ownerClient.transferRx || 0,
+        transferTx: ownerClient.transferTx || 0,
+        tunnelStatus: deriveConnectionStatus(ownerRouter, ownerClient),
+        peerCreatedAt: ownerClient.createdAt || null
+    };
+}
+
+function buildDirectTunnelSummary(router, client) {
+    if (!client) return null;
+    return {
+        source: 'router_wireguard',
+        sourceRouterId: String(router._id),
+        sourceRouterName: router.name || null,
+        peerId: String(client._id),
+        peerName: client.name || null,
+        peerEnabled: Boolean(client.enabled),
+        serverNode: router.serverNode || 'wireguard',
+        vpnIp: client.ip || router.vpnIp || null,
+        publicKeyFingerprint: formatPublicKeyFingerprint(client.publicKey),
+        lastHandshake: getLastHandshakeDate(client) || null,
+        handshakeState: getHandshakeState(client),
+        transferRx: client.transferRx || 0,
+        transferTx: client.transferTx || 0,
+        tunnelStatus: deriveConnectionStatus(router, client),
+        peerCreatedAt: client.createdAt || null,
+        interfaceName: client.interfaceName || null,
+        endpoint: client.endpoint || null,
+        allowedIPs: client.allowedIPs || router.vpnIp || null,
+        persistentKeepalive: client.persistentKeepalive ?? null
+    };
+}
+
+function resolvePrimaryTunnel(router, client, ownerTunnelContext) {
+    return isManagementOnlyRouter(router)
+        ? buildOwnerTunnelSummary(router, ownerTunnelContext)
+        : buildDirectTunnelSummary(router, client);
+}
+
+function resolveTunnelPeerId(router, ownerRouters = []) {
+    if (!router) return null;
+    if (!isManagementOnlyRouter(router)) {
+        return router.wireguardClientId?._id ? String(router.wireguardClientId._id) : (router.wireguardClientId ? String(router.wireguardClientId) : null);
+    }
+    const context = resolveOwnerTunnelContext(router, ownerRouters);
+    return context?.client?._id ? String(context.client._id) : null;
+}
+
+function buildSharedTunnelDeviceEntry(router, ownerRouters = []) {
+    const managementOnly = isManagementOnlyRouter(router);
+    const client = managementOnly ? null : (router.wireguardClientId || null);
+    const ownerTunnelContext = managementOnly ? resolveOwnerTunnelContext(router, ownerRouters) : null;
+    const primaryTunnel = resolvePrimaryTunnel(router, client, ownerTunnelContext);
+
+    return {
+        routerId: String(router._id),
+        routerName: router.name || null,
+        connectionMode: router.connectionMode || 'wireguard',
+        status: router.status,
+        serverNode: primaryTunnel?.serverNode || (managementOnly ? 'management-only' : (router.serverNode || 'wireguard')),
+        vpnIp: primaryTunnel?.vpnIp || router.vpnIp || router.discoveryInfo?.localAddress || null,
+        peerName: primaryTunnel?.peerName || null,
+        peerEnabled: primaryTunnel?.peerEnabled ?? false,
+        lastHandshake: primaryTunnel?.lastHandshake || null,
+        handshakeState: primaryTunnel?.handshakeState || (managementOnly ? 'management_only' : 'never'),
+        tunnelStatus: primaryTunnel?.tunnelStatus || (managementOnly ? 'management_only' : deriveConnectionStatus(router, client)),
+        transferRx: primaryTunnel?.transferRx || 0,
+        transferTx: primaryTunnel?.transferTx || 0,
+        sourceRouterId: primaryTunnel?.sourceRouterId || null,
+        sourceRouterName: primaryTunnel?.sourceRouterName || null
+    };
+}
+
+function buildWireGuardWorkspace(bundle, ownerTunnelContext = null) {
+    const { router, client, ownerRouters = [] } = bundle;
+    const managementOnly = isManagementOnlyRouter(router);
+    const primaryTunnel = resolvePrimaryTunnel(router, client, ownerTunnelContext);
+    const trackingSource = resolveTrackedRuntimeSource(router, ownerRouters);
+    const primaryPeerId = primaryTunnel?.peerId || null;
+    const sharedDevices = !primaryPeerId
+        ? []
+        : ownerRouters
+            .filter((candidate) => String(candidate._id) !== String(router._id))
+            .filter((candidate) => resolveTunnelPeerId(candidate, ownerRouters) === primaryPeerId)
+            .map((candidate) => buildSharedTunnelDeviceEntry(candidate, ownerRouters));
+
+    return {
+        mode: managementOnly ? 'owner_tunnel' : 'router_tunnel',
+        available: Boolean(primaryTunnel),
+        primaryTunnel,
+        trackingSource,
+        sharedDevices,
+        sharedDeviceCount: sharedDevices.length,
+        runtime: null
+    };
+}
+
+function normalizeWireGuardInterfaceRecord(record = {}) {
+    return {
+        id: record['.id'] || null,
+        name: record.name || null,
+        listenPort: record['listen-port'] ? Number(record['listen-port']) : null,
+        mtu: record.mtu ? Number(record.mtu) : null,
+        privateKeyConfigured: Boolean(record['private-key']),
+        publicKey: record['public-key'] || null,
+        disabled: String(record.disabled || '').toLowerCase() === 'true' || String(record.disabled || '').toLowerCase() === 'yes',
+        running: String(record.running || '').toLowerCase() === 'true' || String(record.running || '').toLowerCase() === 'yes'
+    };
+}
+
+function normalizeWireGuardPeerRecord(record = {}) {
+    return {
+        id: record['.id'] || null,
+        interface: record.interface || null,
+        publicKey: record['public-key'] || null,
+        endpointAddress: record['endpoint-address'] || null,
+        endpointPort: record['endpoint-port'] ? Number(record['endpoint-port']) : null,
+        currentEndpointAddress: record['current-endpoint-address'] || null,
+        currentEndpointPort: record['current-endpoint-port'] ? Number(record['current-endpoint-port']) : null,
+        allowedAddress: record['allowed-address'] || null,
+        persistentKeepalive: record['persistent-keepalive'] ? Number(record['persistent-keepalive']) : null,
+        lastHandshake: record['last-handshake'] || null,
+        rx: record['rx'] ? Number(record['rx']) : 0,
+        tx: record['tx'] ? Number(record['tx']) : 0,
+        disabled: String(record.disabled || '').toLowerCase() === 'true' || String(record.disabled || '').toLowerCase() === 'yes'
+    };
+}
+
+async function fetchRouterWireGuardRuntime(routerId) {
+    try {
+        const [interfacesResult, peersResult] = await Promise.all([
+            executeRouterOperation(routerId, 'get_system_resource', { command: '/interface/wireguard/print' }, { actor: 'system', actorType: 'system' }),
+            executeRouterOperation(routerId, 'get_system_resource', { command: '/interface/wireguard/peers/print' }, { actor: 'system', actorType: 'system' })
+        ]);
+
+        const interfaces = Array.isArray(interfacesResult?.data) ? interfacesResult.data.map(normalizeWireGuardInterfaceRecord) : [];
+        const peers = Array.isArray(peersResult?.data) ? peersResult.data.map(normalizeWireGuardPeerRecord) : [];
+
+        return {
+            available: interfaces.length > 0 || peers.length > 0,
+            interfaces,
+            peers,
+            error: null
+        };
+    } catch (error) {
+        return {
+            available: false,
+            interfaces: [],
+            peers: [],
+            error: error.message || 'Failed to query RouterOS WireGuard state'
+        };
+    }
+}
+
+function buildRuntimePeerTrackingMarker(sourceRouterId, peerPublicKey) {
+    return `[tracked-wireguard-peer sourceRouter=${String(sourceRouterId || '').trim()} peerPublicKey=${String(peerPublicKey || '').trim()}]`;
+}
+
+function parseRuntimePeerTrackingMetadata(notes = '') {
+    const body = String(notes || '');
+    const markerMatch = body.match(/\[tracked-wireguard-peer\s+sourceRouter=([^\s\]]+)\s+peerPublicKey=([^\]]+)\]/);
+    if (!markerMatch) return null;
+
+    const readLineValue = (label) => {
+        const lineMatch = body.match(new RegExp(`^${label}:\\s*(.+)$`, 'mi'));
+        return lineMatch ? lineMatch[1].trim() : null;
+    };
+
+    return {
+        sourceRouterId: markerMatch[1] || null,
+        peerPublicKey: markerMatch[2] || null,
+        peerName: readLineValue('Runtime peer'),
+        allowedAddress: readLineValue('Allowed address'),
+        endpoint: readLineValue('Endpoint'),
+        reason: readLineValue('Reason')
+    };
+}
+
+function getRuntimePeerTrackingMarker(router, peer) {
+    if (!router?._id || !peer?.publicKey) return null;
+    return buildRuntimePeerTrackingMarker(router._id, peer.publicKey);
+}
+
+function getTrackedRuntimePeerRouters(router, peer, ownerRouters = []) {
+    const marker = getRuntimePeerTrackingMarker(router, peer);
+    if (!marker) return [];
+
+    return (ownerRouters || [])
+        .filter((candidate) => String(candidate?._id || '') !== String(router?._id || ''))
+        .filter((candidate) => String(candidate?.notes || '').includes(marker));
+}
+
+function buildTrackedRuntimePeerDeviceEntry(candidate) {
+    const trackingSource = resolveTrackedRuntimeSource(candidate);
+    return {
+        routerId: String(candidate._id),
+        routerName: candidate.name || null,
+        connectionMode: candidate.connectionMode || 'management_only',
+        status: candidate.status || 'inactive',
+        serverNode: candidate.serverNode || 'management-only',
+        vpnIp: candidate.vpnIp || candidate.discoveryInfo?.localAddress || null,
+        localAddress: candidate.discoveryInfo?.localAddress || null,
+        hostname: candidate.discoveryInfo?.hostname || null,
+        source: candidate.discoveryInfo?.source || null,
+        lastSeen: candidate.lastSeen || null,
+        sourceRouterId: trackingSource?.sourceRouterId || null,
+        sourceRouterName: trackingSource?.sourceRouterName || null
+    };
+}
+
+function resolveTrackedRuntimeSource(router, ownerRouters = []) {
+    const metadata = parseRuntimePeerTrackingMetadata(router?.notes || '');
+    if (!metadata?.sourceRouterId) return null;
+
+    const sourceRouter = (ownerRouters || []).find((candidate) => String(candidate?._id || '') === String(metadata.sourceRouterId));
+    return {
+        sourceRouterId: metadata.sourceRouterId,
+        sourceRouterName: sourceRouter?.name || null,
+        peerPublicKey: metadata.peerPublicKey || null,
+        peerName: metadata.peerName || null,
+        allowedAddress: metadata.allowedAddress || null,
+        endpoint: metadata.endpoint || null,
+        reason: metadata.reason || null
+    };
+}
+
+async function resolveUniqueRouterName(userId, requestedName) {
+    const baseName = String(requestedName || '').trim();
+    if (!baseName) {
+        throw new Error('Router name is required');
+    }
+
+    const existingRouters = await MikrotikRouter.find({ userId }, { name: 1 }).lean();
+    const existingNames = new Set(existingRouters.map((item) => String(item.name || '').trim().toLowerCase()).filter(Boolean));
+    if (!existingNames.has(baseName.toLowerCase())) {
+        return baseName;
+    }
+
+    for (let suffix = 2; suffix <= 9999; suffix += 1) {
+        const candidate = `${baseName}-${suffix}`;
+        if (!existingNames.has(candidate.toLowerCase())) {
+            return candidate;
+        }
+    }
+
+    throw new Error('Unable to allocate a unique router name');
+}
+
+function enrichRuntimePeersWithTracking(router, runtime, ownerRouters = []) {
+    if (!runtime || !Array.isArray(runtime.peers)) {
+        return runtime;
+    }
+
+    return {
+        ...runtime,
+        peers: runtime.peers.map((peer) => {
+            const trackedDevices = getTrackedRuntimePeerRouters(router, peer, ownerRouters)
+                .map((candidate) => buildTrackedRuntimePeerDeviceEntry(candidate));
+            return {
+                ...peer,
+                trackedDevices,
+                trackedDeviceCount: trackedDevices.length,
+                trackingMarker: getRuntimePeerTrackingMarker(router, peer)
+            };
+        })
+    };
+}
+
+function buildRuntimePeerTrackedNote(router, runtimePeer, reason = '') {
+    const marker = getRuntimePeerTrackingMarker(router, runtimePeer);
+    const endpoint = runtimePeer.currentEndpointAddress || runtimePeer.endpointAddress || 'unknown';
+    const endpointPort = runtimePeer.currentEndpointPort || runtimePeer.endpointPort || null;
+    const peerName = runtimePeer.interface || runtimePeer.publicKey || 'runtime-peer';
+    const noteLines = [
+        marker,
+        `Tracked from router ${router.name || router._id} (${router._id})`,
+        `Runtime peer: ${peerName}`,
+        `Public key: ${runtimePeer.publicKey || 'unknown'}`,
+        `Allowed address: ${runtimePeer.allowedAddress || 'unknown'}`,
+        `Endpoint: ${endpoint}${endpointPort ? `:${endpointPort}` : ''}`
+    ];
+
+    if (reason) {
+        noteLines.push(`Reason: ${reason}`);
+    }
+
+    return noteLines.join('\n');
+}
+
+async function trackRouterRuntimePeer({ routerId, peerId, name, reason = '', actor = 'admin' }) {
+    const bundle = await getRouterBundle(routerId);
+    if (!bundle) {
+        throw new Error('Router not found');
+    }
+
+    const { router, ownerRouters = [] } = bundle;
+    const runtime = await fetchRouterWireGuardRuntime(String(router._id));
+    const runtimePeer = (runtime?.peers || []).find((peer) => String(peer.id || '') === String(peerId || ''));
+
+    if (!runtime.available || !runtimePeer) {
+        throw new Error('Runtime WireGuard peer not found');
+    }
+
+    if (!runtimePeer.publicKey) {
+        throw new Error('Runtime WireGuard peer is missing a public key');
+    }
+
+    const existingTrackedRouters = getTrackedRuntimePeerRouters(router, runtimePeer, ownerRouters);
+    if (existingTrackedRouters.length) {
+        const error = new Error('A managed router already tracks this runtime peer');
+        error.code = 'runtime_peer_already_tracked';
+        error.routerIds = existingTrackedRouters.map((candidate) => String(candidate._id));
+        throw error;
+    }
+
+    const uniqueName = await resolveUniqueRouterName(bundle.owner._id, name);
+
+    const created = await createManagementOnlyRouterAdmin({
+        userId: String(bundle.owner._id),
+        name: uniqueName,
+        notes: buildRuntimePeerTrackedNote(router, runtimePeer, reason)
+    });
+
+    created.router.discoveryInfo = {
+        ...(created.router.discoveryInfo || {}),
+        hostname: runtimePeer.interface || created.router.discoveryInfo?.hostname || null,
+        localAddress: runtimePeer.currentEndpointAddress || runtimePeer.endpointAddress || null,
+        source: 'wireguard_runtime'
+    };
+    created.router.adminNotes = [
+        ...(created.router.adminNotes || []),
+        {
+            body: `Tracked runtime WireGuard peer ${runtimePeer.interface || runtimePeer.publicKey || peerId} from source router ${router.name || router._id}.`,
+            category: 'infrastructure',
+            pinned: false,
+            author: actor,
+            createdAt: new Date()
+        }
+    ];
+    router.adminNotes = [
+        ...(router.adminNotes || []),
+        {
+            body: `Runtime WireGuard peer ${runtimePeer.interface || runtimePeer.publicKey || peerId} was tracked as management-only router ${created.router.name}.`,
+            category: 'infrastructure',
+            pinned: false,
+            author: actor,
+            createdAt: new Date()
+        }
+    ];
+    await router.save();
+    await created.router.save();
+
+    return {
+        sourceRouter: router,
+        runtime,
+        runtimePeer,
+        requestedName: name,
+        createdRouter: created.router,
+        trackedDevices: [buildTrackedRuntimePeerDeviceEntry(created.router)]
+    };
 }
 
 function deriveSetupStatus(router, client) {
@@ -250,10 +659,11 @@ function buildPortsSummary(router) {
     };
 }
 
-function buildMonitoringSummary(router, client) {
+function buildMonitoringSummary(router, client, ownerTunnelContext = null) {
     const lastHandshake = getLastHandshakeDate(client);
     const health = deriveHealthSummary(router, client);
     const managementOnly = isManagementOnlyRouter(router);
+    const ownerTunnel = managementOnly ? buildOwnerTunnelSummary(router, ownerTunnelContext) : null;
 
     return {
         online: router.status === 'active',
@@ -271,13 +681,15 @@ function buildMonitoringSummary(router, client) {
         firmware: router.routerboardInfo?.firmware || null,
         lastTelemetryAt: router.routerboardInfo?.lastChecked || null,
         staleTelemetry: router.routerboardInfo?.lastChecked ? (Date.now() - new Date(router.routerboardInfo.lastChecked).getTime()) > 10 * 60 * 1000 : true,
-        health
+        health,
+        ownerTunnel
     };
 }
 
-function buildConnectivitySummary(router, client) {
+function buildConnectivitySummary(router, client, ownerTunnelContext = null) {
     const lastHandshake = getLastHandshakeDate(client);
     const managementOnly = isManagementOnlyRouter(router);
+    const ownerTunnel = managementOnly ? buildOwnerTunnelSummary(router, ownerTunnelContext) : null;
     return {
         connectionMode: router.connectionMode || 'wireguard',
         managementMode: router.managementMode || (managementOnly ? 'management_only' : 'fully_managed'),
@@ -298,6 +710,7 @@ function buildConnectivitySummary(router, client) {
         rekeyEligible: managementOnly ? false : Boolean(client),
         reconciliationState: managementOnly ? 'management_only' : (client ? (client.enabled ? 'managed' : 'disabled') : 'missing'),
         endpointHealthSummary: router.endpointHealthSummary || 'unknown',
+        ownerTunnel,
         endpoints: (router.managementEndpoints || []).map((endpoint) => ({
             id: endpoint.id,
             kind: endpoint.kind,
@@ -377,6 +790,13 @@ async function loadRouterDirectoryData() {
     }, new Map());
 
     const supportSummaryByUser = new Map();
+    const ownerRoutersByUser = routers.reduce((map, router) => {
+        const key = String(router.userId?._id || router.userId || '');
+        if (!key) return map;
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(router);
+        return map;
+    }, new Map());
     return {
         routers,
         users,
@@ -388,13 +808,18 @@ async function loadRouterDirectoryData() {
             return map;
         }, new Map()),
         userRouterCounts,
-        supportSummaryByUser
+        supportSummaryByUser,
+        ownerRoutersByUser
     };
 }
 
 function buildRouterListItem(router, related) {
     const owner = router.userId;
     const client = router.wireguardClientId || null;
+    const ownerTunnelContext = isManagementOnlyRouter(router)
+        ? resolveOwnerTunnelContext(router, related.ownerRoutersByUser.get(String(owner?._id || owner || '')) || [])
+        : null;
+    const ownerTunnel = isManagementOnlyRouter(router) ? buildOwnerTunnelSummary(router, ownerTunnelContext) : null;
     const subscription = related.subscriptionsByRouterId.get(String(router._id)) || null;
     const health = deriveHealthSummary(router, client);
     const monitoring = buildMonitoringSummary(router, client);
@@ -408,20 +833,25 @@ function buildRouterListItem(router, related) {
         managementMode: router.managementMode || (router.connectionMode === 'management_only' ? 'management_only' : 'fully_managed'),
         setupStatus: deriveSetupStatus(router, client),
         connectionStatus: deriveConnectionStatus(router, client),
-        vpnIp: router.vpnIp || router.discoveryInfo?.localAddress || null,
-        serverNode: router.serverNode || 'wireguard',
+        vpnIp: isManagementOnlyRouter(router)
+            ? (ownerTunnel?.vpnIp || router.vpnIp || router.discoveryInfo?.localAddress || null)
+            : (router.vpnIp || router.discoveryInfo?.localAddress || null),
+        serverNode: isManagementOnlyRouter(router)
+            ? (ownerTunnel?.serverNode || 'management-only')
+            : (router.serverNode || 'wireguard'),
         winboxPort: router.ports?.winbox || null,
         sshPort: router.ports?.ssh || null,
         apiPort: router.ports?.api || null,
         location: router.routerboardInfo?.boardName || router.routerboardInfo?.model || router.discoveryInfo?.hostname || null,
         lastSeen: router.lastSeen || null,
-        lastHandshake: getLastHandshakeDate(client),
+        lastHandshake: isManagementOnlyRouter(router) ? (ownerTunnel?.lastHandshake || null) : getLastHandshakeDate(client),
         healthSummary: health,
         createdAt: router.createdAt,
         billingState: subscription?.status || 'none',
         issueFlags: (router.internalFlags || []).map((flag) => flag.flag),
         unhealthy: monitoring.health.state !== 'healthy',
         apiConnectivity: buildApiAccessSummary(router),
+        ownerTunnel,
         endpointHealthSummary: router.endpointHealthSummary || 'unknown',
         capabilitySummary: {
             interfacesRead: Boolean(router.capabilities?.interfacesRead),
@@ -595,7 +1025,7 @@ async function getRouterBundle(routerId) {
     const [subscription, transactions, ownerRouters, auditLogs] = await Promise.all([
         Subscription.findOne({ routerId: router._id }).lean(),
         Transaction.find({ routerId: router._id }).sort({ createdAt: -1 }).lean(),
-        MikrotikRouter.find({ userId: router.userId?._id || router.userId }).lean(),
+        MikrotikRouter.find({ userId: router.userId?._id || router.userId }).populate('wireguardClientId').lean(),
         AdminAuditLog.find({ targetRouterId: router._id }).populate('actorUserId', 'name email').sort({ createdAt: -1 }).lean()
     ]);
 
@@ -611,13 +1041,19 @@ async function getRouterBundle(routerId) {
 }
 
 function formatAuditEvent(entry) {
+    let summary = entry.reason ? `${entry.action}: ${entry.reason}` : entry.action;
+    if (entry.action === 'admin_track_router_runtime_peer') {
+        const sourceRouterName = entry.metadata?.sourceRouterName || entry.metadata?.sourceRouterId || 'source router';
+        const interfaceName = entry.metadata?.runtimePeerInterface || 'runtime peer';
+        summary = `Tracked ${interfaceName} from ${sourceRouterName}`;
+    }
     return {
         id: String(entry._id),
         type: 'admin_action',
         source: 'admin',
         actor: entry.actorUserId?.email || entry.actorUserId?.name || 'admin',
         action: entry.action,
-        summary: entry.reason ? `${entry.action}: ${entry.reason}` : entry.action,
+        summary,
         metadata: entry.metadata || {},
         timestamp: entry.createdAt
     };
@@ -713,6 +1149,21 @@ function buildRouterActivity(bundle) {
         });
     });
 
+    (router.adminNotes || []).forEach((note) => {
+        events.push({
+            id: `router-note-${router._id}-${note._id || note.createdAt}`,
+            type: 'note_added',
+            source: 'notes',
+            actor: note.author || 'system',
+            summary: note.body,
+            metadata: {
+                category: note.category || 'support',
+                pinned: Boolean(note.pinned)
+            },
+            timestamp: note.createdAt
+        });
+    });
+
     auditLogs.forEach((entry) => {
         events.push(formatAuditEvent(entry));
     });
@@ -779,8 +1230,41 @@ async function getAdminRouterDetail(routerId) {
     if (!bundle) return null;
 
     const { router, client, owner, subscription, ownerRouters } = bundle;
-    const monitoring = buildMonitoringSummary(router, client);
+    const ownerTunnelContext = isManagementOnlyRouter(router) ? resolveOwnerTunnelContext(router, ownerRouters) : null;
+    const monitoring = buildMonitoringSummary(router, client, ownerTunnelContext);
     const activity = buildRouterActivity(bundle);
+    const wireguard = buildWireGuardWorkspace(bundle, ownerTunnelContext);
+    const downstreamDiscovery = await getLatestDownstreamDiscoveryRun(router._id).catch(() => null);
+    wireguard.runtime = await fetchRouterWireGuardRuntime(String(router._id));
+    if (!wireguard.available && wireguard.runtime?.available && wireguard.runtime.peers.length) {
+        const runtimePeer = wireguard.runtime.peers[0];
+        wireguard.available = true;
+        wireguard.mode = 'router_tunnel';
+        wireguard.primaryTunnel = {
+            source: 'router_runtime',
+            sourceRouterId: String(router._id),
+            sourceRouterName: router.name || null,
+            peerId: runtimePeer.id || `runtime-${runtimePeer.publicKey || 'peer'}`,
+            peerName: runtimePeer.interface || runtimePeer.publicKey || 'runtime peer',
+            peerEnabled: !runtimePeer.disabled,
+            serverNode: router.serverNode || 'management-only',
+            vpnIp: router.vpnIp || router.discoveryInfo?.localAddress || null,
+            publicKeyFingerprint: formatPublicKeyFingerprint(runtimePeer.publicKey),
+            lastHandshake: null,
+            handshakeState: runtimePeer.lastHandshake || 'unknown',
+            transferRx: runtimePeer.rx || 0,
+            transferTx: runtimePeer.tx || 0,
+            tunnelStatus: runtimePeer.disabled ? 'peer_disabled' : 'healthy',
+            peerCreatedAt: null,
+            interfaceName: runtimePeer.interface || null,
+            endpoint: runtimePeer.endpointAddress
+                ? `${runtimePeer.endpointAddress}${runtimePeer.endpointPort ? `:${runtimePeer.endpointPort}` : ''}`
+                : null,
+            allowedIPs: runtimePeer.allowedAddress || null,
+            persistentKeepalive: runtimePeer.persistentKeepalive ?? null
+        };
+    }
+    wireguard.runtime = enrichRuntimePeersWithTracking(router, wireguard.runtime, ownerRouters);
 
     return {
         id: String(router._id),
@@ -836,7 +1320,7 @@ async function getAdminRouterDetail(routerId) {
         },
         customer: owner ? buildCustomerSummary(owner, ownerRouters.length, null, subscription) : null,
         accessPorts: buildPortsSummary(router),
-        connectivity: buildConnectivitySummary(router, client),
+        connectivity: buildConnectivitySummary(router, client, ownerTunnelContext),
         discovery: {
             localAddress: router.discoveryInfo?.localAddress || null,
             subnet: router.discoveryInfo?.subnet || null,
@@ -861,6 +1345,8 @@ async function getAdminRouterDetail(routerId) {
             failingTransport: router.failureState?.failingTransport || null
         },
         monitoring,
+        wireguard,
+        downstreamDiscovery,
         provisioning: buildProvisioningSummary(bundle),
         billing: {
             subscription: normalizeSubscription(subscription),
@@ -876,7 +1362,8 @@ async function getAdminRouterDetail(routerId) {
 async function getAdminRouterConnectivity(routerId) {
     const bundle = await getRouterBundle(routerId);
     if (!bundle) return null;
-    return buildConnectivitySummary(bundle.router, bundle.client);
+    const ownerTunnelContext = isManagementOnlyRouter(bundle.router) ? resolveOwnerTunnelContext(bundle.router, bundle.ownerRouters) : null;
+    return buildConnectivitySummary(bundle.router, bundle.client, ownerTunnelContext);
 }
 
 async function getAdminRouterPorts(routerId) {
@@ -888,7 +1375,8 @@ async function getAdminRouterPorts(routerId) {
 async function getAdminRouterMonitoring(routerId) {
     const bundle = await getRouterBundle(routerId);
     if (!bundle) return null;
-    return buildMonitoringSummary(bundle.router, bundle.client);
+    const ownerTunnelContext = isManagementOnlyRouter(bundle.router) ? resolveOwnerTunnelContext(bundle.router, bundle.ownerRouters) : null;
+    return buildMonitoringSummary(bundle.router, bundle.client, ownerTunnelContext);
 }
 
 async function getAdminRouterActivity(routerId, filters = {}) {
@@ -1090,7 +1578,6 @@ async function createManagementOnlyRouterAdmin({ userId, name, notes = '' }) {
     const router = new MikrotikRouter({
         userId: owner._id,
         name: trimmedName,
-        wireguardClientId: null,
         vpnIp: null,
         connectionMode: 'management_only',
         managementMode: 'management_only',
@@ -1387,6 +1874,7 @@ module.exports = {
     getAdminRouterFlags,
     createRouterAdmin,
     createManagementOnlyRouterAdmin,
+    trackRouterRuntimePeer,
     generateRouterSetupArtifacts,
     disableRouter,
     reactivateRouter,

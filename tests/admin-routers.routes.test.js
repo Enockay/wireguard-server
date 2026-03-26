@@ -39,6 +39,8 @@ function createRouterRouteMocks(overrides = {}) {
         async getAdminRouterDiagnostics() { return { issues: [] }; },
         async getAdminRouterNotes() { return [{ body: 'router-note' }]; },
         async getAdminRouterFlags() { return [{ flag: 'manual_review' }]; },
+        async getLatestDownstreamDiscoveryRun() { return { id: 'discovery-1', parentRouterId: router._id, discoveredRouterCount: 1, discoveredRouters: [{ ipAddress: '10.0.5.2', confidence: 'high' }] }; },
+        async discoverDownstreamMikrotiks() { return { id: 'discovery-1', parentRouterId: router._id, discoveredRouterCount: 1, candidateSubnetCount: 2, probedTargetCount: 3, discoveredRouters: [{ ipAddress: '10.0.5.2', confidence: 'high' }] }; },
         async disableRouter() { return { router }; },
         async reactivateRouter() { return { router }; },
         async reprovisionRouter() { return { router }; },
@@ -115,6 +117,14 @@ function createRouterRouteMocks(overrides = {}) {
                     };
                 }
             },
+            'services/downstream-mikrotik-discovery-service.js': {
+                async getLatestDownstreamDiscoveryRun(routerId) {
+                    return service.getLatestDownstreamDiscoveryRun(routerId);
+                },
+                async discoverDownstreamMikrotiks(routerId, options, actorContext) {
+                    return service.discoverDownstreamMikrotiks(routerId, options, actorContext);
+                }
+            },
             'models/MikrotikRouter.js': routerModel
         }
     };
@@ -146,6 +156,7 @@ test('admin router read endpoints return expected payloads and 404 when not foun
             `/api/admin/routers/${router._id}/connectivity`,
             `/api/admin/routers/${router._id}/ports`,
             `/api/admin/routers/${router._id}/monitoring`,
+            `/api/admin/routers/${router._id}/downstream-mikrotiks`,
             `/api/admin/routers/${router._id}/activity`,
             `/api/admin/routers/${router._id}/provisioning`,
             `/api/admin/routers/${router._id}/diagnostics`,
@@ -163,6 +174,7 @@ test('admin router read endpoints return expected payloads and 404 when not foun
             async getAdminRouterConnectivity() { return null; },
             async getAdminRouterPorts() { return null; },
             async getAdminRouterMonitoring() { return null; },
+            async getLatestDownstreamDiscoveryRun() { return null; },
             async getAdminRouterActivity() { return null; },
             async getAdminRouterProvisioning() { return null; },
             async getAdminRouterDiagnostics() { return null; },
@@ -177,6 +189,7 @@ test('admin router read endpoints return expected payloads and 404 when not foun
             '/api/admin/routers/missing/connectivity',
             '/api/admin/routers/missing/ports',
             '/api/admin/routers/missing/monitoring',
+            '/api/admin/routers/missing/downstream-mikrotiks',
             '/api/admin/routers/missing/activity',
             '/api/admin/routers/missing/provisioning',
             '/api/admin/routers/missing/diagnostics',
@@ -231,6 +244,9 @@ test('admin router action endpoints return expected statuses including move conf
 
         const reviewed = await request('POST', `/api/admin/routers/${router._id}/mark-reviewed`, { body: { reason: 'checked' } });
         assert.equal(reviewed.response.status, 200);
+
+        const downstream = await request('POST', `/api/admin/routers/${router._id}/downstream-mikrotiks/discover`, { body: { reason: 'topology check', dryRun: true } });
+        assert.equal(downstream.response.status, 200);
 
         const deleted = await request('DELETE', `/api/admin/routers/${router._id}`, { body: { reason: 'cleanup' } });
         assert.equal(deleted.response.status, 200);

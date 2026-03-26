@@ -54,6 +54,15 @@ async function checkAndEnforceSubscriptions() {
             const result = await enforceSubscriptionSuspension(subscription, {
                 reason: trialExpired ? 'Trial period expired' : 'Billing period ended'
             });
+            if (result?.skipped) {
+                report.skipped += 1;
+                report.items.push({
+                    subscriptionId: String(subscription._id),
+                    action: 'skipped',
+                    reason: result.reason
+                });
+                continue;
+            }
             report.suspended += 1;
             report.items.push({
                 subscriptionId: String(subscription._id),
@@ -82,15 +91,40 @@ async function checkAndEnforceSubscriptions() {
 }
 
 async function enforceSubscriptionSuspension(subscription, options = {}) {
-    const hydratedSubscription = subscription?.populate
-        ? subscription
-        : await Subscription.findById(subscription).populate('userId', '_id name email currency');
+    const subscriptionId = subscription?._id || subscription;
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - (6 * 60 * 60 * 1000));
+    const hydratedSubscription = await Subscription.findOneAndUpdate(
+        {
+            _id: subscriptionId,
+            status: { $in: ['active', 'trial'] },
+            $or: [
+                { enforcedAt: { $exists: false } },
+                { enforcedAt: null },
+                { enforcedAt: { $lte: cutoff } }
+            ]
+        },
+        {
+            $set: {
+                status: 'suspended',
+                enforcedAt: now
+            }
+        },
+        {
+            new: true
+        }
+    ).populate('userId', '_id name email currency');
+
     if (!hydratedSubscription) {
+        const existingSubscription = await Subscription.findById(subscriptionId).select('_id status enforcedAt');
+        if (existingSubscription?.status === 'suspended') {
+            return { skipped: true, reason: 'already_suspended' };
+        }
+        if (existingSubscription?.enforcedAt && existingSubscription.enforcedAt > cutoff) {
+            return { skipped: true, reason: 'recently_enforced' };
+        }
         throw new Error('Subscription not found');
     }
-
-    hydratedSubscription.status = 'suspended';
-    await hydratedSubscription.save();
 
     await suspendSubscriptionOnRouter(hydratedSubscription).catch((error) => {
         log('warn', 'billing_enforcement_router_suspend_failed', {

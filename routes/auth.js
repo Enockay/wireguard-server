@@ -417,6 +417,24 @@ function registerAuthRoutes(app) {
                 });
             }
 
+            if (user.role !== 'admin') {
+                await recordSecurityEvent({
+                    eventType: 'login_blocked',
+                    category: 'auth',
+                    severity: 'high',
+                    source: 'system',
+                    success: false,
+                    userId: user._id,
+                    ipAddress: getRequestIp(req),
+                    userAgent: getRequestUserAgent(req),
+                    reason: 'Non-admin account attempted admin console login'
+                });
+                return res.status(403).json({
+                    success: false,
+                    error: 'Only admin accounts can sign in to this console'
+                });
+            }
+
             if (user.role === 'admin' && user.twoFactorEnabled && user.twoFactorSecret) {
                 user.failedLoginCount = 0;
                 await user.save();

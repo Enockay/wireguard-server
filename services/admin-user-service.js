@@ -607,6 +607,9 @@ function buildRoutersView(routers, clientById) {
             lastSeen: router.lastSeen || null,
             firstConnectedAt: router.firstConnectedAt || null,
             setupStatus: router.status === 'pending' ? 'pending' : 'configured',
+            transferRx: linkedClient?.transferRx || 0,
+            transferTx: linkedClient?.transferTx || 0,
+            lastHandshake: linkedClient?.lastHandshake || null,
             usage: {
                 transferRx: linkedClient?.transferRx || 0,
                 transferTx: linkedClient?.transferTx || 0,

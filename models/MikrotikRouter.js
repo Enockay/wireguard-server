@@ -233,9 +233,7 @@ const mikrotikRouterSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Client',
         required: false,
-        default: null,
-        unique: true,
-        sparse: true
+        default: undefined
     },
     // VPN IP assigned to this router
     vpnIp: {
@@ -321,24 +319,15 @@ const mikrotikRouterSchema = new mongoose.Schema({
     ports: {
         winbox: {
             type: Number,
-            required: false,
-            sparse: true,
-            unique: true,
-            index: true
+            required: false
         },
         ssh: {
             type: Number,
-            required: false,
-            sparse: true,
-            unique: true,
-            index: true
+            required: false
         },
         api: {
             type: Number,
-            required: false,
-            sparse: true,
-            unique: true,
-            index: true
+            required: false
         }
     },
     // Router status
@@ -490,6 +479,42 @@ const mikrotikRouterSchema = new mongoose.Schema({
 // Compound index for user queries
 mikrotikRouterSchema.index({ userId: 1, createdAt: -1 });
 mikrotikRouterSchema.index({ status: 1, lastSeen: -1 });
+mikrotikRouterSchema.index(
+    { wireguardClientId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            wireguardClientId: { $type: 'objectId' }
+        }
+    }
+);
+mikrotikRouterSchema.index(
+    { 'ports.winbox': 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            'ports.winbox': { $type: 'number' }
+        }
+    }
+);
+mikrotikRouterSchema.index(
+    { 'ports.ssh': 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            'ports.ssh': { $type: 'number' }
+        }
+    }
+);
+mikrotikRouterSchema.index(
+    { 'ports.api': 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            'ports.api': { $type: 'number' }
+        }
+    }
+);
 mikrotikRouterSchema.index({ serverNode: 1, status: 1, createdAt: -1 });
 mikrotikRouterSchema.index({ managementMode: 1, status: 1, createdAt: -1 });
 

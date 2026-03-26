@@ -53,6 +53,7 @@ const registerFirewallRoutes = require("./routes/firewall");
 const registerNetworkConfigRoutes = require("./routes/network-config");
 const registerPaymentRoutes = require("./routes/payments");
 const registerBackupRoutes = require("./routes/backup");
+const { registerTopologyRoutes } = require("./routes/topology");
 const { requestLogger } = require("./middleware/request-logger");
 const { runTelemetryPolling } = require("./services/telemetry-service");
 const { createWebSocketServer, broadcastRouterMetric, broadcastRouterStatus } = require("./services/websocket-service");
@@ -158,6 +159,7 @@ registerPppoeRoutes(app); // Admin PPPoE management
 registerQueueRoutes(app); // Admin queue management
 registerFirewallRoutes(app); // Admin firewall management
 registerNetworkConfigRoutes(app); // Admin network configuration management
+registerTopologyRoutes(app); // Network topology and device discovery
 registerPaymentRoutes(app); // Payment gateway integrations
 registerBackupRoutes(app); // Router config backups
 (async () => {
