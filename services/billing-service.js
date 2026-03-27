@@ -2,6 +2,7 @@ const Subscription = require('../models/Subscription');
 const User = require('../models/User');
 const MikrotikRouter = require('../models/MikrotikRouter');
 const ServicePlan = require('../models/ServicePlan');
+const Transaction = require('../models/Transaction');
 const { log } = require('../wg-core');
 const RouterQueue = require('../models/RouterQueue');
 
@@ -10,6 +11,10 @@ const PRICING = {
     ROUTER_MONTHLY_PRICE: parseFloat(process.env.ROUTER_MONTHLY_PRICE || '10.00'), // $10/month per router
     TRIAL_DAYS: 7 // 1 week free trial
 };
+
+function createTransactionId(prefix = 'INV') {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+}
 
 /**
  * Check if this is user's first router (excluding the current router being created)
@@ -33,7 +38,6 @@ async function createSubscription(userId, routerId) {
             throw new Error('User not found');
         }
 
-        const Transaction = require('../models/Transaction');
         const isFirst = await isFirstRouter(userId, routerId);
 
         // Calculate dates
@@ -186,33 +190,132 @@ async function processBilling(subscriptionId) {
             return { processed: true, type: 'trial_to_paid' };
         }
 
-        // Process monthly payment
-        // TODO: Integrate with payment gateway (Stripe, PayPal, etc.)
-        // For now, we'll just update the billing cycle
+        const amountDue = Number(subscription.pricePerMonth || PRICING.ROUTER_MONTHLY_PRICE || 0);
+        const now = new Date();
+        const user = subscription.userId;
+        const userBalance = Number(user?.balance || 0);
+        const latestPendingInvoice = await Transaction.findOne({
+            userId: subscription.userId._id,
+            subscriptionId: subscription._id,
+            type: 'invoice',
+            status: 'pending'
+        }).sort({ createdAt: -1 });
 
-        subscription.currentPeriodStart = new Date();
-        subscription.currentPeriodEnd = new Date();
-        subscription.currentPeriodEnd.setMonth(subscription.currentPeriodEnd.getMonth() + 1);
-        subscription.nextBillingDate = new Date(subscription.currentPeriodEnd);
-        subscription.lastPaymentDate = new Date();
-        subscription.status = 'active';
+        if (userBalance >= amountDue) {
+            user.balance = userBalance - amountDue;
+            await user.save();
 
+            const invoice = latestPendingInvoice || new Transaction({
+                userId: subscription.userId._id,
+                type: 'invoice',
+                transactionId: createTransactionId('INV'),
+                amount: amountDue,
+                currency: user.currency || 'USD',
+                description: `Recurring billing for router ${subscription.routerId?._id || subscription.routerId}`,
+                status: 'pending',
+                paymentMethod: 'balance',
+                routerId: subscription.routerId?._id || subscription.routerId,
+                subscriptionId: subscription._id,
+                dueDate: now,
+                metadata: {
+                    planType: subscription.planType,
+                    source: 'subscription_renewal'
+                }
+            });
+
+            invoice.status = 'completed';
+            invoice.paymentMethod = 'balance';
+            invoice.settledAt = now;
+            invoice.failureReason = '';
+            invoice.metadata = {
+                ...(invoice.metadata || {}),
+                planType: subscription.planType,
+                source: 'subscription_renewal'
+            };
+            await invoice.save();
+
+            await Transaction.create({
+                userId: subscription.userId._id,
+                type: 'payment',
+                transactionId: createTransactionId('PAY'),
+                amount: amountDue,
+                currency: user.currency || 'USD',
+                description: `Balance payment for recurring billing on router ${subscription.routerId?._id || subscription.routerId}`,
+                status: 'completed',
+                paymentMethod: 'balance',
+                settledAt: now,
+                routerId: subscription.routerId?._id || subscription.routerId,
+                subscriptionId: subscription._id,
+                metadata: {
+                    source: 'subscription_renewal',
+                    appliedInvoiceId: invoice._id
+                }
+            });
+
+            subscription.currentPeriodStart = now;
+            subscription.currentPeriodEnd = new Date(now);
+            subscription.currentPeriodEnd.setMonth(subscription.currentPeriodEnd.getMonth() + 1);
+            subscription.nextBillingDate = new Date(subscription.currentPeriodEnd);
+            subscription.lastPaymentDate = now;
+            subscription.status = 'active';
+            subscription.paymentMethod = 'balance';
+
+            await subscription.save();
+            await reactivateSubscriptionOnRouter(subscription).catch((error) => {
+                log('warn', 'subscription_queue_reactivation_failed', { subscriptionId, error: error.message });
+            });
+
+            log('info', 'billing_processed', {
+                subscriptionId,
+                userId: subscription.userId._id,
+                amount: amountDue,
+                remainingBalance: user.balance
+            });
+
+            return {
+                processed: true,
+                type: 'monthly',
+                amount: amountDue,
+                nextBillingDate: subscription.nextBillingDate
+            };
+        }
+
+        if (!latestPendingInvoice) {
+            await Transaction.create({
+                userId: subscription.userId._id,
+                type: 'invoice',
+                transactionId: createTransactionId('INV'),
+                amount: amountDue,
+                currency: user.currency || 'USD',
+                description: `Recurring billing due for router ${subscription.routerId?._id || subscription.routerId}`,
+                status: 'pending',
+                paymentMethod: subscription.paymentMethod || 'manual',
+                routerId: subscription.routerId?._id || subscription.routerId,
+                subscriptionId: subscription._id,
+                dueDate: now,
+                metadata: {
+                    planType: subscription.planType,
+                    source: 'subscription_renewal_insufficient_balance'
+                }
+            });
+        }
+
+        subscription.status = 'past_due';
         await subscription.save();
-        await reactivateSubscriptionOnRouter(subscription).catch((error) => {
-            log('warn', 'subscription_queue_reactivation_failed', { subscriptionId, error: error.message });
-        });
 
-        log('info', 'billing_processed', {
+        log('warn', 'billing_insufficient_balance', {
             subscriptionId,
             userId: subscription.userId._id,
-            amount: subscription.pricePerMonth
+            amountDue,
+            userBalance
         });
 
         return {
-            processed: true,
-            type: 'monthly',
-            amount: subscription.pricePerMonth,
-            nextBillingDate: subscription.nextBillingDate
+            processed: false,
+            type: 'past_due',
+            amount: amountDue,
+            balance: userBalance,
+            reason: 'Insufficient balance for recurring billing'
         };
     } catch (error) {
         log('error', 'process_billing_error', { subscriptionId, error: error.message });

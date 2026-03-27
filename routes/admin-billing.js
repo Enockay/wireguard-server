@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const User = require('../models/User');
 const Subscription = require('../models/Subscription');
 const Transaction = require('../models/Transaction');
+const MikrotikRouter = require('../models/MikrotikRouter');
 const { requireAdminPermission } = require('../middleware/admin-auth');
 const { recordAdminAction } = require('../services/admin-audit-service');
 
@@ -104,6 +105,14 @@ function generateTransactionId(prefix = '') {
     return `${prefix}${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
 }
 
+function boolStatus(configured, label, detailWhenMissing) {
+    return {
+        configured,
+        status: configured ? 'ready' : 'needs_config',
+        detail: configured ? `${label} is configured` : detailWhenMissing
+    };
+}
+
 async function getAccountOr404(req, res) {
     const user = await User.findById(req.params.accountId);
     if (!user) {
@@ -141,6 +150,59 @@ function registerAdminBillingRoutes(app) {
             return res.json({ success: true, overview });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load billing overview', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/billing/readiness', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.VIEW_OVERVIEW), async (req, res) => {
+        try {
+            const brevoReady = Boolean(String(process.env.BREVO_API_KEY || '').trim());
+            const mpesaConsumerReady = Boolean(String(process.env.MPESA_CONSUMER_KEY || '').trim());
+            const mpesaSecretReady = Boolean(String(process.env.MPESA_CONSUMER_SECRET || '').trim());
+            const mpesaShortcodeReady = Boolean(String(process.env.MPESA_SHORTCODE || '').trim());
+            const mpesaPasskeyReady = Boolean(String(process.env.MPESA_PASSKEY || '').trim());
+            const mpesaCallbackReady = Boolean(String(process.env.MPESA_CALLBACK_URL || '').trim());
+            const publicApiReady = Boolean(String(process.env.PUBLIC_API_URL || process.env.SERVICE_URL_WIREGUARD || '').trim());
+
+            const paystackReady = Boolean(String(process.env.PAYSTACK_SECRET_KEY || '').trim());
+            const paypalReady = Boolean(String(process.env.PAYPAL_CLIENT_ID || '').trim() && String(process.env.PAYPAL_CLIENT_SECRET || '').trim());
+            const mpesaReady = mpesaConsumerReady && mpesaSecretReady && mpesaShortcodeReady && mpesaPasskeyReady && mpesaCallbackReady;
+            const topupReady = paystackReady || paypalReady;
+
+            return res.json({
+                success: true,
+                readiness: {
+                    email: boolStatus(brevoReady, 'Brevo email delivery', 'Set BREVO_API_KEY to enable invoice reminders and billing notifications'),
+                    mpesa: {
+                        configured: mpesaReady,
+                        status: mpesaReady ? 'ready' : 'needs_config',
+                        detail: mpesaReady ? 'M-Pesa STK push is configured' : 'Set MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE, MPESA_PASSKEY, and MPESA_CALLBACK_URL',
+                        sandbox: !['0', 'false', 'no', 'off'].includes(String(process.env.MPESA_SANDBOX || 'true').toLowerCase()),
+                        missing: [
+                            !mpesaConsumerReady ? 'MPESA_CONSUMER_KEY' : null,
+                            !mpesaSecretReady ? 'MPESA_CONSUMER_SECRET' : null,
+                            !mpesaShortcodeReady ? 'MPESA_SHORTCODE' : null,
+                            !mpesaPasskeyReady ? 'MPESA_PASSKEY' : null,
+                            !mpesaCallbackReady ? 'MPESA_CALLBACK_URL' : null
+                        ].filter(Boolean)
+                    },
+                    topupLinks: {
+                        configured: topupReady,
+                        status: topupReady ? 'ready' : 'needs_config',
+                        detail: topupReady ? 'At least one hosted top-up provider is configured' : 'Configure Paystack or PayPal credentials before using hosted top-up links',
+                        providers: {
+                            paystack: boolStatus(paystackReady, 'Paystack', 'Set PAYSTACK_SECRET_KEY to enable Paystack top-up links'),
+                            paypal: boolStatus(paypalReady, 'PayPal', 'Set PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET to enable PayPal top-up links')
+                        }
+                    },
+                    publicApiBase: {
+                        configured: publicApiReady,
+                        status: publicApiReady ? 'ready' : 'needs_config',
+                        detail: publicApiReady ? 'Public API base URL is available for callbacks and generated links' : 'Set PUBLIC_API_URL or SERVICE_URL_WIREGUARD so generated links and callbacks use a reachable API host'
+                    }
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load billing readiness', details: error.message });
         }
     });
 
@@ -198,6 +260,63 @@ function registerAdminBillingRoutes(app) {
         }
     });
 
+    app.get('/api/admin/billing/routers/:routerId/subscription', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.VIEW_SUBSCRIPTIONS), async (req, res) => {
+        try {
+            const router = await MikrotikRouter.findById(req.params.routerId).populate('userId', 'name email currency balance');
+            if (!router) {
+                return res.status(404).json({ success: false, error: 'Router not found' });
+            }
+
+            const account = router.userId;
+            const subscription = await Subscription.findOne({ routerId: router._id }).sort({ createdAt: -1 });
+            const openInvoiceCount = await Transaction.countDocuments({
+                userId: router.userId?._id || router.userId,
+                routerId: router._id,
+                type: 'invoice',
+                status: { $in: ['pending', 'failed'] }
+            });
+
+            return res.json({
+                success: true,
+                data: {
+                    router: {
+                        id: String(router._id),
+                        name: router.name,
+                        status: router.status,
+                        vpnIp: router.vpnIp || null,
+                        createdAt: router.createdAt
+                    },
+                    account: account ? {
+                        id: String(account._id),
+                        name: account.name,
+                        email: account.email,
+                        currency: account.currency || 'USD',
+                        balance: account.balance || 0
+                    } : null,
+                    subscription: subscription ? {
+                        id: String(subscription._id),
+                        status: subscription.status,
+                        planType: subscription.planType,
+                        pricePerMonth: subscription.pricePerMonth,
+                        currentPeriodStart: subscription.currentPeriodStart,
+                        currentPeriodEnd: subscription.currentPeriodEnd,
+                        trialEndsAt: subscription.trialEndsAt,
+                        nextBillingDate: subscription.nextBillingDate,
+                        lastPaymentDate: subscription.lastPaymentDate,
+                        paymentMethod: subscription.paymentMethod,
+                        createdAt: subscription.createdAt
+                    } : null,
+                    summary: {
+                        openInvoiceCount,
+                        hasSubscription: Boolean(subscription)
+                    }
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load router subscription billing', details: error.message });
+        }
+    });
+
     app.get('/api/admin/billing/accounts/:accountId/overview', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.VIEW_SUBSCRIPTIONS), async (req, res) => {
         try {
             const detail = await getAccountBillingOverview(req.params.accountId);
@@ -207,6 +326,68 @@ function registerAdminBillingRoutes(app) {
             return res.json({ success: true, data: detail });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load account billing overview', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/billing/accounts/:accountId/add-balance', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.RECORD_PAYMENT), async (req, res) => {
+        try {
+            const account = await getAccountOr404(req, res);
+            if (!account) {
+                return;
+            }
+
+            const amount = normalizeAmount(req.body?.amount);
+            const paymentMethod = ['paypal', 'paystack'].includes(req.body?.paymentMethod) ? req.body.paymentMethod : null;
+            const reason = normalizeReason(req.body?.reason);
+
+            if (!amount) {
+                return res.status(400).json({ success: false, error: 'A valid amount is required' });
+            }
+            if (!paymentMethod) {
+                return res.status(400).json({ success: false, error: 'A valid payment method is required' });
+            }
+
+            const transaction = await Transaction.create({
+                userId: account._id,
+                type: 'payment',
+                transactionId: `PAY-${Date.now()}-${crypto.randomBytes(5).toString('hex').toUpperCase()}`,
+                amount,
+                currency: account.currency || 'USD',
+                description: `Admin-initiated balance top-up via ${paymentMethod}`,
+                status: 'pending',
+                paymentMethod,
+                metadata: {
+                    initiatedByAdminId: req.adminUser._id,
+                    initiatedByAdminEmail: req.adminUser.email,
+                    reason
+                }
+            });
+
+            const paymentLink = paymentMethod === 'paystack'
+                ? `/api/billing/paystack/initiate?transactionId=${transaction.transactionId}`
+                : `/api/billing/paypal/initiate?transactionId=${transaction.transactionId}`;
+
+            await audit(req, account._id, 'admin_billing_add_balance', reason, {
+                amount,
+                paymentMethod,
+                transactionId: transaction.transactionId
+            });
+
+            return res.json({
+                success: true,
+                message: 'Balance top-up link created',
+                transaction: {
+                    id: String(transaction._id),
+                    transactionId: transaction.transactionId,
+                    amount: transaction.amount,
+                    currency: transaction.currency,
+                    status: transaction.status,
+                    paymentMethod: transaction.paymentMethod,
+                    paymentLink
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to create balance top-up link', details: error.message });
         }
     });
 

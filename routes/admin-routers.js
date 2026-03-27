@@ -37,6 +37,7 @@ const {
     getAdminRouterNotes,
     getAdminRouterFlags,
     createRouterAdmin,
+    createManagementOnlyRouterAdmin,
     trackRouterRuntimePeer,
     generateRouterSetupArtifacts,
     disableRouter,
@@ -55,6 +56,175 @@ function normalizeReason(value) {
 function normalizeText(value) {
     const normalized = value == null ? '' : String(value).trim();
     return normalized || null;
+}
+
+function normalizeBoolean(value, fallback = false) {
+    if (value == null || value === '') return fallback;
+    if (typeof value === 'boolean') return value;
+    const normalized = String(value).trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+}
+
+function normalizePortValue(value, fallback = null) {
+    if (value == null || value === '') return fallback;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        throw new Error('Port values must be integers between 1 and 65535');
+    }
+    return parsed;
+}
+
+function buildManualManagementEndpoints(payload = {}, connectionMode = 'wireguard') {
+    const managementHost = normalizeText(payload.managementHost || payload.managementIp || payload.localAddress || payload.host);
+    if (!managementHost) return [];
+
+    const useTls = normalizeBoolean(payload.apiUseTls, false);
+    const preferredTransport = normalizeText(payload.managementTransport || payload.transport);
+    const transport = preferredTransport || (useTls ? 'api_ssl' : 'api');
+    const apiPort = normalizePortValue(payload.apiPort, useTls ? 8729 : 8728);
+    const sshPort = normalizePortValue(payload.sshPort, 22);
+    const allowInsecureTls = normalizeBoolean(payload.allowInsecureTls, false);
+    const endpoints = [];
+    const prefersRemoteManagement = connectionMode !== 'management_only';
+
+    if (['api', 'api_ssl', 'rest_https'].includes(transport)) {
+        endpoints.push({
+            id: `manual-primary-${crypto.randomUUID()}`,
+            kind: transport === 'api_ssl'
+                ? 'local_api_tls'
+                : (transport === 'rest_https' ? 'rest_https' : 'local_api'),
+            host: managementHost,
+            port: transport === 'rest_https' ? normalizePortValue(payload.managementPort, 443) : apiPort,
+            transport,
+            source: 'manual',
+            priority: prefersRemoteManagement ? 15 : 1,
+            enabled: true,
+            allowInsecureTls,
+            hostValidation: allowInsecureTls ? 'disabled' : 'strict',
+            authScope: 'unknown',
+            health: 'unknown',
+            consecutiveFailures: 0
+        });
+    }
+
+    if (normalizeBoolean(payload.includeSshFallback, true) || transport === 'ssh') {
+        endpoints.push({
+            id: `manual-ssh-${crypto.randomUUID()}`,
+            kind: 'ssh_fallback',
+            host: managementHost,
+            port: transport === 'ssh' ? normalizePortValue(payload.managementPort, sshPort) : sshPort,
+            transport: 'ssh',
+            source: 'manual',
+            priority: transport === 'ssh' ? 1 : 90,
+            enabled: true,
+            allowInsecureTls: false,
+            hostValidation: 'disabled',
+            authScope: 'unknown',
+            health: 'unknown',
+            consecutiveFailures: 0
+        });
+    }
+
+    return endpoints;
+}
+
+async function configureRouterAccess(router, req, options = {}) {
+    const apiUsername = normalizeText(options.apiUsername);
+    const apiPassword = options.apiPassword == null ? null : String(options.apiPassword).trim();
+    const apiPort = normalizePortValue(options.apiPort, null);
+    const managementEndpoints = buildManualManagementEndpoints(options, router.connectionMode || 'wireguard');
+    const localAddress = normalizeText(options.localAddress || options.managementIp || options.managementHost);
+    const hostname = normalizeText(options.hostname);
+    const deviceDetails = normalizeText(options.deviceDetails || options.notes);
+
+    if (apiUsername) {
+        router.apiUsername = apiUsername;
+    }
+    if (apiPort != null) {
+        router.apiPort = apiPort;
+    }
+    if (managementEndpoints.length) {
+        router.managementEndpoints = managementEndpoints;
+    }
+    if (localAddress || hostname) {
+        router.discoveryInfo = {
+            ...(router.discoveryInfo || {}),
+            localAddress: localAddress || router.discoveryInfo?.localAddress || null,
+            hostname: hostname || router.discoveryInfo?.hostname || null,
+            source: 'manual'
+        };
+    }
+    if (deviceDetails) {
+        router.adminNotes = [
+            ...(router.adminNotes || []),
+            {
+                body: `Manual router onboarding details: ${deviceDetails}`,
+                category: 'provisioning',
+                pinned: false,
+                author: req.adminUser?.email || 'admin'
+            }
+        ];
+    }
+
+    let pendingCredential = null;
+    if (apiPassword != null) {
+        router.apiPassword = apiPassword;
+        pendingCredential = await rotateCredential({
+            router,
+            principal: router.apiUsername || apiUsername || 'admin',
+            secret: apiPassword,
+            transportHint: 'api',
+            apiPort: apiPort != null ? apiPort : (router.apiPort || 8728),
+            createdBy: req.adminUser.email
+        });
+        router.credentialState = router.credentialState || {};
+        router.credentialState.secretRef = pendingCredential._id;
+        router.credentialState.state = 'rotating';
+    }
+
+    await router.save();
+    return { pendingCredential };
+}
+
+async function testRouterConnection(routerId, req) {
+    const [resource, interfaces] = await Promise.all([
+        getSystemResource(routerId, getActorContext(req)),
+        getInterfaces(routerId, getActorContext(req))
+    ]);
+    const capabilities = await probeCapabilities((targetRouterId, operationName, execContext) => executeRouterOperation(
+        targetRouterId,
+        operationName,
+        execContext,
+        getActorContext(req)
+    ), routerId);
+
+    const router = await MikrotikRouter.findById(routerId);
+    if (!router) {
+        throw new Error('Router not found after connection test');
+    }
+
+    if (router.credentialState?.secretRef) {
+        await markCredentialVerified(routerId, router.credentialState.secretRef);
+    }
+
+    router.capabilities = { ...(router.capabilities || {}), ...capabilities };
+    router.credentialState = {
+        ...(router.credentialState || {}),
+        state: 'active',
+        lastVerifiedAt: new Date(),
+        verificationFailureCount: 0
+    };
+    await router.save();
+
+    return {
+        success: true,
+        resource,
+        interfaces,
+        capabilities,
+        testedAt: new Date().toISOString()
+    };
 }
 
 function resolveRequestIp(req) {
@@ -694,13 +864,17 @@ function registerAdminRouterRoutes(app) {
 
     app.post('/api/admin/routers', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
         try {
-            const userId = String(req.body?.userId || '').trim();
+            const userId = String(req.body?.userId || req.body?.customerEmail || '').trim();
             const name = String(req.body?.name || '').trim();
+            const connectionMode = String(req.body?.connectionMode || '').trim() === 'management_only' || normalizeBoolean(req.body?.managementOnly, false)
+                ? 'management_only'
+                : 'wireguard';
             const serverNode = String(req.body?.serverNode || 'wireguard').trim() || 'wireguard';
             const reason = normalizeReason(req.body?.reason);
+            const shouldTestConnection = normalizeBoolean(req.body?.testConnectionOnCreate, false);
 
             if (!userId) {
-                return res.status(400).json({ success: false, error: 'Customer user ID is required' });
+                return res.status(400).json({ success: false, error: 'Customer user ID or customer email is required' });
             }
             if (!name) {
                 return res.status(400).json({ success: false, error: 'Router name is required' });
@@ -711,12 +885,33 @@ function registerAdminRouterRoutes(app) {
                 return res.status(404).json({ success: false, error: 'Target customer not found' });
             }
 
-            const created = await createRouterAdmin({
-                userId: String(targetUser._id),
-                name,
-                serverNode,
-                notes: reason || ''
-            });
+            const created = connectionMode === 'management_only'
+                ? await createManagementOnlyRouterAdmin({
+                    userId: String(targetUser._id),
+                    name,
+                    notes: reason || ''
+                })
+                : await createRouterAdmin({
+                    userId: String(targetUser._id),
+                    name,
+                    serverNode,
+                    notes: reason || ''
+                });
+
+            await configureRouterAccess(created.router, req, req.body || {});
+
+            let connectionTest = null;
+            if (shouldTestConnection) {
+                try {
+                    connectionTest = await testRouterConnection(created.router._id, req);
+                } catch (error) {
+                    connectionTest = {
+                        success: false,
+                        error: error.message,
+                        testedAt: new Date().toISOString()
+                    };
+                }
+            }
 
             await recordAdminAction({
                 req,
@@ -726,9 +921,13 @@ function registerAdminRouterRoutes(app) {
                 action: 'admin_create_router',
                 reason,
                 metadata: {
+                    connectionMode,
+                    customerEmail: targetUser.email,
                     serverNode,
                     vpnIp: created.router.vpnIp,
-                    ports: created.router.ports
+                    ports: created.router.ports,
+                    testedOnCreate: shouldTestConnection,
+                    connectionTestSuccess: connectionTest?.success === true
                 }
             });
 
@@ -737,13 +936,23 @@ function registerAdminRouterRoutes(app) {
                 data: {
                     id: String(created.router._id),
                     name: created.router.name,
+                    customer: {
+                        id: String(created.owner._id),
+                        name: created.owner.name || null,
+                        email: created.owner.email || null
+                    },
+                    connectionMode: created.router.connectionMode,
                     vpnIp: created.router.vpnIp,
                     ports: created.router.ports,
                     status: created.router.status,
-                    wireguardConfig: created.artifacts?.wireguardConfig
+                    wireguardConfig: created.artifacts?.wireguardConfig,
+                    connectionTest
                 }
             });
         } catch (error) {
+            if (error.message === 'Port values must be integers between 1 and 65535') {
+                return res.status(400).json({ success: false, error: error.message });
+            }
             return res.status(500).json({ success: false, error: 'Failed to create router', details: error.message });
         }
     });

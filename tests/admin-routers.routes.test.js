@@ -13,6 +13,7 @@ const routeModulePath = 'routes/admin-routers.js';
 
 function createRouterRouteMocks(overrides = {}) {
     const ctx = createRouteTestContext();
+    const targetUser = overrides.targetUser || { _id: '507f1f77bcf86cd799439099', name: 'Customer One', email: 'customer@example.com', role: 'user' };
     const router = overrides.router || createDoc({
         _id: '507f1f77bcf86cd799439041',
         name: 'RTR-1',
@@ -41,6 +42,12 @@ function createRouterRouteMocks(overrides = {}) {
         async getAdminRouterFlags() { return [{ flag: 'manual_review' }]; },
         async getLatestDownstreamDiscoveryRun() { return { id: 'discovery-1', parentRouterId: router._id, discoveredRouterCount: 1, discoveredRouters: [{ ipAddress: '10.0.5.2', confidence: 'high' }] }; },
         async discoverDownstreamMikrotiks() { return { id: 'discovery-1', parentRouterId: router._id, discoveredRouterCount: 1, candidateSubnetCount: 2, probedTargetCount: 3, discoveredRouters: [{ ipAddress: '10.0.5.2', confidence: 'high' }] }; },
+        async createRouterAdmin() {
+            return { router, owner: targetUser, artifacts: { wireguardConfig: '[Interface]' } };
+        },
+        async createManagementOnlyRouterAdmin() {
+            return { router, owner: targetUser, artifacts: null };
+        },
         async disableRouter() { return { router }; },
         async reactivateRouter() { return { router }; },
         async reprovisionRouter() { return { router }; },
@@ -54,11 +61,15 @@ function createRouterRouteMocks(overrides = {}) {
 
     const routerModel = {
         findById(id) {
-            return {
-                async populate() {
-                    return id === router._id ? router : null;
-                }
-            };
+            if (id !== router._id) {
+                return {
+                    async populate() {
+                        return null;
+                    }
+                };
+            }
+            router.populate = async () => router;
+            return router;
         },
         ...overrides.routerModel
     };
@@ -125,7 +136,14 @@ function createRouterRouteMocks(overrides = {}) {
                     return service.discoverDownstreamMikrotiks(routerId, options, actorContext);
                 }
             },
-            'models/MikrotikRouter.js': routerModel
+            'models/MikrotikRouter.js': routerModel,
+            'models/User.js': {
+                async findOne(query) {
+                    if (query.email && query.email === targetUser.email) return targetUser;
+                    if (query._id && query._id === targetUser._id) return targetUser;
+                    return null;
+                }
+            }
         }
     };
 }
@@ -291,6 +309,59 @@ test('admin router api credential and connection routes update router state and 
         assert.equal(tested.json.data.credentialState.secretConfigured, true);
         assert.ok(ctx.auditCalls.some((call) => call.action === 'admin.routers.set_credentials'));
         assert.ok(ctx.auditCalls.some((call) => call.action === 'admin.routers.test_connection'));
+    });
+});
+
+test('admin router create route supports customer email, management-only setup, and connection testing', async () => {
+    const router = createDoc({
+        _id: '507f1f77bcf86cd799439081',
+        name: 'RTR-MGMT',
+        connectionMode: 'management_only',
+        managementMode: 'management_only',
+        status: 'active',
+        apiUsername: 'admin',
+        apiPassword: '',
+        apiPort: 8728,
+        managementEndpoints: [],
+        discoveryInfo: {},
+        credentialState: {},
+        capabilities: {},
+        ports: {},
+        adminNotes: [],
+        internalFlags: createSubdocCollection([])
+    });
+    const { mocks, ctx } = createRouterRouteMocks({ router });
+
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const created = await request('POST', '/api/admin/routers', {
+            body: {
+                customerEmail: 'customer@example.com',
+                name: 'RTR-MGMT',
+                connectionMode: 'management_only',
+                managementHost: '192.168.88.1',
+                hostname: 'branch-core',
+                apiUsername: 'ops-admin',
+                apiPassword: 'secret',
+                apiPort: 8728,
+                deviceDetails: 'Installed in the server room with direct API access.',
+                testConnectionOnCreate: true,
+                reason: 'manual onboarding'
+            }
+        });
+
+        assert.equal(created.response.status, 201);
+        assert.equal(created.json.data.customer.email, 'customer@example.com');
+        assert.equal(created.json.data.connectionMode, 'management_only');
+        assert.equal(created.json.data.connectionTest.success, true);
+        assert.equal(router.apiUsername, 'ops-admin');
+        assert.equal(router.apiPassword, 'secret');
+        assert.equal(router.apiPort, 8728);
+        assert.equal(router.managementEndpoints[0].host, '192.168.88.1');
+        assert.equal(router.discoveryInfo.localAddress, '192.168.88.1');
+        assert.equal(router.credentialState.secretRef, 'cred-1');
+        assert.equal(router.credentialState.state, 'active');
+        assert.ok(router.adminNotes.some((entry) => entry.body.includes('Manual router onboarding details')));
+        assert.ok(ctx.auditCalls.some((call) => call.action === 'admin_create_router'));
     });
 });
 

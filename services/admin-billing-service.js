@@ -103,6 +103,13 @@ function isBillableSubscription(subscription) {
     return subscription.planType === 'monthly' && ['active', 'past_due', 'trial'].includes(subscription.status);
 }
 
+function isManagedBillableRouter(router) {
+    if (!router) return false;
+    const managedMode = !router.managementMode || router.managementMode === 'fully_managed';
+    const activeState = ['pending', 'active', 'offline'].includes(router.status);
+    return managedMode && activeState;
+}
+
 function normalizeTransaction(transaction, user = null, subscription = null) {
     return {
         id: String(transaction._id),
@@ -138,17 +145,27 @@ function buildEntitlements(user, routers, subscriptions) {
     const gracePeriodActive = isGracePeriodActive(user);
     const suspendedForBilling = Boolean(user.billingSuspendedAt && !user.isActive);
     const overdue = summary.overdueCount > 0;
+    const activeManagedRouters = routers.filter((router) => isManagedBillableRouter(router));
+    const subscriptionsByRouterId = new Map(
+        subscriptions
+            .filter((subscription) => subscription.routerId)
+            .map((subscription) => [String(subscription.routerId), subscription])
+    );
+    const billableRouters = activeManagedRouters.filter((router) => {
+        const subscription = subscriptionsByRouterId.get(String(router._id));
+        return Boolean(subscription && isBillableSubscription(subscription));
+    }).length;
 
     return {
         routerManagementEnabled: user.isActive,
-        publicAccessPortsEnabled: user.isActive && routers.length > 0,
-        monitoringEnabled: user.isActive && routers.length > 0,
+        publicAccessPortsEnabled: user.isActive && activeManagedRouters.length > 0,
+        monitoringEnabled: user.isActive && activeManagedRouters.length > 0,
         supportTier: user.supportTier || 'standard',
         analyticsAccessEnabled: user.isActive,
         apiAccessEnabled: false,
         trialFeaturesEnabled: Boolean(user.trialEndsAt && new Date(user.trialEndsAt) > new Date()),
-        billableRouters: subscriptions.filter((subscription) => isBillableSubscription(subscription)).length,
-        activeRouters: routers.filter((router) => ['pending', 'active', 'offline'].includes(router.status)).length,
+        billableRouters,
+        activeRouters: activeManagedRouters.length,
         billingHold: overdue && !gracePeriodActive,
         gracePeriodActive,
         gracePeriodEndsAt: user.billingGracePeriodEndsAt || null,
@@ -160,9 +177,12 @@ function buildEntitlements(user, routers, subscriptions) {
 function buildBillableRouterItems(routers, subscriptionsByRouterId) {
     return routers.map((router) => {
         const subscription = subscriptionsByRouterId.get(String(router._id)) || null;
-        const billable = Boolean(subscription && isBillableSubscription(subscription));
+        const eligibleRouter = isManagedBillableRouter(router);
+        const billable = Boolean(eligibleRouter && subscription && isBillableSubscription(subscription));
         let reason = 'No subscription linked';
-        if (subscription) {
+        if (!eligibleRouter) {
+            reason = 'Excluded because router is not actively managed';
+        } else if (subscription) {
             if (subscription.planType === 'trial') reason = 'Covered by trial';
             else if (subscription.status === 'canceled' || subscription.status === 'expired') reason = `Excluded because subscription is ${subscription.status}`;
             else if (subscription.planType === 'monthly') reason = 'Counts toward monthly billing';
@@ -243,6 +263,16 @@ function buildAccountSummary(user, bundle) {
     const subscriptions = bundle.subscriptionsByUser.get(String(user._id)) || [];
     const transactions = bundle.transactionsByUser.get(String(user._id)) || [];
     const summary = summarizeSubscription(subscriptions);
+    const subscriptionsByRouterId = new Map(
+        subscriptions
+            .filter((subscription) => subscription.routerId)
+            .map((subscription) => [String(subscription.routerId), subscription])
+    );
+    const managedRouters = routers.filter((router) => isManagedBillableRouter(router));
+    const billableRouters = managedRouters.filter((router) => {
+        const subscription = subscriptionsByRouterId.get(String(router._id));
+        return Boolean(subscription && isBillableSubscription(subscription));
+    }).length;
     const pendingInvoices = transactions.filter((tx) => tx.type === 'invoice' && tx.status === 'pending');
     const failedPayments = transactions.filter((tx) => tx.type === 'payment' && tx.status === 'failed');
     const lastPayment = transactions.find((tx) => tx.type === 'payment' || tx.type === 'invoice') || null;
@@ -260,8 +290,8 @@ function buildAccountSummary(user, bundle) {
             currentPlan: summary.planType || summary.status,
             subscriptionStatus: summary.status,
             trialStatus: user.trialEndsAt && new Date(user.trialEndsAt) > new Date() ? 'trial' : 'standard',
-            billableRouters: summary.billableRouters,
-            routersCount: routers.length,
+            billableRouters,
+            routersCount: managedRouters.length,
             priceSummary: summary.monthlyValue,
             billingCycle: summary.planType === 'trial' ? 'trial' : 'monthly',
             nextBillingDate: summary.nextBillingDate,
@@ -455,7 +485,7 @@ async function getAccountBillingOverview(accountId, focusSubscriptionId = null, 
             trialEnd: user.trialEndsAt || null,
             billingCycle: summary.planType === 'trial' ? 'trial' : 'monthly',
             unitPricing: PRICING.ROUTER_MONTHLY_PRICE,
-            billableRouters: summary.billableRouters,
+            billableRouters: entitlements.billableRouters,
             estimatedRecurringValue: summary.monthlyValue,
             nextBillingDate: summary.nextBillingDate,
             overdue: summary.overdueCount > 0,
@@ -466,7 +496,7 @@ async function getAccountBillingOverview(accountId, focusSubscriptionId = null, 
         },
         entitlements,
         routers: {
-            total: routers.length,
+            total: routers.filter((router) => isManagedBillableRouter(router)).length,
             items: buildBillableRouterItems(routers, subscriptionsByRouterId)
         },
         invoices: invoices.slice(0, 10).map((tx) => normalizeTransaction(tx, user, bundle.subscriptions.find((sub) => String(sub._id) === String(tx.subscriptionId)) || null)),
@@ -498,11 +528,16 @@ async function getAccountBillableRouters(accountId) {
     const bundle = await getAccountBundle(accountId);
     if (!bundle) return null;
     const items = buildBillableRouterItems(bundle.routers, bundle.subscriptionsByRouterId);
+    const managedItems = items.filter((item) => isManagedBillableRouter({
+        _id: item.router.id,
+        status: item.router.status,
+        managementMode: bundle.routers.find((router) => String(router._id) === String(item.router.id))?.managementMode
+    }));
     return {
-        totalRouters: items.length,
-        billableRouters: items.filter((item) => item.countedTowardBilling).length,
-        freeOrTrialCoveredRouters: items.filter((item) => !item.countedTowardBilling && item.reason === 'Covered by trial').length,
-        excludedRouters: items.filter((item) => !item.countedTowardBilling && item.reason !== 'Covered by trial').length,
+        totalRouters: managedItems.length,
+        billableRouters: managedItems.filter((item) => item.countedTowardBilling).length,
+        freeOrTrialCoveredRouters: managedItems.filter((item) => !item.countedTowardBilling && item.reason === 'Covered by trial').length,
+        excludedRouters: managedItems.filter((item) => !item.countedTowardBilling && item.reason !== 'Covered by trial').length,
         items
     };
 }

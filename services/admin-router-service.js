@@ -3,13 +3,14 @@ const MikrotikRouter = require('../models/MikrotikRouter');
 const User = require('../models/User');
 const Client = require('../models/Client');
 const Subscription = require('../models/Subscription');
+const ServicePlan = require('../models/ServicePlan');
 const Transaction = require('../models/Transaction');
 const AdminAuditLog = require('../models/AdminAuditLog');
 const RouterDiscoverySession = require('../models/RouterDiscoverySession');
 const { allocatePorts, releasePorts } = require('../utils/port-allocator');
 const { generateKeys, getNextAvailableIP } = require('../utils/route-helpers');
 const { startRouterProxy, stopRouterProxy, restartRouterProxy, getProxyStatus } = require('./tcp-proxy-service');
-const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive, getServerEndpoint, getServerPublicKey } = require('../wg-core');
+const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive, getServerEndpoint, getServerPublicKey, log } = require('../wg-core');
 const { createSubscription } = require('./billing-service');
 const { sendRouterDeletedEmail } = require('./email-service');
 const { execute: executeRouterOperation } = require('./router-execution-service');
@@ -19,6 +20,7 @@ const ROUTER_NOTE_CATEGORIES = ['support', 'provisioning', 'monitoring', 'billin
 const ROUTER_FLAG_TYPES = ['provisioning_issue', 'unstable', 'under_investigation', 'vip_customer_router', 'billing_hold', 'manual_review'];
 const ROUTER_FLAG_SEVERITIES = ['low', 'medium', 'high'];
 const CLIENT_IP_RETRY_LIMIT = 5;
+const ROUTER_MONTHLY_PRICE = parseFloat(process.env.ROUTER_MONTHLY_PRICE || '10.00');
 const ADMIN_ROUTER_PERMISSIONS = {
     VIEW: 'admin.routers.view',
     VIEW_DETAILS: 'admin.routers.view_details',
@@ -54,6 +56,35 @@ function isDuplicateClientIpError(error) {
     if (error.keyPattern?.ip) return true;
     if (typeof error.message === 'string' && error.message.includes('ip')) return true;
     return error.keyValue?.ip != null;
+}
+
+function isInsufficientBalanceError(error) {
+    return /insufficient balance/i.test(String(error?.message || ''));
+}
+
+async function createPastDueSubscription(userId, routerId, reason) {
+    const existing = await Subscription.findOne({ routerId }).lean().catch(() => null);
+    if (existing) return existing;
+
+    const fallbackPlan = await ServicePlan.findOne({ isActive: true }).sort({ price: 1 }).lean().catch(() => null);
+    const now = new Date();
+
+    const subscription = new Subscription({
+        userId,
+        routerId,
+        status: 'past_due',
+        planType: 'monthly',
+        pricePerMonth: ROUTER_MONTHLY_PRICE,
+        currentPeriodStart: now,
+        currentPeriodEnd: now,
+        nextBillingDate: now,
+        paymentMethod: 'manual',
+        servicePlanId: fallbackPlan?._id || null
+    });
+
+    await subscription.save();
+    log('warn', 'admin_router_subscription_marked_past_due', { userId, routerId, reason });
+    return subscription;
 }
 
 async function createWireGuardClientRecord({
@@ -1528,7 +1559,26 @@ async function createRouterAdmin({ userId, name, serverNode = 'wireguard', notes
         });
 
         await router.save();
-        await createSubscription(owner._id, router._id);
+
+        try {
+            await createSubscription(owner._id, router._id);
+        } catch (error) {
+            if (!isInsufficientBalanceError(error)) {
+                throw error;
+            }
+
+            await createPastDueSubscription(owner._id, router._id, error.message);
+            router.adminNotes = [
+                ...(router.adminNotes || []),
+                {
+                    body: `Router created by admin with billing hold: ${error.message}`,
+                    category: 'billing',
+                    pinned: true,
+                    author: 'system'
+                }
+            ];
+            await router.save();
+        }
 
         try {
             await startRouterProxy(router._id);

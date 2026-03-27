@@ -119,11 +119,10 @@ function sortEndpoints(endpoints = []) {
 
 function classifyFailure(error) {
     const message = String(error?.message || error || '').toLowerCase();
-    if (/invalid user|cannot log in|auth|permission denied/.test(message)) return 'auth_failed';
+    if (/no route to host|ehostunreach|econnrefused|timed out|timeout|unreachable/.test(message)) return /timeout/.test(message) ? 'timeout' : 'endpoint_unreachable';
+    if (/invalid user|cannot log in|authentication failed|permission denied \(publickey|login failed|invalid user name or password/.test(message)) return 'auth_failed';
     if (/not enough permissions|permission/.test(message)) return 'permission_denied';
-    if (/timeout/.test(message)) return 'timeout';
     if (/tls|certificate|hostname/.test(message)) return 'tls_validation_failed';
-    if (/unreachable|ehostunreach|econnrefused|timed out/.test(message)) return 'endpoint_unreachable';
     return 'transport_error';
 }
 

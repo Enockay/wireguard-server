@@ -42,6 +42,7 @@ const registerAdminRouterRoutes = require("./routes/admin-routers");
 const registerAdminVpnServerRoutes = require("./routes/admin-vpn-servers");
 const registerAdminMonitoringRoutes = require("./routes/admin-monitoring");
 const registerAdminBillingRoutes = require("./routes/admin-billing");
+const registerAdminReferralRoutes = require("./routes/admin-referrals");
 const registerAdminLogRoutes = require("./routes/admin-logs");
 const registerAdminSupportRoutes = require("./routes/admin-support");
 const registerAdminManagementRoutes = require("./routes/admin-management");
@@ -150,6 +151,7 @@ registerAdminRouterRoutes(app); // Admin router management
 registerAdminVpnServerRoutes(app); // Admin VPN infrastructure management
 registerAdminMonitoringRoutes(app); // Admin monitoring and analytics
 registerAdminBillingRoutes(app); // Admin billing and subscription management
+registerAdminReferralRoutes(app); // Admin referral review and payout management
 registerAdminLogRoutes(app); // Admin logs, audit trail, and security management
 registerAdminSupportRoutes(app); // Admin support and ticket management
 registerAdminManagementRoutes(app); // Admin account management

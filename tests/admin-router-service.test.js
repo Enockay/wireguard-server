@@ -217,3 +217,148 @@ test('createRouterAdmin fails clearly after repeated VPN IP conflicts', async ()
         delete require.cache[serviceModulePath];
     });
 });
+
+test('createRouterAdmin keeps the router when billing balance is insufficient and marks subscription past due', async () => {
+    const createdSubscriptions = [];
+    const createdRouters = [];
+
+    class ClientMock {
+        constructor(data) {
+            Object.assign(this, data);
+            this._id = 'client-1';
+        }
+
+        async save() {
+            return this;
+        }
+
+        static async findByIdAndDelete() {}
+    }
+
+    class RouterMock {
+        constructor(data) {
+            Object.assign(this, data);
+            this._id = 'router-1';
+            this.adminNotes = this.adminNotes || [];
+            createdRouters.push(this);
+        }
+
+        async save() {
+            return this;
+        }
+
+        static async findByIdAndDelete() {}
+
+        static findOne(query = {}) {
+            return {
+                async lean() {
+                    if (query.routerId) {
+                        return null;
+                    }
+                    return null;
+                }
+            };
+        }
+    }
+
+    class SubscriptionMock {
+        constructor(data) {
+            Object.assign(this, data);
+            this._id = 'subscription-1';
+            createdSubscriptions.push(this);
+        }
+
+        async save() {
+            return this;
+        }
+
+        static findOne() {
+            return {
+                async lean() {
+                    return null;
+                }
+            };
+        }
+    }
+
+    const mocks = {
+        'models/MikrotikRouter.js': RouterMock,
+        'models/User.js': {
+            async findById(id) {
+                return { _id: id, role: 'user' };
+            }
+        },
+        'models/Client.js': ClientMock,
+        'models/Subscription.js': SubscriptionMock,
+        'models/ServicePlan.js': {
+            findOne() {
+                return {
+                    sort() {
+                        return {
+                            async lean() {
+                                return { _id: 'plan-1' };
+                            }
+                        };
+                    }
+                };
+            }
+        },
+        'models/Transaction.js': {},
+        'models/AdminAuditLog.js': {},
+        'utils/port-allocator.js': {
+            async allocatePorts() {
+                return { winbox: 2201, ssh: 2202, api: 2203 };
+            },
+            async releasePorts() {}
+        },
+        'utils/route-helpers.js': {
+            async generateKeys() {
+                return { privateKey: 'private-key', publicKey: 'public-key' };
+            },
+            async getNextAvailableIP() {
+                return '10.0.0.8/32';
+            }
+        },
+        'services/tcp-proxy-service.js': {
+            async startRouterProxy() {},
+            stopRouterProxy() {},
+            async restartRouterProxy() {},
+            getProxyStatus() { return null; }
+        },
+        'wg-core.js': {
+            wgLock: { async run(fn) { return fn(); } },
+            async runWgCommand() { return ''; },
+            KEEPALIVE_TIME: 25,
+            validateKeepalive(value) { return value; },
+            getServerEndpoint() { return 'vpn.test.local:51820'; },
+            async getServerPublicKey() { return 'server-public-key'; },
+            log() {}
+        },
+        'services/billing-service.js': {
+            async createSubscription() {
+                throw new Error('Insufficient balance. Required: $10, Available: $0');
+            }
+        },
+        'services/email-service.js': {
+            async sendRouterDeletedEmail() {}
+        }
+    };
+
+    await withMockedModules(mocks, async () => {
+        delete require.cache[serviceModulePath];
+        const { createRouterAdmin } = require(serviceModulePath);
+
+        const result = await createRouterAdmin({
+            userId: 'user-1',
+            name: 'Billing Hold Router'
+        });
+
+        assert.equal(result.router._id, 'router-1');
+        assert.equal(createdSubscriptions.length, 1);
+        assert.equal(createdSubscriptions[0].status, 'past_due');
+        assert.equal(createdSubscriptions[0].routerId, 'router-1');
+        assert.ok(createdRouters[0].adminNotes.some((note) => /billing hold/i.test(note.body)));
+
+        delete require.cache[serviceModulePath];
+    });
+});

@@ -8,6 +8,8 @@ public.key
 *.key
 privatekey
 publickey
+wg-flyio.conf
+kitu-mikrotik-wg-client.conf
 
 # Dependencies
 node_modules/
