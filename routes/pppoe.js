@@ -8,6 +8,7 @@ const {
     listActiveSessions,
     disconnectSession,
     listProfiles,
+    listProfileOptions,
     createProfile,
     updateProfile,
     deleteProfile
@@ -110,6 +111,16 @@ function registerPppoeRoutes(app) {
         try {
             const data = await listProfiles(req.params.routerId);
             return res.json({ success: true, data, pagination: { page: 1, limit: data.length, total: data.length, pages: 1 } });
+        } catch (error) {
+            const resolved = resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.get('/api/admin/routers/:routerId/pppoe/profile-options', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_DETAILS), async (req, res) => {
+        try {
+            const data = await listProfileOptions(req.params.routerId);
+            return res.json({ success: true, data });
         } catch (error) {
             const resolved = resolveRouterFeatureError(error);
             return res.status(resolved.status).json(resolved.payload);

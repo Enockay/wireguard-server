@@ -215,6 +215,118 @@ test('pppoe profile routes support update and delete', async () => {
     });
 });
 
+test('pppoe profile options route returns router-aware address references', async () => {
+    const ctx = createRouteTestContext();
+
+    await withRouteApp({
+        routeModulePath: 'routes/pppoe.js',
+        mocks: {
+            'middleware/admin-auth.js': ctx.adminAuth,
+            'services/admin-router-service.js': { ADMIN_ROUTER_PERMISSIONS: createPermissionProxy() },
+            'services/pppoe-service.js': {
+                async listPppoeSecrets() { return { items: [], pagination: { page: 1, limit: 20, total: 0, pages: 1 } }; },
+                async createPppoeSecret() { return {}; },
+                async updatePppoeSecret() { return {}; },
+                async deletePppoeSecret() { return {}; },
+                async listActiveSessions() { return []; },
+                async disconnectSession() { return {}; },
+                async listProfiles() { return []; },
+                async listProfileOptions() {
+                    return {
+                        localAddressOptions: [{ value: '10.0.0.1', label: '10.0.0.1 (bridge)', kind: 'address' }],
+                        remoteAddressOptions: [{ value: 'pppoe-pool', label: 'pppoe-pool (10.0.10.2-10.0.10.254)', kind: 'pool' }]
+                    };
+                },
+                async createProfile() { return {}; },
+                async updateProfile() { return {}; },
+                async deleteProfile() { return {}; }
+            },
+            'models/PppoeSecret.js': {}
+        }
+    }, async ({ request }) => {
+        const result = await request('GET', '/api/admin/routers/router-1/pppoe/profile-options');
+        assert.equal(result.response.status, 200);
+        assert.equal(result.json.data.localAddressOptions[0].value, '10.0.0.1');
+        assert.equal(result.json.data.remoteAddressOptions[0].value, 'pppoe-pool');
+    });
+});
+
+test('hotspot profile routes support update', async () => {
+    const ctx = createRouteTestContext();
+    let updatedPayload = null;
+
+    await withRouteApp({
+        routeModulePath: 'routes/hotspot.js',
+        mocks: {
+            'middleware/admin-auth.js': ctx.adminAuth,
+            'services/admin-router-service.js': { ADMIN_ROUTER_PERMISSIONS: createPermissionProxy() },
+            'services/hotspot-service.js': {
+                async listHotspotUsers() { return { items: [], pagination: { page: 1, limit: 20, total: 0, pages: 1 } }; },
+                async getHotspotUserDetail() { return { routerosId: '*1' }; },
+                async createHotspotUser() { return {}; },
+                async updateHotspotUser() { return {}; },
+                async deleteHotspotUser() { return {}; },
+                async listActiveSessions() { return []; },
+                async disconnectSession() { return {}; },
+                async generateVouchers() { return []; },
+                async listProfiles() { return []; },
+                async updateProfile(_routerId, profileId, payload) {
+                    updatedPayload = { profileId, payload };
+                    return { id: profileId, ...payload };
+                },
+                async listVouchers() { return { items: [], pagination: { page: 1, limit: 20, total: 0, pages: 1 } }; },
+                async revokeVoucher() { return {}; }
+            }
+        }
+    }, async ({ request }) => {
+        const result = await request('PUT', '/api/admin/routers/router-1/hotspot/profiles/profile-1', {
+            body: { name: 'default-small', rateLimit: '20M/10M', sessionTimeout: '1d' }
+        });
+        assert.equal(result.response.status, 200);
+        assert.deepEqual(updatedPayload, {
+            profileId: 'profile-1',
+            payload: { name: 'default-small', rateLimit: '20M/10M', sessionTimeout: '1d' }
+        });
+    });
+});
+
+test('hotspot profile routes support create', async () => {
+    const ctx = createRouteTestContext();
+    let createdPayload = null;
+
+    await withRouteApp({
+        routeModulePath: 'routes/hotspot.js',
+        mocks: {
+            'middleware/admin-auth.js': ctx.adminAuth,
+            'services/admin-router-service.js': { ADMIN_ROUTER_PERMISSIONS: createPermissionProxy() },
+            'services/hotspot-service.js': {
+                async listHotspotUsers() { return { items: [], pagination: { page: 1, limit: 20, total: 0, pages: 1 } }; },
+                async getHotspotUserDetail() { return { routerosId: '*1' }; },
+                async createHotspotUser() { return {}; },
+                async updateHotspotUser() { return {}; },
+                async deleteHotspotUser() { return {}; },
+                async listActiveSessions() { return []; },
+                async disconnectSession() { return {}; },
+                async generateVouchers() { return []; },
+                async listProfiles() { return []; },
+                async createProfile(_routerId, payload) {
+                    createdPayload = payload;
+                    return { id: '*5', ...payload };
+                },
+                async updateProfile() { return {}; },
+                async listVouchers() { return { items: [], pagination: { page: 1, limit: 20, total: 0, pages: 1 } }; },
+                async revokeVoucher() { return {}; }
+            }
+        }
+    }, async ({ request }) => {
+        const result = await request('POST', '/api/admin/routers/router-1/hotspot/profiles', {
+            body: { name: 'small-day', rateLimit: '10M/5M', sessionTimeout: '1d' }
+        });
+        assert.equal(result.response.status, 201);
+        assert.deepEqual(createdPayload, { name: 'small-day', rateLimit: '10M/5M', sessionTimeout: '1d' });
+    });
+});
+
 test('firewall nat routes support update', async () => {
     const ctx = createRouteTestContext();
     let updateCall = null;

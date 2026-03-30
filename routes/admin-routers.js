@@ -46,6 +46,7 @@ const {
     reprovisionRouter,
     reassignRouterPorts,
     markRouterProvisioningReviewed,
+    updateRouterManagementPolicy,
     deleteRouterAdmin
 } = require('../services/admin-router-service');
 
@@ -1499,6 +1500,31 @@ function registerAdminRouterRoutes(app) {
             return res.json({ success: true, message: 'Router provisioning marked as reviewed', reviewedAt: updated.provisioningReviewedAt });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to mark router as reviewed', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/management-policy', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const updated = await updateRouterManagementPolicy(req.params.id, {
+                policyProfile: req.body?.policyProfile
+            });
+            await audit(req, router, 'admin.routers.update_management_policy', normalizeReason(req.body?.reason), {
+                policyProfile: updated.policy.profile,
+                defaultMaxClass: updated.policy.defaultMaxClass,
+                approvedScopes: updated.policy.approvedScopes
+            });
+
+            return res.json({
+                success: true,
+                message: 'Router management policy updated',
+                data: updated
+            });
+        } catch (error) {
+            const statusCode = /only supported/i.test(error.message) ? 400 : (/invalid/i.test(error.message) ? 400 : 500);
+            return res.status(statusCode).json({ success: false, error: 'Failed to update router management policy', details: error.message });
         }
     });
 

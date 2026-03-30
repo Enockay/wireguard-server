@@ -10,6 +10,8 @@ const {
     disconnectSession,
     generateVouchers,
     listProfiles,
+    createProfile,
+    updateProfile,
     listVouchers,
     revokeVoucher
 } = require('../services/hotspot-service');
@@ -161,6 +163,32 @@ function registerHotspotRoutes(app) {
             return res.json({ success: true, data, pagination: { page: 1, limit: data.length, total: data.length, pages: 1 } });
         } catch (error) {
             const resolved = resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.post('/api/admin/routers/:routerId/hotspot/profiles', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const { name } = req.body || {};
+            if (!name) {
+                return res.status(400).json({ success: false, error: 'Profile name is required' });
+            }
+            const data = await createProfile(req.params.routerId, req.body || {});
+            return res.status(201).json({ success: true, data });
+        } catch (error) {
+            const resolved = resolveRouterFeatureError(error);
+            return res.status(resolved.status).json(resolved.payload);
+        }
+    });
+
+    app.put('/api/admin/routers/:routerId/hotspot/profiles/:profileId', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const data = await updateProfile(req.params.routerId, req.params.profileId, req.body || {});
+            return res.json({ success: true, data });
+        } catch (error) {
+            const resolved = error.message === 'Hotspot profile not found'
+                ? { status: 404, payload: { success: false, error: error.message } }
+                : resolveRouterFeatureError(error);
             return res.status(resolved.status).json(resolved.payload);
         }
     });

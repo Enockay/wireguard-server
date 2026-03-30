@@ -59,6 +59,7 @@ function serializeSession(doc) {
 
 function serializeProfile(record) {
     return {
+        id: record['.id'] || '',
         name: record.name || 'default',
         localAddress: record['local-address'] || '',
         remoteAddress: record['remote-address'] || '',
@@ -302,6 +303,46 @@ async function listProfiles(routerId) {
     return records.map(serializeProfile);
 }
 
+function uniqueOptions(items) {
+    const seen = new Set();
+    return items.filter((item) => {
+        const key = `${item.value}::${item.kind}`;
+        if (!item.value || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+async function listProfileOptions(routerId) {
+    await ensureRouterExists(routerId);
+    const [poolRecords, addressRecords] = await Promise.all([
+        executeCommand(routerId, '/ip/pool/print', {}, { operationName: 'get_system_resource' }).catch(() => []),
+        executeCommand(routerId, '/ip/address/print', {}, { operationName: 'get_system_resource' }).catch(() => [])
+    ]);
+
+    const poolOptions = uniqueOptions((poolRecords || []).map((record) => ({
+        value: record.name || '',
+        label: record.ranges ? `${record.name} (${record.ranges})` : (record.name || ''),
+        kind: 'pool'
+    })));
+
+    const addressOptions = uniqueOptions((addressRecords || []).map((record) => {
+        const cidr = record.address || '';
+        const address = String(cidr).split('/')[0] || '';
+        const iface = record.interface || '';
+        return {
+            value: address,
+            label: iface ? `${address} (${iface})` : address,
+            kind: 'address'
+        };
+    }));
+
+    return {
+        localAddressOptions: uniqueOptions([...addressOptions, ...poolOptions]),
+        remoteAddressOptions: uniqueOptions([...poolOptions, ...addressOptions])
+    };
+}
+
 async function createProfile(routerId, payload) {
     await ensureRouterExists(routerId);
     const {
@@ -380,6 +421,7 @@ module.exports = {
     listActiveSessions,
     disconnectSession,
     listProfiles,
+    listProfileOptions,
     createProfile,
     updateProfile,
     deleteProfile

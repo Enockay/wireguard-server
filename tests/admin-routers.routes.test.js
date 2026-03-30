@@ -55,6 +55,19 @@ function createRouterRouteMocks(overrides = {}) {
         async resetRouterPeer() { return { generatedAt: '2026-03-14T00:00:00.000Z' }; },
         async reassignRouterPorts() { return { previousPorts: { ssh: 2201 }, ports: { ssh: 2202 } }; },
         async markRouterProvisioningReviewed() { return { provisioningReviewedAt: '2026-03-14T00:00:00.000Z' }; },
+        async updateRouterManagementPolicy() {
+            return {
+                routerId: router._id,
+                policy: {
+                    profile: 'full_remote_admin',
+                    defaultMaxClass: 'network_core_mutation',
+                    allowNetworkCoreWrites: true,
+                    allowBootstrap: false,
+                    approvedScopes: ['queues', 'hotspot', 'pppoe', 'firewall', 'routes', 'interfaces'],
+                    breakGlassRequiredFor: ['bootstrap_mutation']
+                }
+            };
+        },
         async deleteRouterAdmin() { return { deleted: true }; },
         ...overrides.service
     };
@@ -328,9 +341,9 @@ test('admin router create route supports customer email, management-only setup, 
         capabilities: {},
         ports: {},
         safetyPolicy: {
-            defaultMaxClass: 'service_mutation',
-            allowNetworkCoreWrites: false,
-            approvedScopes: ['queues']
+            defaultMaxClass: 'network_core_mutation',
+            allowNetworkCoreWrites: true,
+            approvedScopes: ['queues', 'hotspot', 'pppoe', 'firewall', 'routes', 'interfaces']
         },
         adminNotes: [],
         internalFlags: createSubdocCollection([])
@@ -365,11 +378,37 @@ test('admin router create route supports customer email, management-only setup, 
         assert.equal(router.discoveryInfo.localAddress, '192.168.88.1');
         assert.equal(router.credentialState.secretRef, 'cred-1');
         assert.equal(router.credentialState.state, 'active');
-        assert.equal(router.safetyPolicy.defaultMaxClass, 'service_mutation');
-        assert.deepEqual(router.safetyPolicy.approvedScopes, ['queues']);
-        assert.equal(router.safetyPolicy.allowNetworkCoreWrites, false);
+        assert.equal(router.safetyPolicy.defaultMaxClass, 'network_core_mutation');
+        assert.deepEqual(router.safetyPolicy.approvedScopes, ['queues', 'hotspot', 'pppoe', 'firewall', 'routes', 'interfaces']);
+        assert.equal(router.safetyPolicy.allowNetworkCoreWrites, true);
         assert.ok(router.adminNotes.some((entry) => entry.body.includes('Manual router onboarding details')));
         assert.ok(ctx.auditCalls.some((call) => call.action === 'admin_create_router'));
+    });
+});
+
+test('admin router management policy route updates management-only router access profile', async () => {
+    const router = createDoc({
+        _id: '507f1f77bcf86cd799439082',
+        name: 'RTR-MGMT-POLICY',
+        connectionMode: 'management_only',
+        managementMode: 'management_only',
+        status: 'active',
+        adminNotes: [],
+        internalFlags: createSubdocCollection([])
+    });
+    const { mocks, ctx } = createRouterRouteMocks({ router });
+
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const updated = await request('POST', `/api/admin/routers/${router._id}/management-policy`, {
+            body: { policyProfile: 'full_remote_admin', reason: 'enable remote admin' }
+        });
+
+        assert.equal(updated.response.status, 200);
+        assert.equal(updated.json.data.policy.profile, 'full_remote_admin');
+        assert.equal(updated.json.data.policy.defaultMaxClass, 'network_core_mutation');
+        assert.equal(updated.json.data.policy.allowNetworkCoreWrites, true);
+        assert.deepEqual(updated.json.data.policy.approvedScopes, ['queues', 'hotspot', 'pppoe', 'firewall', 'routes', 'interfaces']);
+        assert.ok(ctx.auditCalls.some((call) => call.action === 'admin.routers.update_management_policy'));
     });
 });
 

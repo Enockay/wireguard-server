@@ -87,3 +87,27 @@ test('operation policy allows management-only queue mutations when queues scope 
     assert.equal(decision.details.capabilityRequired, 'queueWrite');
     assert.deepEqual(decision.details.approvedScopes, ['queues']);
 });
+
+test('operation policy allows management-only network core mutations when full remote admin is enabled', async () => {
+    const router = {
+        connectionMode: 'management_only',
+        managementMode: 'management_only',
+        capabilities: {
+            firewallWrite: true
+        },
+        safetyPolicy: {
+            defaultMaxClass: 'network_core_mutation',
+            allowNetworkCoreWrites: true,
+            approvedScopes: ['queues', 'hotspot', 'pppoe', 'firewall', 'routes', 'interfaces']
+        }
+    };
+
+    const decision = authorizeOperation(router, 'firewall_mutation', {
+        scope: 'firewall'
+    });
+
+    assert.equal(decision.allowed, true);
+    assert.equal(decision.reason, null);
+    assert.equal(decision.details.managementMode, 'management_only');
+    assert.equal(decision.details.capabilityRequired, 'firewallWrite');
+});

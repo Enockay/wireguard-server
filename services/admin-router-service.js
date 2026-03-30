@@ -21,6 +21,32 @@ const ROUTER_FLAG_TYPES = ['provisioning_issue', 'unstable', 'under_investigatio
 const ROUTER_FLAG_SEVERITIES = ['low', 'medium', 'high'];
 const CLIENT_IP_RETRY_LIMIT = 5;
 const ROUTER_MONTHLY_PRICE = parseFloat(process.env.ROUTER_MONTHLY_PRICE || '10.00');
+const MANAGEMENT_POLICY_PROFILES = {
+    queue_only: {
+        defaultMaxClass: 'service_mutation',
+        allowPublicEndpointWrites: false,
+        allowNetworkCoreWrites: false,
+        allowBootstrap: false,
+        breakGlassRequiredFor: ['service_mutation', 'network_core_mutation', 'bootstrap_mutation'],
+        approvedScopes: ['queues']
+    },
+    service_admin: {
+        defaultMaxClass: 'service_mutation',
+        allowPublicEndpointWrites: false,
+        allowNetworkCoreWrites: false,
+        allowBootstrap: false,
+        breakGlassRequiredFor: ['network_core_mutation', 'bootstrap_mutation'],
+        approvedScopes: ['queues', 'hotspot', 'pppoe', 'interfaces']
+    },
+    full_remote_admin: {
+        defaultMaxClass: 'network_core_mutation',
+        allowPublicEndpointWrites: false,
+        allowNetworkCoreWrites: true,
+        allowBootstrap: false,
+        breakGlassRequiredFor: ['bootstrap_mutation'],
+        approvedScopes: ['queues', 'hotspot', 'pppoe', 'firewall', 'routes', 'interfaces']
+    }
+};
 const ADMIN_ROUTER_PERMISSIONS = {
     VIEW: 'admin.routers.view',
     VIEW_DETAILS: 'admin.routers.view_details',
@@ -40,6 +66,27 @@ const ADMIN_ROUTER_PERMISSIONS = {
     LIVE_OPS: 'admin.routers.live_ops',
     RUN_COMMAND: 'admin.routers.run_command'
 };
+
+function getManagementPolicyProfile(profile = 'full_remote_admin') {
+    return MANAGEMENT_POLICY_PROFILES[profile] || MANAGEMENT_POLICY_PROFILES.full_remote_admin;
+}
+
+function inferManagementPolicyProfile(safetyPolicy = {}) {
+    for (const [profile, definition] of Object.entries(MANAGEMENT_POLICY_PROFILES)) {
+        const currentScopes = [...(safetyPolicy.approvedScopes || [])].sort();
+        const expectedScopes = [...definition.approvedScopes].sort();
+        if (
+            safetyPolicy.defaultMaxClass === definition.defaultMaxClass
+            && Boolean(safetyPolicy.allowNetworkCoreWrites) === definition.allowNetworkCoreWrites
+            && Boolean(safetyPolicy.allowBootstrap) === definition.allowBootstrap
+            && JSON.stringify(currentScopes) === JSON.stringify(expectedScopes)
+        ) {
+            return profile;
+        }
+    }
+
+    return 'custom';
+}
 
 function toDateOrNull(value) {
     if (!value) return null;
@@ -1322,6 +1369,7 @@ async function getAdminRouterDetail(routerId) {
             updatedAt: router.updatedAt
         },
         policy: {
+            profile: inferManagementPolicyProfile(router.safetyPolicy || {}),
             defaultMaxClass: router.safetyPolicy?.defaultMaxClass || 'read_only',
             allowNetworkCoreWrites: Boolean(router.safetyPolicy?.allowNetworkCoreWrites),
             allowBootstrap: Boolean(router.safetyPolicy?.allowBootstrap),
@@ -1637,12 +1685,7 @@ async function createManagementOnlyRouterAdmin({ userId, name, notes = '' }) {
         lastSeen: new Date(),
         notes: notes || '',
         safetyPolicy: {
-            defaultMaxClass: 'service_mutation',
-            allowPublicEndpointWrites: false,
-            allowNetworkCoreWrites: false,
-            allowBootstrap: false,
-            breakGlassRequiredFor: ['service_mutation', 'network_core_mutation', 'bootstrap_mutation'],
-            approvedScopes: ['queues']
+            ...getManagementPolicyProfile('full_remote_admin')
         }
     });
 
@@ -1845,6 +1888,39 @@ async function markRouterProvisioningReviewed(routerId, reviewerEmail) {
     return router;
 }
 
+async function updateRouterManagementPolicy(routerId, { policyProfile } = {}) {
+    const router = await MikrotikRouter.findById(routerId);
+    if (!router) return null;
+
+    const normalizedProfile = String(policyProfile || '').trim() || 'full_remote_admin';
+    if (!MANAGEMENT_POLICY_PROFILES[normalizedProfile]) {
+        throw new Error('Invalid management policy profile');
+    }
+
+    const managementMode = router.managementMode || (router.connectionMode === 'management_only' ? 'management_only' : 'fully_managed');
+    if (managementMode !== 'management_only') {
+        throw new Error('Management policy updates are only supported for management-only routers');
+    }
+
+    router.safetyPolicy = {
+        ...(router.safetyPolicy?.toObject ? router.safetyPolicy.toObject() : (router.safetyPolicy || {})),
+        ...getManagementPolicyProfile(normalizedProfile)
+    };
+    await router.save();
+
+    return {
+        routerId: String(router._id),
+        policy: {
+            profile: inferManagementPolicyProfile(router.safetyPolicy || {}),
+            defaultMaxClass: router.safetyPolicy?.defaultMaxClass || 'read_only',
+            allowNetworkCoreWrites: Boolean(router.safetyPolicy?.allowNetworkCoreWrites),
+            allowBootstrap: Boolean(router.safetyPolicy?.allowBootstrap),
+            approvedScopes: router.safetyPolicy?.approvedScopes || [],
+            breakGlassRequiredFor: router.safetyPolicy?.breakGlassRequiredFor || []
+        }
+    };
+}
+
 async function deleteRouterAdmin(routerId) {
     const bundle = await getRouterBundle(routerId);
     if (!bundle) return null;
@@ -1932,5 +2008,7 @@ module.exports = {
     reprovisionRouter,
     reassignRouterPorts,
     markRouterProvisioningReviewed,
+    updateRouterManagementPolicy,
+    MANAGEMENT_POLICY_PROFILES,
     deleteRouterAdmin
 };

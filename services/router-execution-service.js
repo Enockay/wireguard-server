@@ -132,6 +132,7 @@ function filterEndpoints(endpoints = [], context = {}) {
 function classifyFailure(error) {
     const message = String(error?.message || error || '').toLowerCase();
     if (/invalid user|cannot log in|authentication failed|permission denied \(publickey|login failed|invalid user name or password/.test(message)) return 'auth_failed';
+    if (/invalid time value|invalid value|expected end of command|failure: can't/.test(message)) return 'transport_error';
     if (/no route to host|ehostunreach|econnrefused|timed out|timeout|unreachable/.test(message)) return /timed out|operation timed out|\btimeout\b/.test(message) ? 'timeout' : 'endpoint_unreachable';
     if (/not enough permissions|permission/.test(message)) return 'permission_denied';
     if (/tls|certificate|hostname/.test(message)) return 'tls_validation_failed';
@@ -328,6 +329,11 @@ async function execute(routerId, operationName, context = {}, actorContext = {})
 
             let result;
             if (endpoint.transport === 'ssh') {
+                if (context.attributes && Object.keys(context.attributes).length > 0) {
+                    const unsupported = new Error('Structured RouterOS commands with attributes are not supported over SSH fallback');
+                    unsupported.failureType = 'transport_error';
+                    throw unsupported;
+                }
                 const sshResult = await executeRouterOSCommand(
                     endpoint.host,
                     context.command,

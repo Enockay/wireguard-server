@@ -14,13 +14,22 @@ function toNumber(value) {
     return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+function normalizeRecords(result) {
+    if (Array.isArray(result)) return result;
+    if (Array.isArray(result?.data)) return result.data;
+    if (Array.isArray(result?.items)) return result.items;
+    if (Array.isArray(result?.records)) return result.records;
+    return [];
+}
+
 async function listDhcpLeases(routerId) {
-    const records = await executeCommand(routerId, '/ip/dhcp-server/lease/print', {}, {
+    const result = await executeCommand(routerId, '/ip/dhcp-server/lease/print', {}, {
         operationName: 'get_system_resource',
         scope: 'interfaces'
     });
+    const records = normalizeRecords(result);
 
-    return (records || []).map((record) => ({
+    return records.map((record) => ({
         routerosId: record['.id'] || '',
         address: record.address || '',
         macAddress: record['mac-address'] || '',
@@ -49,12 +58,13 @@ async function deleteLease(routerId, routerosId) {
 }
 
 async function listWirelessClients(routerId) {
-    const records = await executeCommand(routerId, '/interface/wireless/registration-table/print', {}, {
+    const result = await executeCommand(routerId, '/interface/wireless/registration-table/print', {}, {
         operationName: 'get_system_resource',
         scope: 'interfaces'
     });
+    const records = normalizeRecords(result);
 
-    return (records || []).map((record) => ({
+    return records.map((record) => ({
         macAddress: record['mac-address'] || '',
         interface: record.interface || '',
         signal: toNumber(record.signal || record['signal-strength']),
@@ -67,12 +77,13 @@ async function listWirelessClients(routerId) {
 }
 
 async function listInterfaces(routerId) {
-    const records = await executeCommand(routerId, '/interface/print', {}, {
+    const result = await executeCommand(routerId, '/interface/print', {}, {
         operationName: 'get_interfaces',
         scope: 'interfaces'
     });
+    const records = normalizeRecords(result);
 
-    return (records || []).map((record) => ({
+    return records.map((record) => ({
         name: record.name || '',
         type: record.type || '',
         mtu: toNumber(record.mtu),

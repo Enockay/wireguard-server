@@ -40,6 +40,10 @@ const routerQueueSchema = new mongoose.Schema({
         type: String,
         trim: true
     },
+    isDynamic: {
+        type: Boolean,
+        default: false
+    },
     linkedSubscriptionId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Subscription'
@@ -47,6 +51,19 @@ const routerQueueSchema = new mongoose.Schema({
     linkedServicePlanId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'ServicePlan'
+    },
+    overrideSourceType: {
+        type: String,
+        enum: ['hotspot_user', 'pppoe_secret', 'manual'],
+        trim: true
+    },
+    overrideSourceId: {
+        type: String,
+        trim: true
+    },
+    overrideSourceName: {
+        type: String,
+        trim: true
     },
     queueType: {
         type: String,

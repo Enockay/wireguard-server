@@ -126,8 +126,10 @@ function serializeHotspotSession(doc) {
 
 function serializeHotspotProfile(record) {
     return {
+        id: record['.id'] || '',
         name: record.name || 'default',
         rateLimit: record['rate-limit'] || '',
+        comment: record.comment || '',
         sessionTimeout: record['session-timeout'] || '',
         idleTimeout: record['idle-timeout'] || ''
     };
@@ -650,6 +652,71 @@ async function listProfiles(routerId) {
     return records.map(serializeHotspotProfile);
 }
 
+async function createProfile(routerId, payload) {
+    await ensureRouterExists(routerId);
+    const {
+        name,
+        rateLimit = '',
+        sessionTimeout = '',
+        idleTimeout = '',
+        comment = ''
+    } = payload;
+
+    const attributes = { name };
+    if (rateLimit) attributes['rate-limit'] = rateLimit;
+    if (sessionTimeout) attributes['session-timeout'] = sessionTimeout;
+    if (idleTimeout) attributes['idle-timeout'] = idleTimeout;
+    if (comment) attributes.comment = comment;
+
+    await executeCommand(routerId, '/ip/hotspot/user/profile/add', attributes, { operationName: 'hotspot_mutation', scope: 'hotspot' });
+
+    const records = await executeCommand(routerId, '/ip/hotspot/user/profile/print', {}, { operationName: 'get_system_resource' });
+    const profile = records.find((item) => item.name === name);
+    return serializeHotspotProfile(profile || {
+        '.id': '',
+        name,
+        'rate-limit': rateLimit,
+        'session-timeout': sessionTimeout,
+        'idle-timeout': idleTimeout,
+        comment
+    });
+}
+
+async function updateProfile(routerId, profileId, payload) {
+    await ensureRouterExists(routerId);
+    const records = await executeCommand(routerId, '/ip/hotspot/user/profile/print', {}, { operationName: 'get_system_resource' });
+    const profile = records.find((item) => item['.id'] === profileId || item.name === profileId);
+    if (!profile) {
+        throw new Error('Hotspot profile not found');
+    }
+
+    const nextName = payload.name != null ? String(payload.name || '').trim() : profile.name || 'default';
+    const nextRateLimit = payload.rateLimit != null ? payload.rateLimit || '' : profile['rate-limit'] || '';
+    const nextSessionTimeout = payload.sessionTimeout != null ? payload.sessionTimeout || '' : profile['session-timeout'] || '';
+    const nextIdleTimeout = payload.idleTimeout != null ? payload.idleTimeout || '' : profile['idle-timeout'] || '';
+    const nextComment = payload.comment != null ? payload.comment || '' : profile.comment || '';
+
+    const attributes = {
+        '.id': profile['.id'],
+        name: nextName
+    };
+    if (nextRateLimit) attributes['rate-limit'] = nextRateLimit;
+    if (nextSessionTimeout) attributes['session-timeout'] = nextSessionTimeout;
+    if (nextIdleTimeout) attributes['idle-timeout'] = nextIdleTimeout;
+    if (nextComment) attributes.comment = nextComment;
+
+    await executeCommand(routerId, '/ip/hotspot/user/profile/set', attributes, { operationName: 'hotspot_mutation', scope: 'hotspot' });
+
+    return {
+        id: profile['.id'] || '',
+        name: nextName,
+        rateLimit: nextRateLimit,
+        comment: nextComment,
+        sessionTimeout: nextSessionTimeout,
+        idleTimeout: nextIdleTimeout
+    };
+}
+
 module.exports = {
     listHotspotUsers,
     getHotspotUserDetail,
@@ -660,6 +727,8 @@ module.exports = {
     disconnectSession,
     generateVouchers,
     listProfiles,
+    createProfile,
+    updateProfile,
     listVouchers,
     revokeVoucher
 };

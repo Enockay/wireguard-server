@@ -16,6 +16,9 @@ function resolveRouterFeatureError(error, notFoundMessage = 'Router not found') 
     if (message === notFoundMessage) {
         return { status: 404, payload: { success: false, error: message } };
     }
+    if (/Dynamic queues cannot/i.test(message) || /Queue update was not applied/i.test(message) || /could not be verified/i.test(message) || /already have such name/i.test(message)) {
+        return { status: 400, payload: { success: false, error: message } };
+    }
     if (message === 'capability_missing' || error?.failureType === 'capability_missing') {
         return { status: 403, payload: { success: false, error: 'Router capability missing', code: 'capability_missing' } };
     }
@@ -54,7 +57,7 @@ function registerQueueRoutes(app) {
 
     app.put('/api/admin/routers/:routerId/queues/:queueId', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
         try {
-            const queue = await RouterQueue.findOne({ _id: req.params.queueId, routerId: req.params.routerId });
+            const queue = await RouterQueue.findOne({ _id: req.params.queueId, routerId: req.params.routerId, isActive: true });
             if (!queue) {
                 return res.status(404).json({ success: false, error: 'Queue not found' });
             }
@@ -70,7 +73,7 @@ function registerQueueRoutes(app) {
 
     app.delete('/api/admin/routers/:routerId/queues/:queueId', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
         try {
-            const queue = await RouterQueue.findOne({ _id: req.params.queueId, routerId: req.params.routerId });
+            const queue = await RouterQueue.findOne({ _id: req.params.queueId, routerId: req.params.routerId, isActive: true });
             if (!queue) {
                 return res.status(404).json({ success: false, error: 'Queue not found' });
             }
