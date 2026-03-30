@@ -19,10 +19,14 @@ function normalizeMacAddress(value) {
     return /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(normalized) ? normalized.toLowerCase() : null;
 }
 
-function inferDeviceType(deviceData = {}) {
+function inferDeviceProfile(deviceData = {}) {
     const explicitType = normalizeString(deviceData.deviceType);
     if (explicitType && explicitType !== 'unknown') {
-        return explicitType;
+        return {
+            deviceType: explicitType,
+            classificationConfidence: 100,
+            classificationEvidence: ['manual_device_type']
+        };
     }
 
     const source = normalizeString(deviceData.discoverySource) || 'unknown';
@@ -42,16 +46,76 @@ function inferDeviceType(deviceData = {}) {
     const routerLike = /(routeros|mikrotik|\brouter\b|\bgateway\b|\bcore\b|\bedge\b|\brtr\b|rb\d|hap|hex|ccr|gateway)/;
     const accessPointLike = /(access point|access-point|\bap\b|\bcap\b|\bcpe\b|\bwap\b|\beap\b|\bssid\b|\bwifi\b)/;
     const switchLike = /(switch|crs|css|ethernet switch|gs108|sg\d+)/;
+    const openPorts = Array.isArray(deviceData.openPorts)
+        ? deviceData.openPorts.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+        : [];
+    const clientCount = Number(deviceData.clientCount || 0);
+    const evidence = [];
 
-    if (phoneLike.test(descriptor)) return 'client';
-    if (source === 'bgp') return 'router';
-    if (routerLike.test(descriptor)) return 'router';
-    if (switchLike.test(descriptor)) return 'switch';
-    if (accessPointLike.test(descriptor)) return 'access_point';
-    if (source === 'neighbor') return 'router';
-    if (['wireless', 'wireguard', 'pppoe', 'hotspot', 'arp'].includes(source)) return 'client';
+    if (phoneLike.test(descriptor)) {
+        evidence.push('endpoint_descriptor_match');
+        return { deviceType: 'client', classificationConfidence: 88, classificationEvidence: evidence };
+    }
 
-    return 'unknown';
+    if (source === 'bgp') {
+        evidence.push('bgp_peer');
+        return { deviceType: 'router', classificationConfidence: 96, classificationEvidence: evidence };
+    }
+
+    if (source === 'neighbor') {
+        evidence.push('neighbor_discovery');
+        if (switchLike.test(descriptor)) {
+            evidence.push('switch_descriptor_match');
+            return { deviceType: 'switch', classificationConfidence: 85, classificationEvidence: evidence };
+        }
+        if (accessPointLike.test(descriptor)) {
+            evidence.push('access_point_descriptor_match');
+            return { deviceType: 'access_point', classificationConfidence: 84, classificationEvidence: evidence };
+        }
+        evidence.push('infrastructure_neighbor');
+        return { deviceType: 'router', classificationConfidence: 90, classificationEvidence: evidence };
+    }
+
+    if (routerLike.test(descriptor)) {
+        evidence.push('router_descriptor_match');
+        return { deviceType: 'router', classificationConfidence: 82, classificationEvidence: evidence };
+    }
+
+    if (switchLike.test(descriptor)) {
+        evidence.push('switch_descriptor_match');
+        return { deviceType: 'switch', classificationConfidence: 80, classificationEvidence: evidence };
+    }
+
+    if (accessPointLike.test(descriptor)) {
+        evidence.push('access_point_descriptor_match');
+        return { deviceType: 'access_point', classificationConfidence: 78, classificationEvidence: evidence };
+    }
+
+    if (openPorts.some((port) => [22, 80, 443, 8291, 161].includes(port))) {
+        evidence.push('management_port_detected');
+        return { deviceType: 'router', classificationConfidence: 68, classificationEvidence: evidence };
+    }
+
+    if (clientCount > 0) {
+        evidence.push('downstream_client_count');
+        return { deviceType: 'access_point', classificationConfidence: 72, classificationEvidence: evidence };
+    }
+
+    if (['wireless', 'wireguard', 'pppoe', 'hotspot'].includes(source)) {
+        evidence.push(`${source}_session`);
+        return { deviceType: 'client', classificationConfidence: 74, classificationEvidence: evidence };
+    }
+
+    if (source === 'arp') {
+        evidence.push('arp_presence_only');
+        return { deviceType: 'unknown', classificationConfidence: 35, classificationEvidence: evidence };
+    }
+
+    return {
+        deviceType: 'unknown',
+        classificationConfidence: 20,
+        classificationEvidence: evidence.length ? evidence : ['insufficient_signals']
+    };
 }
 
 function getDeviceTypePriority(deviceType) {
@@ -94,16 +158,23 @@ function mergeDeviceRecord(existing = {}, incoming = {}) {
     const incomingType = normalizeString(incoming.deviceType) || 'unknown';
     const existingSource = normalizeString(existing.discoverySource) || 'unknown';
     const incomingSource = normalizeString(incoming.discoverySource) || 'unknown';
+    const existingConfidence = Number(existing.classificationConfidence || 0);
+    const incomingConfidence = Number(incoming.classificationConfidence || 0);
+    const keepExistingType =
+        getDeviceTypePriority(existingType) > getDeviceTypePriority(incomingType) ||
+        (getDeviceTypePriority(existingType) === getDeviceTypePriority(incomingType) && existingConfidence >= incomingConfidence);
 
     return {
         ...existing,
         ...incoming,
-        deviceType: getDeviceTypePriority(existingType) >= getDeviceTypePriority(incomingType)
-            ? existingType
-            : incomingType,
+        deviceType: keepExistingType ? existingType : incomingType,
         discoverySource: getDiscoverySourcePriority(existingSource) >= getDiscoverySourcePriority(incomingSource)
             ? existingSource
             : incomingSource,
+        classificationConfidence: keepExistingType ? existingConfidence : incomingConfidence,
+        classificationEvidence: keepExistingType
+            ? (Array.isArray(existing.classificationEvidence) ? existing.classificationEvidence : [])
+            : (Array.isArray(incoming.classificationEvidence) ? incoming.classificationEvidence : []),
         manufacturer: normalizeString(existing.manufacturer) || normalizeString(incoming.manufacturer),
         model: normalizeString(existing.model) || normalizeString(incoming.model),
         interfaceName: normalizeString(existing.interfaceName) || normalizeString(incoming.interfaceName),
@@ -175,11 +246,14 @@ function buildDeviceSelector(parentRouterId, identityParts) {
 }
 
 function sanitizeDeviceData(deviceData = {}) {
+    const inferredProfile = inferDeviceProfile(deviceData);
     const sanitized = {
         ...deviceData,
         deviceId: normalizeString(deviceData.deviceId),
         deviceName: normalizeString(deviceData.deviceName),
-        deviceType: inferDeviceType(deviceData),
+        deviceType: inferredProfile.deviceType,
+        classificationConfidence: inferredProfile.classificationConfidence,
+        classificationEvidence: inferredProfile.classificationEvidence,
         ipAddress: normalizeString(deviceData.ipAddress),
         macAddress: normalizeMacAddress(deviceData.macAddress),
         publicKey: normalizeString(deviceData.publicKey),
@@ -203,10 +277,9 @@ function sanitizeDeviceData(deviceData = {}) {
     return { sanitized, identityParts };
 }
 
-function buildLiveTopologyFilter(parentRouterId) {
+function buildTopologyFilter(parentRouterId) {
     return {
         parentRouterId,
-        isOnline: true,
         discoverySource: {
             $in: ['neighbor', 'bgp', 'wireless', 'wireguard', 'pppoe', 'hotspot', 'manual']
         }
@@ -220,7 +293,7 @@ async function getConnectedDevicesWithLocations(parentRouterId) {
     const routerObjectId = toObjectId(parentRouterId);
     await reclassifyUnknownDevices(parentRouterId);
 
-    const devices = await ConnectedDevice.find(buildLiveTopologyFilter(routerObjectId))
+    const devices = await ConnectedDevice.find(buildTopologyFilter(routerObjectId))
         .populate('trackedRouterId', 'name status')
         .sort({ lastSeen: -1 });
 
@@ -242,7 +315,7 @@ async function getNetworkTopology(parentRouterId) {
 
     // Get direct connections
     const directConnections = await ConnectedDevice.find({
-        ...buildLiveTopologyFilter(parentRouterId),
+        ...buildTopologyFilter(parentRouterId),
         isManagedByUser: true
     }).populate('trackedRouterId');
 
@@ -268,7 +341,7 @@ async function getNetworkTopology(parentRouterId) {
             });
 
             const childConnections = await ConnectedDevice.find({
-                ...buildLiveTopologyFilter(device.trackedRouterId._id)
+                ...buildTopologyFilter(device.trackedRouterId._id)
             }).limit(10); // Limit to 10 per tier to avoid too much data
 
             topology.connections.push({
@@ -426,15 +499,21 @@ async function reclassifyUnknownDevices(parentRouterId) {
 
     const operations = unknownDevices
         .map((device) => {
-            const inferredType = inferDeviceType(device.toObject ? device.toObject() : device);
-            if (!inferredType || inferredType === 'unknown') {
+            const inferredProfile = inferDeviceProfile(device.toObject ? device.toObject() : device);
+            if (!inferredProfile?.deviceType || inferredProfile.deviceType === 'unknown') {
                 return null;
             }
 
             return {
                 updateOne: {
                     filter: { _id: device._id },
-                    update: { $set: { deviceType: inferredType } }
+                    update: {
+                        $set: {
+                            deviceType: inferredProfile.deviceType,
+                            classificationConfidence: inferredProfile.classificationConfidence,
+                            classificationEvidence: inferredProfile.classificationEvidence
+                        }
+                    }
                 }
             };
         })
@@ -457,7 +536,7 @@ async function reclassifyUnknownDevices(parentRouterId) {
 async function getConnectionStats(parentRouterId) {
     await reclassifyUnknownDevices(parentRouterId);
     const stats = await ConnectedDevice.aggregate([
-        { $match: buildLiveTopologyFilter(toObjectId(parentRouterId)) },
+        { $match: buildTopologyFilter(toObjectId(parentRouterId)) },
         {
             $group: {
                 _id: null,
@@ -479,6 +558,12 @@ async function getConnectionStats(parentRouterId) {
                 },
                 clients: {
                     $sum: { $cond: [{ $eq: ['$deviceType', 'client'] }, 1, 0] }
+                },
+                switches: {
+                    $sum: { $cond: [{ $eq: ['$deviceType', 'switch'] }, 1, 0] }
+                },
+                unknown: {
+                    $sum: { $cond: [{ $eq: ['$deviceType', 'unknown'] }, 1, 0] }
                 }
             }
         }
@@ -493,7 +578,9 @@ async function getConnectionStats(parentRouterId) {
         avgBandwidth: 0,
         accessPoints: 0,
         routers: 0,
-        clients: 0
+        clients: 0,
+        switches: 0,
+        unknown: 0
     };
 }
 
@@ -503,7 +590,7 @@ async function getConnectionStats(parentRouterId) {
 async function getDevicesClustered(parentRouterId, zoom = 4) {
     // Simple clustering by region
     const devices = await ConnectedDevice.find({
-        ...buildLiveTopologyFilter(parentRouterId),
+        ...buildTopologyFilter(parentRouterId),
         latitude: { $exists: true, $ne: null },
         longitude: { $exists: true, $ne: null }
     }).select('deviceName latitude longitude location isOnline deviceType');

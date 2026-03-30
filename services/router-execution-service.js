@@ -117,6 +117,18 @@ function sortEndpoints(endpoints = []) {
         });
 }
 
+function filterEndpoints(endpoints = [], context = {}) {
+    const allowedTransports = Array.isArray(context.allowedTransports)
+        ? context.allowedTransports.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+        : [];
+
+    if (!allowedTransports.length) {
+        return endpoints;
+    }
+
+    return endpoints.filter((endpoint) => allowedTransports.includes(String(endpoint.transport || '').toLowerCase()));
+}
+
 function classifyFailure(error) {
     const message = String(error?.message || error || '').toLowerCase();
     if (/no route to host|ehostunreach|econnrefused|timed out|timeout|unreachable/.test(message)) return /timeout/.test(message) ? 'timeout' : 'endpoint_unreachable';
@@ -304,7 +316,7 @@ async function execute(routerId, operationName, context = {}, actorContext = {})
         throw err;
     }
 
-    const endpoints = sortEndpoints(buildDefaultEndpoints(router, credential));
+    const endpoints = filterEndpoints(sortEndpoints(buildDefaultEndpoints(router, credential)), context);
     const startedAt = Date.now();
     const transportChain = [];
     let snapshot = null;

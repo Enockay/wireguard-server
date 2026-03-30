@@ -114,7 +114,7 @@ function boolStatus(configured, label, detailWhenMissing) {
 }
 
 async function getAccountOr404(req, res) {
-    const user = await User.findById(req.params.accountId);
+    const user = await User.findOne({ _id: req.params.accountId, role: { $ne: 'admin' } });
     if (!user) {
         res.status(404).json({ success: false, error: 'Account not found' });
         return null;
@@ -262,12 +262,15 @@ function registerAdminBillingRoutes(app) {
 
     app.get('/api/admin/billing/routers/:routerId/subscription', requireAdminPermission(ADMIN_BILLING_PERMISSIONS.VIEW_SUBSCRIPTIONS), async (req, res) => {
         try {
-            const router = await MikrotikRouter.findById(req.params.routerId).populate('userId', 'name email currency balance');
+            const router = await MikrotikRouter.findById(req.params.routerId).populate('userId', 'name email currency balance role');
             if (!router) {
                 return res.status(404).json({ success: false, error: 'Router not found' });
             }
 
             const account = router.userId;
+            if (account?.role === 'admin') {
+                return res.status(404).json({ success: false, error: 'No billing account is linked to this router' });
+            }
             const subscription = await Subscription.findOne({ routerId: router._id }).sort({ createdAt: -1 });
             const openInvoiceCount = await Transaction.countDocuments({
                 userId: router.userId?._id || router.userId,
@@ -443,7 +446,7 @@ function registerAdminBillingRoutes(app) {
             if (!accountId || !description || !String(description).trim() || !amount) {
                 return res.status(400).json({ success: false, error: 'accountId, amount, and description are required' });
             }
-            const user = await User.findById(accountId);
+            const user = await User.findOne({ _id: accountId, role: { $ne: 'admin' } });
             if (!user) {
                 return res.status(404).json({ success: false, error: 'Account not found' });
             }
@@ -501,7 +504,10 @@ function registerAdminBillingRoutes(app) {
             if (!invoice) {
                 return res.status(404).json({ success: false, error: 'Invoice not found' });
             }
-            const user = await User.findById(invoice.userId).lean();
+            const user = await User.findOne({ _id: invoice.userId, role: { $ne: 'admin' } }).lean();
+            if (!user) {
+                return res.status(404).json({ success: false, error: 'Invoice account not found' });
+            }
             const pdf = buildSimplePdf([
                 process.env.COMPANY_NAME || 'Blackie Networks',
                 'Invoice',
@@ -552,7 +558,7 @@ function registerAdminBillingRoutes(app) {
             if (!accountId || !description || !String(description).trim() || !paymentMethod || !amount) {
                 return res.status(400).json({ success: false, error: 'accountId, amount, description, and paymentMethod are required' });
             }
-            const user = await User.findById(accountId);
+            const user = await User.findOne({ _id: accountId, role: { $ne: 'admin' } });
             if (!user) {
                 return res.status(404).json({ success: false, error: 'Account not found' });
             }
@@ -613,7 +619,7 @@ function registerAdminBillingRoutes(app) {
             if (!accountId || !description || !String(description).trim() || !amount || !reason) {
                 return res.status(400).json({ success: false, error: 'accountId, amount, description, and reason are required' });
             }
-            const user = await User.findById(accountId);
+            const user = await User.findOne({ _id: accountId, role: { $ne: 'admin' } });
             if (!user) {
                 return res.status(404).json({ success: false, error: 'Account not found' });
             }
@@ -670,8 +676,9 @@ function registerAdminBillingRoutes(app) {
             const start = new Date();
             start.setDate(start.getDate() - days);
             const transactions = await Transaction.find({ createdAt: { $gte: start } }).sort({ createdAt: 1 }).lean();
-            const users = await User.find({ _id: { $in: [...new Set(transactions.map((tx) => String(tx.userId)).filter(Boolean))] } }).lean();
+            const users = await User.find({ _id: { $in: [...new Set(transactions.map((tx) => String(tx.userId)).filter(Boolean))] }, role: { $ne: 'admin' } }).lean();
             const usersById = new Map(users.map((user) => [String(user._id), user]));
+            const allowedUserIds = new Set(users.map((user) => String(user._id)));
             const seriesMap = new Map();
             const revenueByUser = new Map();
             const bucketKey = (date) => {
@@ -699,6 +706,9 @@ function registerAdminBillingRoutes(app) {
                     seriesMap.set(key, { date: key, revenue: 0, invoices: 0, failedPayments: 0 });
                 }
                 const bucket = seriesMap.get(key);
+                if (!allowedUserIds.has(String(tx.userId))) {
+                    continue;
+                }
                 if (tx.type === 'payment' && tx.status === 'completed') {
                     bucket.revenue += tx.amount || 0;
                     totalRevenue += tx.amount || 0;
@@ -761,9 +771,10 @@ function registerAdminBillingRoutes(app) {
                     item.oldestInvoiceDate = invoice.createdAt || null;
                 }
             }
-            const users = await User.find({ _id: { $in: [...grouped.keys()] } }).lean();
+            const users = await User.find({ _id: { $in: [...grouped.keys()] }, role: { $ne: 'admin' } }).lean();
             const usersById = new Map(users.map((user) => [String(user._id), user]));
             const accounts = [...grouped.values()]
+                .filter((item) => usersById.has(item.accountId))
                 .map((item) => ({
                     accountId: item.accountId,
                     name: usersById.get(item.accountId)?.name || 'Unknown',
@@ -869,6 +880,10 @@ function registerAdminBillingRoutes(app) {
             if (!subscription) {
                 return res.status(404).json({ success: false, error: 'Subscription not found' });
             }
+            const targetUser = await User.findOne({ _id: subscription.userId, role: { $ne: 'admin' } }).select('_id');
+            if (!targetUser) {
+                return res.status(404).json({ success: false, error: 'Subscription account not found' });
+            }
             const updated = await enforceSubscriptionSuspension(subscription, {
                 reason: normalizeReason(req.body?.reason) || 'Manually suspended by admin'
             });
@@ -891,6 +906,10 @@ function registerAdminBillingRoutes(app) {
             const subscription = await Subscription.findById(req.params.id);
             if (!subscription) {
                 return res.status(404).json({ success: false, error: 'Subscription not found' });
+            }
+            const targetUser = await User.findOne({ _id: subscription.userId, role: { $ne: 'admin' } }).select('_id');
+            if (!targetUser) {
+                return res.status(404).json({ success: false, error: 'Subscription account not found' });
             }
             const amount = normalizeAmount(req.body?.amount) || subscription.pricePerMonth || 0;
             const updated = await handlePaymentConfirmed(

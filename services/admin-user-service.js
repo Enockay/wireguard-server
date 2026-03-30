@@ -29,6 +29,8 @@ const ADMIN_PERMISSIONS = {
     EXPORT: 'admin.users.export'
 };
 
+const CUSTOMER_USER_QUERY = { role: { $ne: 'admin' } };
+
 function toDateOrNull(value) {
     if (!value) return null;
     const date = new Date(value);
@@ -257,7 +259,7 @@ function serializeUsersAsCsv(rows) {
 }
 
 async function loadDirectoryData(filters = {}) {
-    const query = {};
+    const query = { ...CUSTOMER_USER_QUERY };
     const createdFrom = toDateOrNull(filters.createdFrom);
     const createdTo = toDateOrNull(filters.createdTo);
     const lastLoginFrom = toDateOrNull(filters.lastLoginFrom);
@@ -332,7 +334,7 @@ async function loadDirectoryData(filters = {}) {
 
 async function getAdminUserStats() {
     const [users, routers, subscriptions, tickets] = await Promise.all([
-        User.find().lean(),
+        User.find(CUSTOMER_USER_QUERY).lean(),
         MikrotikRouter.find().lean(),
         Subscription.find().lean(),
         SupportTicket.find().lean()
@@ -564,7 +566,7 @@ function deriveActivity(user, routers, subscriptions, transactions, tickets, aud
 }
 
 async function getUserBundle(userId) {
-    const user = await User.findById(userId).lean();
+    const user = await User.findOne({ _id: userId, ...CUSTOMER_USER_QUERY }).lean();
     if (!user) {
         return null;
     }
@@ -845,13 +847,13 @@ async function getAdminUserSupport(userId, filters = {}) {
 }
 
 async function getAdminUserNotes(userId) {
-    const user = await User.findById(userId).select('adminNotes');
+    const user = await User.findOne({ _id: userId, ...CUSTOMER_USER_QUERY }).select('adminNotes');
     if (!user) return null;
     return (user.adminNotes || []).map(normalizeNote).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
 async function getAdminUserFlags(userId) {
-    const user = await User.findById(userId).select('internalFlags riskStatus');
+    const user = await User.findOne({ _id: userId, ...CUSTOMER_USER_QUERY }).select('internalFlags riskStatus');
     if (!user) return null;
     return {
         riskStatus: buildRiskStatus(user),

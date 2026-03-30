@@ -18,6 +18,19 @@ const {
 } = require('../services/mikrotik-device-discovery');
 
 function registerTopologyRoutes(app) {
+    function normalizeTimeoutMs(value) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return undefined;
+        return Math.max(1000, Math.min(7000, parsed));
+    }
+
+    function normalizeSources(value) {
+        if (!Array.isArray(value)) return undefined;
+        const allowed = ['wireless', 'arp', 'bgp', 'neighbor', 'wireguard', 'pppoe', 'hotspot'];
+        const sources = value.map((item) => String(item || '').trim().toLowerCase()).filter((item) => allowed.includes(item));
+        return sources.length ? sources : undefined;
+    }
+
     /**
      * GET /api/admin/routers/:id/topology/devices
      * Get all connected devices for a router
@@ -245,7 +258,10 @@ function registerTopologyRoutes(app) {
                     reason: 'Manual device discovery trigger'
                 };
 
-                const result = await runFullDeviceDiscovery(req.params.id, actorContext);
+                const result = await runFullDeviceDiscovery(req.params.id, actorContext, {
+                    timeoutMs: normalizeTimeoutMs(req.body?.timeoutMs),
+                    sources: normalizeSources(req.body?.sources)
+                });
 
                 if (result.status === 'failed') {
                     return res.status(502).json({

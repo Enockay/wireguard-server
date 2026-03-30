@@ -42,16 +42,48 @@ function parseCidr(value) {
     return { address, prefix, cidr: `${address}/${prefix}` };
 }
 
+function parseConfiguredCidrs(value) {
+    return String(value || '')
+        .split(',')
+        .map((item) => parseCidr(item))
+        .filter(Boolean)
+        .map((item) => item.cidr);
+}
+
+function isLikelyContainerInterface(name, item = {}) {
+    const normalizedName = String(name || '').trim().toLowerCase();
+    const mac = String(item.mac || '').trim().toLowerCase();
+
+    if (/^(docker|br-|veth|cni|flannel|virbr|podman)/.test(normalizedName)) {
+        return true;
+    }
+
+    if (mac.startsWith('02:42:')) {
+        return true;
+    }
+
+    return false;
+}
+
 function getLocalDiscoveryCidrs() {
+    const preferred = parseConfiguredCidrs(process.env.ROUTER_DISCOVERY_PREFERRED_SUBNETS || process.env.ROUTER_DISCOVERY_ALLOWED_SUBNETS);
+    if (preferred.length) {
+        return [...new Set(preferred)];
+    }
+
+    const excluded = new Set(parseConfiguredCidrs(process.env.ROUTER_DISCOVERY_EXCLUDE_SUBNETS));
     const interfaces = os.networkInterfaces();
     const discovered = [];
 
-    Object.values(interfaces).forEach((items) => {
+    Object.entries(interfaces).forEach(([name, items]) => {
         (items || []).forEach((item) => {
             if (!item || item.family !== 'IPv4' || item.internal || !item.address || !item.netmask) return;
             if (item.address.startsWith('127.') || item.address.startsWith('169.254.')) return;
+            if (isLikelyContainerInterface(name, item)) return;
             const prefix = netmaskToPrefix(item.netmask);
-            discovered.push(`${item.address}/${prefix}`);
+            const cidr = `${item.address}/${prefix}`;
+            if (excluded.has(cidr)) return;
+            discovered.push(cidr);
         });
     });
 

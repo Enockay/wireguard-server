@@ -1,4 +1,10 @@
 // Load environment variables from .env file FIRST (before any other imports)
+const dns = require('dns');
+
+dns.setDefaultResultOrder('ipv4first');
+dns.setServers(['8.8.8.8', '1.1.1.1']);
+
+console.log('DNS servers:', dns.getServers());
 require('dotenv').config();
 
 const express = require("express");

@@ -204,7 +204,7 @@ function getRequestedSubnets(requestedSubnet) {
 
     const local = getLocalDiscoveryCidrs();
     if (!local.length) {
-        throw new Error('No local IPv4 subnets were detected. Provide a subnet explicitly or configure ROUTER_DISCOVERY_AGENT_URL.');
+        throw new Error('No eligible local IPv4 subnets were detected. Provide a subnet explicitly, configure ROUTER_DISCOVERY_PREFERRED_SUBNETS, or use ROUTER_DISCOVERY_AGENT_URL.');
     }
     return local;
 }
@@ -261,7 +261,9 @@ async function startDiscoveryScan({ adminUserId, requestedSubnet, reason = '' })
         status: 'pending'
     });
 
-    void executeDiscoveryScan(session._id);
+    setImmediate(() => {
+        void executeDiscoveryScan(session._id);
+    });
     return serializeSession(session);
 }
 

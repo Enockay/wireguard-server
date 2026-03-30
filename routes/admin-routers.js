@@ -574,19 +574,22 @@ function registerAdminRouterRoutes(app) {
                 reason: normalizeReason(req.body?.reason)
             });
 
-            await recordAdminAction({
-                req,
-                actorUserId: req.adminUser._id,
-                action: 'admin_start_router_discovery_scan',
-                reason: normalizeReason(req.body?.reason),
-                metadata: {
-                    discoverySessionId: session.id,
-                    requestedSubnet: session.requestedSubnet,
-                    source: session.source
-                }
-            });
+            res.status(202).json({ success: true, session });
 
-            return res.status(202).json({ success: true, session });
+            setImmediate(() => {
+                void recordAdminAction({
+                    req,
+                    actorUserId: req.adminUser._id,
+                    action: 'admin_start_router_discovery_scan',
+                    reason: normalizeReason(req.body?.reason),
+                    metadata: {
+                        discoverySessionId: session.id,
+                        requestedSubnet: session.requestedSubnet,
+                        source: session.source
+                    }
+                });
+            });
+            return;
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to start router discovery scan', details: error.message });
         }

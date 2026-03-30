@@ -79,7 +79,9 @@ test('topology service converts router ids to ObjectId for device and stats quer
             avgBandwidth: 0,
             accessPoints: 0,
             routers: 0,
-            clients: 0
+            clients: 0,
+            switches: 0,
+            unknown: 0
         });
 
         assert.ok(captured.deviceQuery.parentRouterId instanceof mongoose.Types.ObjectId);
@@ -148,7 +150,7 @@ test('upsertConnectedDevice classifies phone-like clients separately from router
     });
 });
 
-test('getConnectedDevicesWithLocations reclassifies stored unknown arp devices to clients', async () => {
+test('getConnectedDevicesWithLocations keeps bare arp-only devices as unknown until stronger evidence exists', async () => {
     const bulkWrites = [];
 
     const mocks = {
@@ -210,8 +212,7 @@ test('getConnectedDevicesWithLocations reclassifies stored unknown arp devices t
 
         await getConnectedDevicesWithLocations('69c2404892b7ad0f00a5a5cb');
 
-        assert.equal(bulkWrites.length, 1);
-        assert.equal(bulkWrites[0].updateOne.update.$set.deviceType, 'client');
+        assert.equal(bulkWrites.length, 0);
 
         delete require.cache[serviceModulePath];
     });

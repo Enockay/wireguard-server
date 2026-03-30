@@ -30,6 +30,7 @@ const ADMIN_BILLING_PERMISSIONS = {
 const BILLING_NOTE_CATEGORIES = ['billing', 'payment', 'subscription', 'overdue', 'support', 'finance_review', 'grace_period', 'adjustment', 'follow_up'];
 const BILLING_FLAG_TYPES = ['overdue_high_priority', 'manual_review', 'grace_period', 'disputed', 'VIP_billing', 'payment_failure_watch', 'suspension_pending'];
 const BILLING_FLAG_SEVERITIES = ['low', 'medium', 'high'];
+const CUSTOMER_USER_QUERY = { role: { $ne: 'admin' } };
 
 function toDateOrNull(value) {
     if (!value) return null;
@@ -210,7 +211,7 @@ function buildBillableRouterItems(routers, subscriptionsByRouterId) {
 
 async function loadBillingDataset() {
     const [users, routers, subscriptions, transactions, auditLogs] = await Promise.all([
-        User.find({}).lean(),
+        User.find(CUSTOMER_USER_QUERY).lean(),
         MikrotikRouter.find({}).lean(),
         Subscription.find({}).sort({ createdAt: -1 }).lean(),
         Transaction.find({}).sort({ createdAt: -1 }).lean(),
@@ -221,23 +222,27 @@ async function loadBillingDataset() {
     ]);
 
     const usersById = new Map(users.map((user) => [String(user._id), user]));
+    const customerUserIds = new Set(users.map((user) => String(user._id)));
     const routersByUser = new Map();
     const subscriptionsByUser = new Map();
     const transactionsByUser = new Map();
-    const subscriptionsById = new Map(subscriptions.map((subscription) => [String(subscription._id), subscription]));
-    const subscriptionsByRouterId = new Map(subscriptions.map((subscription) => [String(subscription.routerId), subscription]));
+    const filteredRouters = routers.filter((router) => customerUserIds.has(String(router.userId)));
+    const filteredSubscriptions = subscriptions.filter((subscription) => customerUserIds.has(String(subscription.userId)));
+    const filteredTransactions = transactions.filter((transaction) => customerUserIds.has(String(transaction.userId)));
+    const subscriptionsById = new Map(filteredSubscriptions.map((subscription) => [String(subscription._id), subscription]));
+    const subscriptionsByRouterId = new Map(filteredSubscriptions.map((subscription) => [String(subscription.routerId), subscription]));
 
-    for (const router of routers) {
+    for (const router of filteredRouters) {
         const key = String(router.userId);
         if (!routersByUser.has(key)) routersByUser.set(key, []);
         routersByUser.get(key).push(router);
     }
-    for (const subscription of subscriptions) {
+    for (const subscription of filteredSubscriptions) {
         const key = String(subscription.userId);
         if (!subscriptionsByUser.has(key)) subscriptionsByUser.set(key, []);
         subscriptionsByUser.get(key).push(subscription);
     }
-    for (const transaction of transactions) {
+    for (const transaction of filteredTransactions) {
         const key = String(transaction.userId);
         if (!transactionsByUser.has(key)) transactionsByUser.set(key, []);
         transactionsByUser.get(key).push(transaction);
@@ -245,9 +250,9 @@ async function loadBillingDataset() {
 
     return {
         users,
-        routers,
-        subscriptions,
-        transactions,
+        routers: filteredRouters,
+        subscriptions: filteredSubscriptions,
+        transactions: filteredTransactions,
         auditLogs,
         usersById,
         routersByUser,
@@ -430,7 +435,7 @@ async function getSubscriptionDetail(subscriptionId) {
 
 async function getAccountBundle(accountId, preloaded = null) {
     const bundle = preloaded || await loadBillingDataset();
-    const user = bundle.usersById.get(String(accountId)) || await User.findById(accountId).lean();
+    const user = bundle.usersById.get(String(accountId)) || await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY }).lean();
     if (!user) return null;
     return {
         user,
@@ -633,9 +638,10 @@ async function getInvoiceDetail(invoiceId) {
     const transaction = await Transaction.findOne({ _id: invoiceId, type: 'invoice' }).lean();
     if (!transaction) return null;
     const [user, subscription] = await Promise.all([
-        User.findById(transaction.userId).lean(),
+        User.findOne({ _id: transaction.userId, ...CUSTOMER_USER_QUERY }).lean(),
         transaction.subscriptionId ? Subscription.findById(transaction.subscriptionId).lean() : Promise.resolve(null)
     ]);
+    if (!user) return null;
     return normalizeTransaction(transaction, user, subscription);
 }
 
@@ -668,7 +674,8 @@ async function listPayments(query = {}) {
 async function getPaymentDetail(paymentId) {
     const transaction = await Transaction.findOne({ _id: paymentId, type: 'payment' }).lean();
     if (!transaction) return null;
-    const user = await User.findById(transaction.userId).lean();
+    const user = await User.findOne({ _id: transaction.userId, ...CUSTOMER_USER_QUERY }).lean();
+    if (!user) return null;
     return normalizeTransaction(transaction, user, null);
 }
 
@@ -765,19 +772,19 @@ async function listTrials(query = {}) {
 }
 
 async function getBillingNotes(accountId) {
-    const user = await User.findById(accountId).select('adminNotes');
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY }).select('adminNotes');
     if (!user) return null;
     return (user.adminNotes || []).map(normalizeNote).filter((note) => BILLING_NOTE_CATEGORIES.includes(note.category) || note.category === 'billing');
 }
 
 async function getBillingFlags(accountId) {
-    const user = await User.findById(accountId).select('internalFlags');
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY }).select('internalFlags');
     if (!user) return null;
     return (user.internalFlags || []).map(normalizeFlag).filter((flag) => BILLING_FLAG_TYPES.includes(flag.flag) || flag.flag === 'overdue_billing');
 }
 
 async function extendAccountTrial(accountId, days, authorEmail, reason = '') {
-    const user = await User.findById(accountId);
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY });
     if (!user) return null;
     const base = user.trialEndsAt && new Date(user.trialEndsAt) > new Date() ? new Date(user.trialEndsAt) : new Date();
     base.setDate(base.getDate() + Number(days));
@@ -801,7 +808,7 @@ async function extendAccountTrial(accountId, days, authorEmail, reason = '') {
 }
 
 async function markBillingReviewed(accountId, reviewerEmail, note = '') {
-    const user = await User.findById(accountId);
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY });
     if (!user) return null;
     user.billingReviewedAt = new Date();
     user.billingReviewedBy = reviewerEmail;
@@ -817,7 +824,7 @@ async function markBillingReviewed(accountId, reviewerEmail, note = '') {
 }
 
 async function suspendAccountForBilling(accountId, reviewerEmail, reason = '') {
-    const user = await User.findById(accountId);
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY });
     if (!user) return null;
     user.isActive = false;
     user.billingSuspendedAt = new Date();
@@ -832,7 +839,7 @@ async function suspendAccountForBilling(accountId, reviewerEmail, reason = '') {
 }
 
 async function reactivateAccountAfterBilling(accountId, reviewerEmail, reason = '') {
-    const user = await User.findById(accountId);
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY });
     if (!user) return null;
     user.isActive = true;
     user.billingReactivatedAt = new Date();
@@ -847,7 +854,7 @@ async function reactivateAccountAfterBilling(accountId, reviewerEmail, reason = 
 }
 
 async function resendLatestInvoice(accountId) {
-    const user = await User.findById(accountId);
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY });
     if (!user) return null;
     const invoice = await Transaction.findOne({ userId: user._id, type: 'invoice' }).sort({ createdAt: -1 });
     if (!invoice) {
@@ -867,7 +874,7 @@ async function resendLatestInvoice(accountId) {
 }
 
 async function applyGracePeriod(accountId, days, authorEmail, reason = '') {
-    const user = await User.findById(accountId);
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY });
     if (!user) return null;
     const base = user.billingGracePeriodEndsAt && new Date(user.billingGracePeriodEndsAt) > new Date() ? new Date(user.billingGracePeriodEndsAt) : new Date();
     base.setDate(base.getDate() + Number(days));
@@ -882,7 +889,7 @@ async function applyGracePeriod(accountId, days, authorEmail, reason = '') {
 }
 
 async function removeGracePeriod(accountId, authorEmail, reason = '') {
-    const user = await User.findById(accountId);
+    const user = await User.findOne({ _id: accountId, ...CUSTOMER_USER_QUERY });
     if (!user) return null;
     user.billingGracePeriodEndsAt = null;
     user.adminNotes.push({

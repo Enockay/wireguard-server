@@ -7,7 +7,10 @@
 const deviceTopologyService = require('./device-topology-service');
 const { execute: executeRouterOperation } = require('./router-execution-service');
 
-const DEFAULT_TIMEOUT_MS = 8000;
+const DEFAULT_TIMEOUT_MS = 3500;
+const MIN_TIMEOUT_MS = 1000;
+const MAX_TIMEOUT_MS = 7000;
+const DEFAULT_DISCOVERY_SOURCES = ['wireless', 'arp', 'bgp', 'neighbor', 'wireguard', 'pppoe', 'hotspot'];
 
 function toArray(result) {
     if (Array.isArray(result?.records)) return result.records;
@@ -45,15 +48,21 @@ function firstNonEmpty(...values) {
 }
 
 async function executeDiscoveryCommand(routerId, command, attributes, actorContext, metadata = {}) {
+    const boundedTimeout = Math.max(
+        MIN_TIMEOUT_MS,
+        Math.min(MAX_TIMEOUT_MS, Number(metadata.timeoutMs) || DEFAULT_TIMEOUT_MS)
+    );
     return executeRouterOperation(
         routerId,
         'topology_discovery',
         {
             command,
             attributes: attributes || {},
-            timeout: metadata.timeoutMs || DEFAULT_TIMEOUT_MS,
+            timeout: boundedTimeout,
+            allowedTransports: ['api'],
             metadata: {
                 discoveryCommand: command,
+                timeoutMs: boundedTimeout,
                 ...metadata
             }
         },
@@ -140,7 +149,7 @@ async function discoverWirelessDevices(routerId, actorContext) {
                 { command: '/interface/wifi/registration-table/print' }
             ],
             actorContext,
-            { source: 'wireless' }
+            { source: 'wireless', timeoutMs: actorContext?.timeoutMs }
         );
 
         const devices = data
@@ -182,7 +191,7 @@ async function discoverArpDevices(routerId, actorContext) {
             routerId,
             [{ command: '/ip/arp/print' }],
             actorContext,
-            { source: 'arp' }
+            { source: 'arp', timeoutMs: actorContext?.timeoutMs }
         );
 
         const devices = data
@@ -218,7 +227,7 @@ async function discoverRouterPeers(routerId, actorContext) {
                 { command: '/routing/bgp/peer/print' }
             ],
             actorContext,
-            { source: 'bgp' }
+            { source: 'bgp', timeoutMs: actorContext?.timeoutMs }
         );
 
         const devices = data
@@ -253,7 +262,7 @@ async function discoverLldpNeighbors(routerId, actorContext) {
                 { command: '/interface/ethernet/switch/lldp/neighbor/print' }
             ],
             actorContext,
-            { source: 'neighbor' }
+            { source: 'neighbor', timeoutMs: actorContext?.timeoutMs }
         );
 
         const devices = data
@@ -288,7 +297,7 @@ async function discoverWireGuardPeers(routerId, actorContext) {
             routerId,
             [{ command: '/interface/wireguard/peers/print' }],
             actorContext,
-            { source: 'wireguard' }
+            { source: 'wireguard', timeoutMs: actorContext?.timeoutMs }
         );
 
         const devices = data
@@ -330,7 +339,7 @@ async function discoverPppoeClients(routerId, actorContext) {
                 { command: '/interface/pppoe-server/monitor', attributes: { once: 'true' } }
             ],
             actorContext,
-            { source: 'pppoe' }
+            { source: 'pppoe', timeoutMs: actorContext?.timeoutMs }
         );
 
         const clients = data
@@ -366,7 +375,7 @@ async function discoverHotspotClients(routerId, actorContext) {
             routerId,
             [{ command: '/ip/hotspot/active/print' }],
             actorContext,
-            { source: 'hotspot' }
+            { source: 'hotspot', timeoutMs: actorContext?.timeoutMs }
         );
 
         const clients = data
@@ -393,19 +402,43 @@ async function discoverHotspotClients(routerId, actorContext) {
     }
 }
 
-async function runFullDeviceDiscovery(routerId, actorContext) {
+function normalizeDiscoveryOptions(options = {}) {
+    const timeoutMs = Math.max(
+        MIN_TIMEOUT_MS,
+        Math.min(MAX_TIMEOUT_MS, Number(options.timeoutMs) || DEFAULT_TIMEOUT_MS)
+    );
+    const requestedSources = Array.isArray(options.sources)
+        ? options.sources.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+        : [];
+    const sources = requestedSources.length
+        ? DEFAULT_DISCOVERY_SOURCES.filter((source) => requestedSources.includes(source))
+        : DEFAULT_DISCOVERY_SOURCES;
+
+    return {
+        timeoutMs,
+        sources
+    };
+}
+
+async function runFullDeviceDiscovery(routerId, actorContext, options = {}) {
     const startedAt = new Date();
     const startTime = Date.now();
+    const normalizedOptions = normalizeDiscoveryOptions(options);
+    const scopedActorContext = {
+        ...actorContext,
+        timeoutMs: normalizedOptions.timeoutMs
+    };
+    const sourceHandlers = {
+        wireless: () => discoverWirelessDevices(routerId, scopedActorContext),
+        arp: () => discoverArpDevices(routerId, scopedActorContext),
+        bgp: () => discoverRouterPeers(routerId, scopedActorContext),
+        neighbor: () => discoverLldpNeighbors(routerId, scopedActorContext),
+        wireguard: () => discoverWireGuardPeers(routerId, scopedActorContext),
+        pppoe: () => discoverPppoeClients(routerId, scopedActorContext),
+        hotspot: () => discoverHotspotClients(routerId, scopedActorContext)
+    };
 
-    const scans = await Promise.all([
-        discoverWirelessDevices(routerId, actorContext),
-        discoverArpDevices(routerId, actorContext),
-        discoverRouterPeers(routerId, actorContext),
-        discoverLldpNeighbors(routerId, actorContext),
-        discoverWireGuardPeers(routerId, actorContext),
-        discoverPppoeClients(routerId, actorContext),
-        discoverHotspotClients(routerId, actorContext)
-    ]);
+    const scans = await Promise.all(normalizedOptions.sources.map((source) => sourceHandlers[source]()));
 
     const discoveries = {};
     const errors = [];
@@ -443,6 +476,8 @@ async function runFullDeviceDiscovery(routerId, actorContext) {
         completedAt: new Date(),
         durationMs: Date.now() - startTime,
         routerId,
+        timeoutMs: normalizedOptions.timeoutMs,
+        sources: normalizedOptions.sources,
         discoveries,
         completedSources,
         failedSources,

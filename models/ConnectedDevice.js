@@ -30,6 +30,16 @@ const connectedDeviceSchema = new mongoose.Schema({
         enum: ['access_point', 'router', 'client', 'switch', 'unknown'],
         default: 'unknown'
     },
+    classificationConfidence: {
+        type: Number,
+        default: 0,
+        min: 0,
+        max: 100
+    },
+    classificationEvidence: {
+        type: [String],
+        default: []
+    },
     // Connection details
     ipAddress: {
         type: String,

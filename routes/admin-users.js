@@ -24,7 +24,7 @@ const {
 } = require('../services/admin-user-service');
 
 async function getTargetUserOr404(req, res) {
-  const user = await User.findById(req.params.id);
+  const user = await User.findOne({ _id: req.params.id, role: { $ne: 'admin' } });
   if (!user) {
     res.status(404).json({ success: false, error: 'User not found' });
     return null;
