@@ -327,6 +327,11 @@ test('admin router create route supports customer email, management-only setup, 
         credentialState: {},
         capabilities: {},
         ports: {},
+        safetyPolicy: {
+            defaultMaxClass: 'service_mutation',
+            allowNetworkCoreWrites: false,
+            approvedScopes: ['queues']
+        },
         adminNotes: [],
         internalFlags: createSubdocCollection([])
     });
@@ -360,6 +365,9 @@ test('admin router create route supports customer email, management-only setup, 
         assert.equal(router.discoveryInfo.localAddress, '192.168.88.1');
         assert.equal(router.credentialState.secretRef, 'cred-1');
         assert.equal(router.credentialState.state, 'active');
+        assert.equal(router.safetyPolicy.defaultMaxClass, 'service_mutation');
+        assert.deepEqual(router.safetyPolicy.approvedScopes, ['queues']);
+        assert.equal(router.safetyPolicy.allowNetworkCoreWrites, false);
         assert.ok(router.adminNotes.some((entry) => entry.body.includes('Manual router onboarding details')));
         assert.ok(ctx.auditCalls.some((call) => call.action === 'admin_create_router'));
     });

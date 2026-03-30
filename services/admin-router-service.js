@@ -1637,12 +1637,12 @@ async function createManagementOnlyRouterAdmin({ userId, name, notes = '' }) {
         lastSeen: new Date(),
         notes: notes || '',
         safetyPolicy: {
-            defaultMaxClass: 'safe_operational',
+            defaultMaxClass: 'service_mutation',
             allowPublicEndpointWrites: false,
             allowNetworkCoreWrites: false,
             allowBootstrap: false,
             breakGlassRequiredFor: ['service_mutation', 'network_core_mutation', 'bootstrap_mutation'],
-            approvedScopes: []
+            approvedScopes: ['queues']
         }
     });
 

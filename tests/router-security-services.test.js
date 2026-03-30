@@ -62,3 +62,28 @@ test('operation policy allows read-only raw commands without break-glass', async
 
     assert.equal(decision.allowed, true);
 });
+
+test('operation policy allows management-only queue mutations when queues scope is approved', async () => {
+    const router = {
+        connectionMode: 'management_only',
+        managementMode: 'management_only',
+        capabilities: {
+            queueWrite: true
+        },
+        safetyPolicy: {
+            defaultMaxClass: 'service_mutation',
+            allowNetworkCoreWrites: false,
+            approvedScopes: ['queues']
+        }
+    };
+
+    const decision = authorizeOperation(router, 'queue_mutation', {
+        scope: 'queues'
+    });
+
+    assert.equal(decision.allowed, true);
+    assert.equal(decision.reason, null);
+    assert.equal(decision.details.managementMode, 'management_only');
+    assert.equal(decision.details.capabilityRequired, 'queueWrite');
+    assert.deepEqual(decision.details.approvedScopes, ['queues']);
+});

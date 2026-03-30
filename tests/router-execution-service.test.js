@@ -30,3 +30,29 @@ test('classifyFailure treats no-route errors as endpoint_unreachable instead of 
         delete require.cache[serviceModulePath];
     });
 });
+
+test('classifyFailure treats ssh permission denied as auth_failed even when command contains ConnectTimeout option', async () => {
+    const mocks = {
+        'models/MikrotikRouter.js': {},
+        'models/RouterConfigSnapshot.js': {},
+        'utils/routeros-api-client.js': {},
+        'services/mikrotik-api-service.js': {},
+        'services/router-credential-service.js': {},
+        'services/operation-policy-service.js': {},
+        'services/operation-ledger-service.js': {},
+        'wg-core.js': { log() {} }
+    };
+
+    await withMockedModules(mocks, async () => {
+        delete require.cache[serviceModulePath];
+        const { classifyFailure } = require(serviceModulePath);
+
+        const failureType = classifyFailure(new Error(
+            'Command failed: ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=no -o BatchMode=yes admin@167.86.73.169 "/interface/print"\nadmin@167.86.73.169: Permission denied (publickey,password).'
+        ));
+
+        assert.equal(failureType, 'auth_failed');
+
+        delete require.cache[serviceModulePath];
+    });
+});

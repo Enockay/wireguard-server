@@ -131,8 +131,8 @@ function filterEndpoints(endpoints = [], context = {}) {
 
 function classifyFailure(error) {
     const message = String(error?.message || error || '').toLowerCase();
-    if (/no route to host|ehostunreach|econnrefused|timed out|timeout|unreachable/.test(message)) return /timeout/.test(message) ? 'timeout' : 'endpoint_unreachable';
     if (/invalid user|cannot log in|authentication failed|permission denied \(publickey|login failed|invalid user name or password/.test(message)) return 'auth_failed';
+    if (/no route to host|ehostunreach|econnrefused|timed out|timeout|unreachable/.test(message)) return /timed out|operation timed out|\btimeout\b/.test(message) ? 'timeout' : 'endpoint_unreachable';
     if (/not enough permissions|permission/.test(message)) return 'permission_denied';
     if (/tls|certificate|hostname/.test(message)) return 'tls_validation_failed';
     return 'transport_error';

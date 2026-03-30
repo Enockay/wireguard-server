@@ -85,6 +85,5 @@ const routerLocationSchema = new mongoose.Schema({
 // Index for geographic queries
 routerLocationSchema.index({ latitude: 1, longitude: 1 });
 routerLocationSchema.index({ country: 1 });
-routerLocationSchema.index({ routerId: 1 });
 
 module.exports = mongoose.model('RouterLocation', routerLocationSchema);
