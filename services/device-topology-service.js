@@ -62,6 +62,11 @@ function inferDeviceProfile(deviceData = {}) {
         return { deviceType: 'router', classificationConfidence: 96, classificationEvidence: evidence };
     }
 
+    if (source === 'route_next_hop') {
+        evidence.push('route_next_hop');
+        return { deviceType: 'router', classificationConfidence: 94, classificationEvidence: evidence };
+    }
+
     if (source === 'neighbor') {
         evidence.push('neighbor_discovery');
         if (switchLike.test(descriptor)) {
@@ -137,6 +142,7 @@ function getDiscoverySourcePriority(source) {
     switch (source) {
         case 'neighbor':
         case 'bgp':
+        case 'route_next_hop':
             return 5;
         case 'wireguard':
             return 4;
@@ -316,7 +322,11 @@ async function getNetworkTopology(parentRouterId) {
     // Get direct connections
     const directConnections = await ConnectedDevice.find({
         ...buildTopologyFilter(parentRouterId),
-        isManagedByUser: true
+        $or: [
+            { isManagedByUser: true },
+            { deviceType: 'router' },
+            { discoverySource: 'route_next_hop' }
+        ]
     }).populate('trackedRouterId');
 
     // Get location for parent
@@ -360,7 +370,8 @@ async function getNetworkTopology(parentRouterId) {
                 device,
                 childRouter: null,
                 childConnections: 0,
-                childDevices: []
+                childDevices: [],
+                pathRole: device.discoverySource === 'route_next_hop' ? 'routed_hop' : 'direct_device'
             });
         }
     }

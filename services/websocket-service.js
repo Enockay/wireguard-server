@@ -4,7 +4,8 @@ const { log } = require('../wg-core');
 const MikrotikRouter = require('../models/MikrotikRouter');
 const { stripCidrSuffix } = require('./routeros-command-service');
 const { getResolvedCredential } = require('./router-credential-service');
-const { startSshSession } = require('./terminal-service');
+const { startApiConsoleSession, startSshSession } = require('./terminal-service');
+const { resolveManagementEndpoints } = require('./router-execution-service');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const AUTH_COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'mikrotik_admin_session';
@@ -67,29 +68,40 @@ function getEndpointHealthRank(endpoint) {
     return rank[endpoint?.health] ?? 9;
 }
 
-function resolveTerminalSshEndpoint(router) {
-    const endpoints = Array.isArray(router?.managementEndpoints) ? router.managementEndpoints : [];
-    const preferredSshEndpoint = [...endpoints]
-        .filter((endpoint) => endpoint?.enabled !== false && endpoint?.transport === 'ssh' && endpoint?.host)
-        .sort((a, b) => {
-            const healthDiff = getEndpointHealthRank(a) - getEndpointHealthRank(b);
-            if (healthDiff !== 0) return healthDiff;
-            return (a.priority || 999) - (b.priority || 999);
-        })[0];
+function resolveTerminalAccessPlan(router, credential) {
+    const resolvedEndpoints = resolveManagementEndpoints(router, credential);
+    const apiEndpoint = resolvedEndpoints.find((endpoint) =>
+        endpoint?.enabled !== false
+        && ['api', 'api_ssl', 'rest_https'].includes(endpoint?.transport)
+        && endpoint?.host
+    ) || null;
+    const sshEndpoint = resolvedEndpoints.find((endpoint) =>
+        endpoint?.enabled !== false
+        && endpoint?.transport === 'ssh'
+        && endpoint?.host
+    ) || null;
 
-    if (preferredSshEndpoint) {
+    if (!apiEndpoint && !sshEndpoint) {
+        const localHost = stripCidrSuffix(router?.discoveryInfo?.localAddress);
+        const vpnHost = stripCidrSuffix(router?.vpnIp);
+        const host = vpnHost || localHost || '';
         return {
-            host: preferredSshEndpoint.host,
-            port: preferredSshEndpoint.port || 22
+            apiEndpoint: host ? { host, port: credential?.apiPort || router?.apiPort || 8728, transport: 'api', kind: 'derived_api' } : null,
+            sshEndpoint: host ? { host, port: 22, transport: 'ssh', kind: 'derived_ssh' } : null
         };
     }
 
-    const localHost = stripCidrSuffix(router?.discoveryInfo?.localAddress);
-    const vpnHost = stripCidrSuffix(router?.vpnIp);
-    const host = (router?.status !== 'active' && localHost) || vpnHost || localHost || '';
-    const port = router?.ports?.ssh || 22;
+    return {
+        apiEndpoint,
+        sshEndpoint
+    };
+}
 
-    return host ? { host, port } : null;
+function classifyTerminalPath(endpoint) {
+    if (!endpoint) return 'unknown';
+    if (endpoint.kind === 'wireguard_management' || endpoint.kind === 'wireguard_api') return 'wireguard';
+    if (String(endpoint.kind || '').includes('public')) return 'public';
+    return 'local';
 }
 
 function createWebSocketServer(httpServer) {
@@ -122,8 +134,8 @@ function createWebSocketServer(httpServer) {
                 return;
             }
 
-            MikrotikRouter.findById(routerId)
-                .select('_id vpnIp apiUsername apiPassword credentialState discoveryInfo.localAddress managementEndpoints ports.ssh status')
+                    MikrotikRouter.findById(routerId)
+                .select('_id vpnIp apiPort apiUsername apiPassword credentialState connectionMode discoveryInfo.localAddress managementEndpoints ports.ssh status')
                 .then(async (router) => {
                     if (!router) {
                         ws.close(4004, 'Router not found');
@@ -137,18 +149,29 @@ function createWebSocketServer(httpServer) {
                         return;
                     }
 
-                    const sshEndpoint = resolveTerminalSshEndpoint(router);
-                    if (!sshEndpoint?.host) {
-                        safeSend(ws, { type: 'error', message: 'No reachable SSH endpoint configured for this router' });
+                    const accessPlan = resolveTerminalAccessPlan(router, credential);
+                    if (!accessPlan.apiEndpoint?.host && !accessPlan.sshEndpoint?.host) {
+                        safeSend(ws, { type: 'error', message: 'No reachable terminal endpoint configured for this router' });
                         ws.close(1011, 'Terminal setup failed');
                         return;
                     }
 
+                    const startApiFallback = () => startApiConsoleSession(ws, routerId, {
+                        actor: decoded.userId || decoded.id || 'terminal',
+                        actorType: 'admin',
+                        host: accessPlan.apiEndpoint?.host || null,
+                        port: accessPlan.apiEndpoint?.port || null,
+                        transport: accessPlan.apiEndpoint?.transport || 'api',
+                        pathType: classifyTerminalPath(accessPlan.apiEndpoint)
+                    });
+
                     startSshSession(ws, routerId, {
-                        host: sshEndpoint.host,
-                        port: sshEndpoint.port,
+                        host: accessPlan.sshEndpoint?.host || accessPlan.apiEndpoint?.host,
+                        port: accessPlan.sshEndpoint?.port || 22,
                         username: credential.username || 'admin',
-                        password: credential.password || ''
+                        password: credential.password || '',
+                        pathType: classifyTerminalPath(accessPlan.sshEndpoint || accessPlan.apiEndpoint),
+                        onFallback: accessPlan.apiEndpoint?.host ? startApiFallback : null
                     });
                 })
                 .catch((error) => {

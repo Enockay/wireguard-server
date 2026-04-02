@@ -8,7 +8,7 @@ const routerEndpointSchema = new mongoose.Schema({
     },
     kind: {
         type: String,
-        enum: ['wireguard_api', 'local_api', 'local_api_tls', 'rest_https', 'ssh_fallback', 'public_api_tls'],
+        enum: ['wireguard_api', 'wireguard_management', 'local_api', 'local_api_tls', 'rest_https', 'ssh_fallback', 'public_api_tls'],
         required: true
     },
     host: {
@@ -27,7 +27,7 @@ const routerEndpointSchema = new mongoose.Schema({
     },
     source: {
         type: String,
-        enum: ['discovery', 'wireguard', 'manual', 'claim', 'derived'],
+        enum: ['discovery', 'wireguard', 'manual', 'claim', 'derived', 'system'],
         default: 'derived'
     },
     priority: {
@@ -85,6 +85,263 @@ const routerEndpointSchema = new mongoose.Schema({
     },
     lastFailureAt: {
         type: Date,
+        default: null
+    }
+}, { _id: false });
+
+const routerEndpointBindingSchema = new mongoose.Schema({
+    expectedIdentity: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    expectedSerial: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    state: {
+        type: String,
+        enum: ['unknown', 'local_only', 'tunnel_ready', 'verified_local', 'verified_wireguard', 'mismatch', 'conflict'],
+        default: 'unknown'
+    },
+    verifiedEndpointId: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    verifiedEndpointHost: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    verifiedTransport: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    verifiedAt: {
+        type: Date,
+        default: null
+    },
+    mismatchReason: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    lastMismatchAt: {
+        type: Date,
+        default: null
+    }
+}, { _id: false });
+
+const routerEndpointHistorySchema = new mongoose.Schema({
+    changedAt: {
+        type: Date,
+        default: Date.now
+    },
+    changedBy: {
+        type: String,
+        trim: true,
+        default: 'system'
+    },
+    reason: {
+        type: String,
+        trim: true,
+        default: ''
+    },
+    previousHost: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    nextHost: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    previousIdentity: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    nextIdentity: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    previousApiPort: {
+        type: Number,
+        default: null
+    },
+    nextApiPort: {
+        type: Number,
+        default: null
+    },
+    validationState: {
+        type: String,
+        enum: ['pending', 'verified', 'mismatch', 'failed'],
+        default: 'pending'
+    },
+    validationMessage: {
+        type: String,
+        trim: true,
+        default: null
+    }
+}, { _id: false });
+
+const routerDriftEventSchema = new mongoose.Schema({
+    detectedAt: {
+        type: Date,
+        default: Date.now
+    },
+    eventType: {
+        type: String,
+        enum: ['identity_changed', 'serial_changed', 'public_key_changed', 'endpoint_changed', 'endpoint_collision', 'routing_drift', 'tunnel_path_lost'],
+        required: true
+    },
+    severity: {
+        type: String,
+        enum: ['info', 'warning', 'critical'],
+        default: 'warning'
+    },
+    message: {
+        type: String,
+        trim: true,
+        required: true
+    },
+    previousValue: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    currentValue: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    endpointHost: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    resolvedAt: {
+        type: Date,
+        default: null
+    }
+}, { _id: false });
+
+const routerManagementPathObservationSchema = new mongoose.Schema({
+    observedAt: {
+        type: Date,
+        default: Date.now
+    },
+    endpointId: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    host: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    port: {
+        type: Number,
+        default: null
+    },
+    transport: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    pathType: {
+        type: String,
+        enum: ['wireguard', 'local', 'public', 'derived'],
+        default: 'derived'
+    },
+    operationName: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    outcome: {
+        type: String,
+        enum: ['selected', 'success', 'failed', 'skipped'],
+        default: 'selected'
+    },
+    failureType: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    message: {
+        type: String,
+        trim: true,
+        default: null
+    }
+}, { _id: false });
+
+const routerRemoteBootstrapSchema = new mongoose.Schema({
+    managementInterfaceName: {
+        type: String,
+        trim: true,
+        default: 'wg-mgmt'
+    },
+    bootstrapMode: {
+        type: String,
+        enum: ['wireguard_only', 'wireguard_with_api', 'wireguard_with_api_ssh'],
+        default: 'wireguard_with_api_ssh'
+    },
+    preferredManagementSubnet: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    apiAllowedSources: [{
+        type: String,
+        trim: true
+    }],
+    sshAllowedSources: [{
+        type: String,
+        trim: true
+    }],
+    generatedAt: {
+        type: Date,
+        default: null
+    },
+    lastAppliedAt: {
+        type: Date,
+        default: null
+    }
+}, { _id: false });
+
+const routerSafeModeSchema = new mongoose.Schema({
+    enabled: {
+        type: Boolean,
+        default: false
+    },
+    requireBreakGlass: {
+        type: Boolean,
+        default: true
+    },
+    breakGlassCode: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    lastEnabledAt: {
+        type: Date,
+        default: null
+    },
+    lastEnabledBy: {
+        type: String,
+        trim: true,
+        default: null
+    },
+    note: {
+        type: String,
+        trim: true,
         default: null
     }
 }, { _id: false });
@@ -276,6 +533,22 @@ const mikrotikRouterSchema = new mongoose.Schema({
         type: [routerEndpointSchema],
         default: []
     },
+    endpointBinding: {
+        type: routerEndpointBindingSchema,
+        default: () => ({})
+    },
+    endpointHistory: {
+        type: [routerEndpointHistorySchema],
+        default: []
+    },
+    driftEvents: {
+        type: [routerDriftEventSchema],
+        default: []
+    },
+    managementPathObservations: {
+        type: [routerManagementPathObservationSchema],
+        default: []
+    },
     endpointHealthSummary: {
         type: String,
         enum: ['unknown', 'healthy', 'degraded', 'unreachable', 'stale'],
@@ -291,6 +564,14 @@ const mikrotikRouterSchema = new mongoose.Schema({
     },
     safetyPolicy: {
         type: routerSafetyPolicySchema,
+        default: () => ({})
+    },
+    safeMode: {
+        type: routerSafeModeSchema,
+        default: () => ({})
+    },
+    remoteBootstrap: {
+        type: routerRemoteBootstrapSchema,
         default: () => ({})
     },
     failureState: {

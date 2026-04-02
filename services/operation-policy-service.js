@@ -86,6 +86,16 @@ function authorizeOperation(router, operationName, context = {}) {
     const definition = resolveOperationDefinition(operationName, context);
     const managementMode = getRouterManagementMode(router);
     const safety = router?.safetyPolicy || {};
+    const safeMode = router?.safeMode || {};
+    const configuredBreakGlassCode = String(safeMode.breakGlassCode || '').trim();
+    const providedBreakGlassCode = String(context.breakGlassCode || '').trim();
+    const safeModeBreakGlassRequired =
+        Boolean(safeMode.enabled)
+        && safeMode.requireBreakGlass !== false
+        && definition.commandClass !== 'read_only';
+    const breakGlassRequired =
+        Boolean(definition.breakGlass)
+        || safeModeBreakGlassRequired;
     const details = {
         operationName,
         commandClass: definition.commandClass,
@@ -93,8 +103,9 @@ function authorizeOperation(router, operationName, context = {}) {
         managementMode,
         defaultMaxClass: safety.defaultMaxClass || (managementMode === 'management_only' ? 'safe_operational' : 'network_core_mutation'),
         scope: definition.scope || context.scope || null,
-        breakGlassRequired: Boolean(definition.breakGlass),
+        breakGlassRequired,
         breakGlassProvided: Boolean(context.breakGlass),
+        breakGlassConfigured: Boolean(configuredBreakGlassCode),
         approvedScopes: safety.approvedScopes || [],
         capabilitiesProbedAt: router?.capabilities?.probedAt || null
     };
@@ -147,12 +158,24 @@ function authorizeOperation(router, operationName, context = {}) {
         }
     }
 
-    if (definition.breakGlass && !context.breakGlass) {
+    if (breakGlassRequired && !context.breakGlass) {
         return {
             allowed: false,
             reason: 'unsafe_operation_blocked',
             definition,
             details
+        };
+    }
+
+    if (breakGlassRequired && configuredBreakGlassCode && configuredBreakGlassCode !== providedBreakGlassCode) {
+        return {
+            allowed: false,
+            reason: 'unsafe_operation_blocked',
+            definition,
+            details: {
+                ...details,
+                breakGlassCodeValid: false
+            }
         };
     }
 

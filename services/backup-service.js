@@ -34,6 +34,31 @@ function createFilename(router, createdAt) {
     return `${safeName}-${stamp}.rsc`;
 }
 
+function evaluateRestoreReadiness(exportText, router) {
+    const normalized = String(exportText || '').trim();
+    const signals = [];
+
+    if (normalized.includes('/interface') || normalized.includes('/ip address') || normalized.includes('/ip route')) {
+        signals.push('config_sections_present');
+    }
+    if (normalized.length > 200) {
+        signals.push('export_length_sufficient');
+    }
+    if (router?.routerboardInfo?.serialNumber) {
+        signals.push('serial_recorded');
+    }
+    if (router?.routerosVersion || router?.routerboardInfo?.firmware) {
+        signals.push('version_recorded');
+    }
+
+    const restoreCompatible = signals.length >= 3;
+    return {
+        restoreCompatible,
+        lastRestoreTestAt: restoreCompatible ? new Date() : null,
+        restoreValidationSignals: signals
+    };
+}
+
 async function fetchExportText(routerId) {
     const primary = await executeCommand(routerId, '/export', {}, { operationName: 'backup_export' }).catch(() => null);
     let exportText = normalizeExportOutput(primary);
@@ -51,13 +76,14 @@ async function fetchExportText(routerId) {
 }
 
 async function createBackup(routerId, { triggeredBy = 'manual', createdBy = 'admin', note = '' } = {}) {
-    const router = await MikrotikRouter.findById(routerId).select('_id name');
+    const router = await MikrotikRouter.findById(routerId).select('_id name routerosVersion routerboardInfo');
     if (!router) {
         throw new Error('Router not found');
     }
 
     const exportText = await fetchExportText(routerId);
     const createdAt = new Date();
+    const readiness = evaluateRestoreReadiness(exportText, router);
 
     return RouterBackup.create({
         routerId,
@@ -67,6 +93,15 @@ async function createBackup(routerId, { triggeredBy = 'manual', createdBy = 'adm
         triggeredBy,
         createdBy,
         note: String(note || '').trim(),
+        metadata: {
+            routerosVersion: router.routerosVersion || router.routerboardInfo?.firmware || null,
+            boardName: router.routerboardInfo?.boardName || null,
+            model: router.routerboardInfo?.model || null,
+            serialNumber: router.routerboardInfo?.serialNumber || null,
+            restoreCompatible: readiness.restoreCompatible,
+            lastRestoreTestAt: readiness.lastRestoreTestAt,
+            restoreValidationSignals: readiness.restoreValidationSignals
+        },
         createdAt,
         updatedAt: createdAt
     });

@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const MikrotikRouter = require('../models/MikrotikRouter');
 const Client = require('../models/Client');
 const User = require('../models/User');
@@ -5,6 +6,7 @@ const SupportTicket = require('../models/SupportTicket');
 const Subscription = require('../models/Subscription');
 const AdminAuditLog = require('../models/AdminAuditLog');
 const MonitoringIncident = require('../models/MonitoringIncident');
+const RouterMetric = require('../models/RouterMetric');
 const { listAdminRouters } = require('./admin-router-service');
 const { listAdminVpnServers } = require('./admin-vpn-server-service');
 const { getProxyStatus } = require('./tcp-proxy-service');
@@ -96,6 +98,110 @@ function addDateToBuckets(buckets, date, key, bucketMs) {
     buckets[index][key] += 1;
 }
 
+function getBucketWindowPoints(windowConfig) {
+    const now = Date.now();
+    const start = now - windowConfig.ms;
+    const points = [];
+    for (let ts = start; ts <= now; ts += windowConfig.bucketMs) {
+        points.push(ts);
+    }
+    return points;
+}
+
+function resolveMetricTrafficTotals(metric, state) {
+    if (!metric || !state) {
+        return { rx: 0, tx: 0 };
+    }
+
+    if (state.observedPeer?.source === 'runtime_peer') {
+        const publicKey = String(state.observedPeer.publicKey || '').trim();
+        const peer = (metric.wireguardPeers || []).find((item) => String(item?.publicKey || '').trim() === publicKey);
+        return {
+            rx: peer?.rx || 0,
+            tx: peer?.tx || 0
+        };
+    }
+
+    return {
+        rx: metric.wireguardSummary?.totalTransferRx || 0,
+        tx: metric.wireguardSummary?.totalTransferTx || 0
+    };
+}
+
+async function buildTrafficTrendSeries(dataset, windowConfig) {
+    const trackedStates = dataset.routerStates.filter((state) => state.peerMonitorable);
+    if (!trackedStates.length) {
+        return [{
+            timestamp: new Date().toISOString(),
+            totalTransferRx: 0,
+            totalTransferTx: 0,
+            totalTransferBytes: 0
+        }];
+    }
+
+    const sourceRouterIds = Array.from(new Set(
+        trackedStates.map((state) => String(state.observedPeer?.sourceRouterId || state.router._id))
+    ));
+    const objectIds = sourceRouterIds
+        .filter((value) => /^[a-f\d]{24}$/i.test(value))
+        .map((value) => new mongoose.Types.ObjectId(value));
+    const since = new Date(Date.now() - windowConfig.ms);
+    const metrics = await RouterMetric.find({
+        routerId: { $in: objectIds },
+        timestamp: { $gte: since }
+    }).sort({ routerId: 1, timestamp: 1 }).lean();
+
+    const metricsBySourceRouterId = new Map();
+    for (const metric of metrics) {
+        const key = String(metric.routerId);
+        if (!metricsBySourceRouterId.has(key)) {
+            metricsBySourceRouterId.set(key, []);
+        }
+        metricsBySourceRouterId.get(key).push(metric);
+    }
+
+    const bucketPoints = getBucketWindowPoints(windowConfig);
+    const series = bucketPoints.map((timestamp) => ({
+        timestamp: new Date(timestamp).toISOString(),
+        totalTransferRx: 0,
+        totalTransferTx: 0,
+        totalTransferBytes: 0
+    }));
+
+    for (const state of trackedStates) {
+        const sourceRouterId = String(state.observedPeer?.sourceRouterId || state.router._id);
+        const routerMetrics = metricsBySourceRouterId.get(sourceRouterId) || [];
+        let metricIndex = 0;
+        let currentMetric = null;
+        let previousTotals = null;
+
+        for (const point of series) {
+            const pointTime = new Date(point.timestamp).getTime();
+            while (metricIndex < routerMetrics.length && new Date(routerMetrics[metricIndex].timestamp).getTime() <= pointTime) {
+                currentMetric = routerMetrics[metricIndex];
+                metricIndex += 1;
+            }
+
+            if (!currentMetric) {
+                previousTotals = null;
+                continue;
+            }
+
+            const totals = resolveMetricTrafficTotals(currentMetric, state);
+            if (previousTotals) {
+                const rxDelta = totals.rx >= previousTotals.rx ? (totals.rx - previousTotals.rx) : totals.rx;
+                const txDelta = totals.tx >= previousTotals.tx ? (totals.tx - previousTotals.tx) : totals.tx;
+                point.totalTransferRx += rxDelta;
+                point.totalTransferTx += txDelta;
+                point.totalTransferBytes += (rxDelta + txDelta);
+            }
+            previousTotals = totals;
+        }
+    }
+
+    return series;
+}
+
 function getHandshakeAgeMs(lastHandshake) {
     if (!lastHandshake) return null;
     const time = new Date(lastHandshake).getTime();
@@ -109,7 +215,12 @@ function getHandshakeState(client) {
     return age > 180000 ? 'stale' : 'fresh';
 }
 
+function isManagementOnlyRouter(router) {
+    return String(router?.connectionMode || '').trim() === 'management_only';
+}
+
 function getProvisioningState(router, client) {
+    if (isManagementOnlyRouter(router)) return 'management_only';
     if (!client) return 'failed';
     if (router.status === 'inactive') return 'disabled';
     if (router.firstConnectedAt) return 'connected';
@@ -130,6 +241,14 @@ function getRouterTelemetryState(router) {
 }
 
 function getProxyHealth(router) {
+    if (isManagementOnlyRouter(router)) {
+        return {
+            running: false,
+            unhealthyPorts: [],
+            proxyStatus: { running: false, notRequired: true }
+        };
+    }
+
     const proxyStatus = getProxyStatus(router._id);
     const running = Boolean(proxyStatus.running);
     const unhealthyPorts = [];
@@ -150,18 +269,25 @@ function getProxyHealth(router) {
     };
 }
 
-function buildRouterOperationalState(router) {
+function buildRouterOperationalState(router, latestMetricByRouterId = new Map(), routerById = new Map()) {
     const client = router.wireguardClientId || null;
+    const managementOnly = isManagementOnlyRouter(router);
+    const observedPeer = resolveObservedPeerData(router, client, latestMetricByRouterId, routerById);
     const telemetry = getRouterTelemetryState(router);
     const proxy = getProxyHealth(router);
-    const handshakeState = getHandshakeState(client);
+    const handshakeState = observedPeer?.handshakeState || (managementOnly ? 'management_only' : getHandshakeState(client));
     const issues = [];
+    const peerMonitorable = Boolean(observedPeer);
 
     if (router.status === 'offline') issues.push('offline');
-    if (!client) issues.push('missing_peer');
-    if (client && !client.enabled) issues.push('peer_disabled');
-    if (handshakeState === 'none') issues.push('no_handshake');
-    if (handshakeState === 'stale') issues.push('stale_handshake');
+    if (peerMonitorable) {
+        if (!observedPeer.enabled) issues.push('peer_disabled');
+        if (handshakeState === 'none') issues.push('no_handshake');
+        if (handshakeState === 'stale') issues.push('stale_handshake');
+        if (observedPeer.unresolved) issues.push('tracked_peer_unresolved');
+    } else if (!managementOnly) {
+        issues.push('missing_peer');
+    }
     if (router.provisioningError) issues.push('provisioning_error');
     if (telemetry.staleTelemetry) issues.push('stale_telemetry');
     issues.push(...proxy.unhealthyPorts);
@@ -169,6 +295,9 @@ function buildRouterOperationalState(router) {
     return {
         router,
         client,
+        managementOnly,
+        observedPeer,
+        peerMonitorable,
         telemetry,
         proxy,
         handshakeState,
@@ -182,6 +311,112 @@ function stripCidr(value) {
     const normalized = String(value || '').trim();
     if (!normalized) return '';
     return normalized.split('/')[0].trim();
+}
+
+function parseRuntimePeerTrackingMetadata(notes = '') {
+    const body = String(notes || '');
+    const markerMatch = body.match(/\[tracked-wireguard-peer\s+sourceRouter=([^\s\]]+)\s+peerPublicKey=([^\]]+)\]/);
+    if (!markerMatch) return null;
+
+    return {
+        sourceRouterId: String(markerMatch[1] || '').trim() || null,
+        peerPublicKey: String(markerMatch[2] || '').trim() || null
+    };
+}
+
+async function getLatestRouterMetrics(routerIds = []) {
+    const normalizedIds = routerIds.map((routerId) => String(routerId || '').trim()).filter(Boolean);
+    if (!normalizedIds.length) {
+        return new Map();
+    }
+
+    const objectIds = normalizedIds
+        .filter((value) => /^[a-f\d]{24}$/i.test(value))
+        .map((value) => new mongoose.Types.ObjectId(value));
+
+    if (!objectIds.length) {
+        return new Map();
+    }
+
+    const latestMetrics = await RouterMetric.aggregate([
+        { $match: { routerId: { $in: objectIds } } },
+        { $sort: { routerId: 1, timestamp: -1 } },
+        {
+            $group: {
+                _id: '$routerId',
+                metric: { $first: '$$ROOT' }
+            }
+        }
+    ]);
+
+    return new Map(
+        latestMetrics.map((entry) => [String(entry._id), entry.metric])
+    );
+}
+
+function resolveObservedPeerData(router, client, latestMetricByRouterId = new Map(), routerById = new Map()) {
+    if (client) {
+        return {
+            source: 'platform_peer',
+            peerId: client._id ? String(client._id) : null,
+            peerName: client.name || null,
+            publicKey: client.publicKey || null,
+            enabled: Boolean(client.enabled),
+            lastHandshake: client.lastHandshake || null,
+            handshakeState: getHandshakeState(client),
+            transferRx: client.transferRx || 0,
+            transferTx: client.transferTx || 0,
+            sourceRouterId: String(router._id),
+            sourceRouterName: router.name || null,
+            sourceServerNode: router.serverNode || 'wireguard'
+        };
+    }
+
+    if (!isManagementOnlyRouter(router)) {
+        return null;
+    }
+
+    const tracking = parseRuntimePeerTrackingMetadata(router.notes || '');
+    if (!tracking?.sourceRouterId || !tracking.peerPublicKey) {
+        return null;
+    }
+
+    const sourceMetric = latestMetricByRouterId.get(String(tracking.sourceRouterId));
+    const sourceRouter = routerById.get(String(tracking.sourceRouterId));
+    const peer = (sourceMetric?.wireguardPeers || []).find((item) => String(item?.publicKey || '').trim() === tracking.peerPublicKey);
+    if (!peer) {
+        return {
+            source: 'runtime_peer',
+            peerId: tracking.peerPublicKey,
+            peerName: null,
+            publicKey: tracking.peerPublicKey,
+            enabled: false,
+            lastHandshake: null,
+            handshakeState: 'none',
+            transferRx: 0,
+            transferTx: 0,
+            sourceRouterId: String(tracking.sourceRouterId),
+            sourceRouterName: sourceRouter?.name || null,
+            sourceServerNode: sourceRouter?.serverNode || 'management-only',
+            unresolved: true
+        };
+    }
+
+    return {
+        source: 'runtime_peer',
+        peerId: tracking.peerPublicKey,
+        peerName: peer.interface || tracking.peerPublicKey,
+        publicKey: tracking.peerPublicKey,
+        enabled: !peer.disabled,
+        lastHandshake: peer.lastHandshake || null,
+        handshakeState: peer.handshakeState || 'none',
+        transferRx: peer.rx || 0,
+        transferTx: peer.tx || 0,
+        sourceRouterId: String(tracking.sourceRouterId),
+        sourceRouterName: sourceRouter?.name || null,
+        sourceServerNode: sourceRouter?.serverNode || 'management-only',
+        unresolved: false
+    };
 }
 
 function buildRouterClientFallbackMaps(routers = [], clients = []) {
@@ -290,8 +525,10 @@ async function loadMonitoringDataset() {
         ...router,
         wireguardClientId: router.wireguardClientId || clientByRouterId.get(String(router._id)) || null
     }));
+    const routerById = new Map(hydratedRouters.map((router) => [String(router._id), router]));
+    const latestMetricByRouterId = await getLatestRouterMetrics(hydratedRouters.map((router) => router._id));
 
-    const routerStates = hydratedRouters.map(buildRouterOperationalState);
+    const routerStates = hydratedRouters.map((router) => buildRouterOperationalState(router, latestMetricByRouterId, routerById));
     const openTickets = tickets.filter((ticket) => ['open', 'in_progress'].includes(ticket.status));
     const subscriptionByRouterId = new Map(subscriptions.map((item) => [String(item.routerId), item]));
     const serverItems = serversResult.items || [];
@@ -313,6 +550,7 @@ async function loadMonitoringDataset() {
     return {
         routers: hydratedRouters,
         routerStates,
+        latestMetricByRouterId,
         users,
         clients,
         usersById,
@@ -384,7 +622,7 @@ function buildDerivedIncidents(dataset) {
             });
         }
 
-        if (state.handshakeState === 'stale' || state.handshakeState === 'none') {
+        if (state.peerMonitorable && (state.handshakeState === 'stale' || state.handshakeState === 'none')) {
             incidents.push({
                 incidentKey: `router:${router._id}:handshake_${state.handshakeState}`,
                 sourceType: 'peer',
@@ -397,7 +635,7 @@ function buildDerivedIncidents(dataset) {
                 relatedServerId: null,
                 relatedClientId: state.client?._id || null,
                 impact: { affectedRouters: 1, affectedUsers: userKey ? 1 : 0 },
-                metadata: baseMetadata
+                metadata: { ...baseMetadata, peerSource: state.observedPeer?.source || null, peerPublicKey: state.observedPeer?.publicKey || null }
             });
         }
 
@@ -418,7 +656,7 @@ function buildDerivedIncidents(dataset) {
             });
         }
 
-        if (state.proxy.unhealthyPorts.length > 0) {
+        if (!state.managementOnly && state.proxy.unhealthyPorts.length > 0) {
             incidents.push({
                 incidentKey: `router:${router._id}:ports`,
                 sourceType: 'router',
@@ -567,11 +805,13 @@ async function synchronizeMonitoringIncidents() {
 async function getMonitoringOverview() {
     const dataset = await synchronizeMonitoringIncidents();
     const incidents = await MonitoringIncident.find({ status: { $in: ['open', 'acknowledged'] } }).lean();
-    const totalPeers = dataset.routerStates.length;
-    const activePeers = dataset.routerStates.filter((state) => state.handshakeState === 'fresh').length;
-    const stalePeers = dataset.routerStates.filter((state) => state.handshakeState !== 'fresh').length;
-    const missingPorts = dataset.routerStates.filter((state) => state.proxy.unhealthyPorts.includes('missing_ports')).length;
-    const brokenAccessMappings = dataset.routerStates.filter((state) => state.proxy.unhealthyPorts.some((issue) => issue.endsWith('_proxy_down') || issue === 'proxy_stopped')).length;
+    const peerManagedStates = dataset.routerStates.filter((state) => state.peerMonitorable);
+    const wireguardManagedStates = dataset.routerStates.filter((state) => !state.managementOnly);
+    const totalPeers = peerManagedStates.length;
+    const activePeers = peerManagedStates.filter((state) => state.handshakeState === 'fresh').length;
+    const stalePeers = peerManagedStates.filter((state) => state.handshakeState !== 'fresh').length;
+    const missingPorts = wireguardManagedStates.filter((state) => state.proxy.unhealthyPorts.includes('missing_ports')).length;
+    const brokenAccessMappings = wireguardManagedStates.filter((state) => state.proxy.unhealthyPorts.some((issue) => issue.endsWith('_proxy_down') || issue === 'proxy_stopped')).length;
     const unhealthyRouters = dataset.routerStates.filter((state) => state.unhealthy).length;
     const pendingSetupRouters = dataset.routerStates.filter((state) => ['pending', 'awaiting_connection'].includes(state.setupState)).length;
     const failedProvisioningRouters = dataset.routerStates.filter((state) => state.setupState === 'failed').length;
@@ -655,7 +895,7 @@ async function getMonitoringDiagnostics() {
 
     for (const state of dataset.routerStates) {
         const router = state.router;
-        if (!state.client) {
+        if (!state.managementOnly && !state.client) {
             issues.push({
                 code: 'router_missing_peer',
                 severity: 'critical',
@@ -675,7 +915,7 @@ async function getMonitoringDiagnostics() {
                 message: 'Router does not have a valid VPN server assignment.'
             });
         }
-        if (state.proxy.unhealthyPorts.length > 0) {
+        if (!state.managementOnly && state.proxy.unhealthyPorts.length > 0) {
             issues.push({
                 code: 'router_port_mapping_issue',
                 severity: 'high',
@@ -685,14 +925,14 @@ async function getMonitoringDiagnostics() {
                 message: `Router has unhealthy public access mappings: ${state.proxy.unhealthyPorts.join(', ')}.`
             });
         }
-        if (state.handshakeState !== 'fresh') {
+        if (state.peerMonitorable && state.handshakeState !== 'fresh') {
             issues.push({
                 code: 'router_handshake_issue',
                 severity: state.handshakeState === 'stale' ? 'high' : 'medium',
                 resourceType: 'router',
                 resourceId: String(router._id),
                 resourceName: router.name,
-                message: `Router peer handshake state is ${state.handshakeState}.`
+                message: `Router peer handshake state is ${state.handshakeState}${state.observedPeer?.source === 'runtime_peer' ? ' (runtime tracked peer)' : ''}.`
             });
         }
     }
@@ -866,6 +1106,8 @@ async function getMonitoringActivity(query = {}) {
 
 async function getRouterHealthSummary() {
     const dataset = await loadMonitoringDataset();
+    const wireguardManagedStates = dataset.routerStates.filter((state) => !state.managementOnly);
+    const peerManagedStates = dataset.routerStates.filter((state) => state.peerMonitorable);
     const byStatus = {
         pending: 0,
         active: 0,
@@ -877,7 +1119,8 @@ async function getRouterHealthSummary() {
         awaiting_connection: 0,
         connected: 0,
         failed: 0,
-        disabled: 0
+        disabled: 0,
+        management_only: 0
     };
     const byServer = {};
 
@@ -892,10 +1135,10 @@ async function getRouterHealthSummary() {
         totalRouters: dataset.routerStates.length,
         byStatus,
         bySetupState,
-        staleHandshakeRouters: dataset.routerStates.filter((state) => state.handshakeState === 'stale').length,
-        noHandshakeRouters: dataset.routerStates.filter((state) => state.handshakeState === 'none').length,
+        staleHandshakeRouters: peerManagedStates.filter((state) => state.handshakeState === 'stale').length,
+        noHandshakeRouters: peerManagedStates.filter((state) => state.handshakeState === 'none').length,
         staleTelemetryRouters: dataset.routerStates.filter((state) => state.telemetry.staleTelemetry).length,
-        missingPortsRouters: dataset.routerStates.filter((state) => state.proxy.unhealthyPorts.includes('missing_ports')).length,
+        missingPortsRouters: wireguardManagedStates.filter((state) => state.proxy.unhealthyPorts.includes('missing_ports')).length,
         unhealthyRouters: dataset.routerStates.filter((state) => state.unhealthy).length,
         byServer
     };
@@ -958,14 +1201,15 @@ async function listStaleVpnServers(query = {}) {
 
 async function getPeerHealthSummary() {
     const dataset = await loadMonitoringDataset();
-    const peers = dataset.routerStates.map((state) => state.client).filter(Boolean);
+    const peerStates = dataset.routerStates.filter((state) => state.peerMonitorable);
+    const peers = peerStates.map((state) => state.observedPeer).filter(Boolean);
     return {
         totalPeers: peers.length,
-        activePeers: dataset.routerStates.filter((state) => state.handshakeState === 'fresh').length,
-        stalePeers: dataset.routerStates.filter((state) => state.handshakeState === 'stale').length,
-        peersWithNoHandshake: dataset.routerStates.filter((state) => state.handshakeState === 'none').length,
+        activePeers: peerStates.filter((state) => state.handshakeState === 'fresh').length,
+        stalePeers: peerStates.filter((state) => state.handshakeState === 'stale').length,
+        peersWithNoHandshake: peerStates.filter((state) => state.handshakeState === 'none').length,
         disabledPeers: peers.filter((peer) => !peer.enabled).length,
-        unlinkedRouters: dataset.routerStates.filter((state) => !state.client).length,
+        unlinkedRouters: peerStates.filter((state) => !state.observedPeer).length,
         totalTransferRx: peers.reduce((sum, peer) => sum + (peer.transferRx || 0), 0),
         totalTransferTx: peers.reduce((sum, peer) => sum + (peer.transferTx || 0), 0)
     };
@@ -974,10 +1218,11 @@ async function getPeerHealthSummary() {
 async function listStalePeers(query = {}) {
     const dataset = await loadMonitoringDataset();
     const items = dataset.routerStates
+        .filter((state) => state.peerMonitorable)
         .filter((state) => state.handshakeState === 'stale' || state.handshakeState === 'none')
         .map((state) => ({
-            id: state.client ? String(state.client._id) : `missing-${state.router._id}`,
-            peerName: state.client?.name || null,
+            id: state.observedPeer?.peerId || `missing-${state.router._id}`,
+            peerName: state.observedPeer?.peerName || null,
             router: {
                 id: String(state.router._id),
                 name: state.router.name
@@ -987,12 +1232,12 @@ async function listStalePeers(query = {}) {
                 name: state.router.userId.name || null,
                 email: state.router.userId.email || null
             } : null,
-            enabled: Boolean(state.client?.enabled),
+            enabled: Boolean(state.observedPeer?.enabled),
             handshakeState: state.handshakeState,
-            lastHandshake: state.client?.lastHandshake || null,
-            transferRx: state.client?.transferRx || 0,
-            transferTx: state.client?.transferTx || 0,
-            serverNode: state.router.serverNode || 'wireguard'
+            lastHandshake: state.observedPeer?.lastHandshake || null,
+            transferRx: state.observedPeer?.transferRx || 0,
+            transferTx: state.observedPeer?.transferTx || 0,
+            serverNode: state.observedPeer?.sourceServerNode || state.router.serverNode || 'wireguard'
         }))
         .sort((a, b) => new Date(b.lastHandshake || 0).getTime() - new Date(a.lastHandshake || 0).getTime());
     return paginate(items, query.page, query.limit);
@@ -1001,19 +1246,20 @@ async function listStalePeers(query = {}) {
 async function listUnhealthyPeers(query = {}) {
     const dataset = await loadMonitoringDataset();
     const items = dataset.routerStates
-        .filter((state) => !state.client || !state.client.enabled || state.handshakeState !== 'fresh')
+        .filter((state) => state.peerMonitorable)
+        .filter((state) => !state.observedPeer || !state.observedPeer.enabled || state.handshakeState !== 'fresh')
         .map((state) => ({
-            id: state.client ? String(state.client._id) : `missing-${state.router._id}`,
-            peerName: state.client?.name || null,
+            id: state.observedPeer?.peerId || `missing-${state.router._id}`,
+            peerName: state.observedPeer?.peerName || null,
             router: {
                 id: String(state.router._id),
                 name: state.router.name
             },
-            enabled: Boolean(state.client?.enabled),
+            enabled: Boolean(state.observedPeer?.enabled),
             handshakeState: state.handshakeState,
-            issues: state.issues.filter((issue) => ['missing_peer', 'peer_disabled', 'no_handshake', 'stale_handshake'].includes(issue)),
-            transferRx: state.client?.transferRx || 0,
-            transferTx: state.client?.transferTx || 0
+            issues: state.issues.filter((issue) => ['missing_peer', 'peer_disabled', 'no_handshake', 'stale_handshake', 'tracked_peer_unresolved'].includes(issue)),
+            transferRx: state.observedPeer?.transferRx || 0,
+            transferTx: state.observedPeer?.transferTx || 0
         }));
     return paginate(items, query.page, query.limit);
 }
@@ -1029,10 +1275,10 @@ async function getTrafficSummary() {
                 name: state.router.userId.name || null,
                 email: state.router.userId.email || null
             } : null,
-            serverNode: state.router.serverNode || 'wireguard',
-            transferRx: state.client?.transferRx || 0,
-            transferTx: state.client?.transferTx || 0,
-            totalTransferBytes: (state.client?.transferRx || 0) + (state.client?.transferTx || 0)
+            serverNode: state.observedPeer?.sourceServerNode || state.router.serverNode || 'wireguard',
+            transferRx: state.observedPeer?.transferRx || 0,
+            transferTx: state.observedPeer?.transferTx || 0,
+            totalTransferBytes: (state.observedPeer?.transferRx || 0) + (state.observedPeer?.transferTx || 0)
         }))
         .sort((a, b) => b.totalTransferBytes - a.totalTransferBytes);
 
@@ -1057,17 +1303,14 @@ async function getTrafficSummary() {
 }
 
 async function getTrafficTrends(query = {}) {
-    const summary = await getTrafficSummary();
+    const dataset = await loadMonitoringDataset();
+    const windowConfig = getWindowConfig(query.window);
+    const series = await buildTrafficTrendSeries(dataset, windowConfig);
     return {
-        window: getWindowConfig(query.window).key,
-        supported: false,
-        reason: TRAFFIC_TRENDS_UNSUPPORTED_REASON,
-        series: [{
-            timestamp: new Date().toISOString(),
-            totalTransferRx: summary.totalTransferRx,
-            totalTransferTx: summary.totalTransferTx,
-            totalTransferBytes: summary.totalTransferBytes
-        }]
+        window: windowConfig.key,
+        supported: true,
+        supportedSeries: ['totalTransferRx', 'totalTransferTx', 'totalTransferBytes'],
+        series
     };
 }
 
@@ -1082,10 +1325,10 @@ async function getTopTrafficRouters(query = {}) {
                 name: state.router.userId.name || null,
                 email: state.router.userId.email || null
             } : null,
-            serverNode: state.router.serverNode || 'wireguard',
-            transferRx: state.client?.transferRx || 0,
-            transferTx: state.client?.transferTx || 0,
-            totalTransferBytes: (state.client?.transferRx || 0) + (state.client?.transferTx || 0)
+            serverNode: state.observedPeer?.sourceServerNode || state.router.serverNode || 'wireguard',
+            transferRx: state.observedPeer?.transferRx || 0,
+            transferTx: state.observedPeer?.transferTx || 0,
+            totalTransferBytes: (state.observedPeer?.transferRx || 0) + (state.observedPeer?.transferTx || 0)
         }))
         .sort((a, b) => b.totalTransferBytes - a.totalTransferBytes);
     return paginate(items, query.page, query.limit);
@@ -1134,7 +1377,7 @@ async function buildAffectedCustomerItems() {
         if (state.router.status === 'offline') entry.offlineRouters += 1;
         if (state.unhealthy) entry.unhealthyRouters += 1;
         if (state.setupState === 'failed') entry.failedProvisioningRouters += 1;
-        if (state.handshakeState !== 'fresh') entry.staleRouters += 1;
+        if (state.peerMonitorable && state.handshakeState !== 'fresh') entry.staleRouters += 1;
         const server = dataset.serverByNodeId.get(state.router.serverNode || 'wireguard');
         if (server && server.healthSummary?.status !== 'healthy') {
             entry.affectedByServer = true;
@@ -1175,6 +1418,7 @@ async function getProvisioningSummary() {
     const failed = dataset.routerStates.filter((state) => state.setupState === 'failed').length;
     const connected = dataset.routerStates.filter((state) => state.setupState === 'connected').length;
     const pending = dataset.routerStates.filter((state) => state.setupState === 'pending').length;
+    const managementOnly = dataset.routerStates.filter((state) => state.setupState === 'management_only').length;
 
     let totalSetupCompletionMs = 0;
     let setupCompletionCount = 0;
@@ -1195,6 +1439,7 @@ async function getProvisioningSummary() {
         awaitingFirstHandshake,
         setupSucceeded: connected,
         provisioningFailures: failed,
+        managementOnlyRouters: managementOnly,
         averageSetupCompletionMinutes: setupCompletionCount ? Number((totalSetupCompletionMs / setupCompletionCount / 60000).toFixed(2)) : null
     };
 }

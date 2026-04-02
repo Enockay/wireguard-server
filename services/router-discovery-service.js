@@ -144,6 +144,27 @@ function normalizeVerificationMetadata(metadata) {
     };
 }
 
+async function assertEndpointHostAvailable(host, excludeRouterId = null) {
+    const normalizedHost = String(host || '').trim();
+    if (!normalizedHost) return;
+
+    const query = {
+        $or: [
+            { 'discoveryInfo.localAddress': normalizedHost },
+            { 'managementEndpoints.host': normalizedHost }
+        ]
+    };
+
+    if (excludeRouterId) {
+        query._id = { $ne: excludeRouterId };
+    }
+
+    const conflict = await MikrotikRouter.findOne(query).select('_id name discoveryInfo.localAddress managementEndpoints').lean();
+    if (!conflict) return;
+
+    throw new Error(`Management endpoint ${normalizedHost} is already bound to router ${conflict.name || conflict._id}`);
+}
+
 function normalizeVerificationPayload(verification, fallbackError = null) {
     const normalized = verification || {};
     return {
@@ -473,6 +494,8 @@ async function importDiscoveryCandidate({ sessionId, candidateId, userId, name, 
         throw new Error('This router appears to already be onboarded');
     }
 
+    await assertEndpointHostAvailable(candidate.ipAddress);
+
     const metadata = candidate.verification.metadata || {};
     const routerName = String(name || metadata.identity || candidate.hostname || `router-${candidate.ipAddress.replace(/\./g, '-')}`).trim();
     const importMode = String(connectionMode || 'wireguard').trim().toLowerCase() === 'management_only' ? 'management_only' : 'wireguard';
@@ -524,6 +547,18 @@ async function importDiscoveryCandidate({ sessionId, candidateId, userId, name, 
     if (metadata.routerosVersion) {
         created.router.routerosVersion = metadata.routerosVersion;
     }
+    created.router.endpointBinding = {
+        ...(created.router.endpointBinding || {}),
+        expectedIdentity: metadata.identity || candidate.hostname || created.router.name,
+        expectedSerial: metadata.serialNumber || null,
+        state: importMode === 'management_only' ? 'local_only' : 'tunnel_ready',
+        verifiedEndpointId: null,
+        verifiedEndpointHost: null,
+        verifiedTransport: null,
+        verifiedAt: null,
+        mismatchReason: null,
+        lastMismatchAt: null
+    };
     created.router.lastSeen = new Date();
     if (candidate.verification?.method === 'api') {
         created.router.lastApiSuccessAt = new Date();

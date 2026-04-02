@@ -38,8 +38,11 @@ const {
     getAdminRouterFlags,
     createRouterAdmin,
     createManagementOnlyRouterAdmin,
+    clearEndpointMismatchQuarantine,
+    getEndpointMismatchCooldownState,
     trackRouterRuntimePeer,
     generateRouterSetupArtifacts,
+    markRouterBootstrapApplied,
     disableRouter,
     reactivateRouter,
     resetRouterPeer,
@@ -47,6 +50,7 @@ const {
     reassignRouterPorts,
     markRouterProvisioningReviewed,
     updateRouterManagementPolicy,
+    updateRouterSafeMode,
     deleteRouterAdmin
 } = require('../services/admin-router-service');
 
@@ -131,10 +135,31 @@ function buildManualManagementEndpoints(payload = {}, connectionMode = 'wireguar
     return endpoints;
 }
 
+async function assertManagementEndpointAvailability(routerId, endpoints = []) {
+    const hosts = [...new Set((endpoints || []).map((endpoint) => String(endpoint?.host || '').trim()).filter(Boolean))];
+    if (!hosts.length) return;
+
+    const conflict = await MikrotikRouter.findOne({
+        _id: { $ne: routerId },
+        $or: [
+            { 'managementEndpoints.host': { $in: hosts } },
+            { 'discoveryInfo.localAddress': { $in: hosts } }
+        ]
+    }).select('_id name').lean();
+
+    if (conflict) {
+        throw new Error(`Management endpoint ${hosts[0]} is already bound to router ${conflict.name || conflict._id}`);
+    }
+}
+
 async function configureRouterAccess(router, req, options = {}) {
+    const previousHost = normalizeText((router.managementEndpoints || [])[0]?.host || router.discoveryInfo?.localAddress);
+    const previousIdentity = normalizeText(router.endpointBinding?.expectedIdentity || router.discoveryInfo?.hostname || router.name);
+    const previousApiPort = router.apiPort || null;
     const apiUsername = normalizeText(options.apiUsername);
     const apiPassword = options.apiPassword == null ? null : String(options.apiPassword).trim();
     const apiPort = normalizePortValue(options.apiPort, null);
+    const sshPort = normalizePortValue(options.sshPort, null);
     const managementEndpoints = buildManualManagementEndpoints(options, router.connectionMode || 'wireguard');
     const localAddress = normalizeText(options.localAddress || options.managementIp || options.managementHost);
     const hostname = normalizeText(options.hostname);
@@ -146,15 +171,39 @@ async function configureRouterAccess(router, req, options = {}) {
     if (apiPort != null) {
         router.apiPort = apiPort;
     }
+    if (sshPort != null) {
+        router.sshPort = sshPort;
+    }
     if (managementEndpoints.length) {
+        await assertManagementEndpointAvailability(router._id, managementEndpoints);
         router.managementEndpoints = managementEndpoints;
+        router.endpointBinding = {
+            ...(router.endpointBinding || {}),
+            state: router.connectionMode === 'management_only' ? 'local_only' : (router.vpnIp ? 'tunnel_ready' : 'unknown'),
+            verifiedEndpointId: null,
+            verifiedEndpointHost: null,
+            verifiedTransport: null,
+            verifiedAt: null,
+            mismatchReason: null,
+            lastMismatchAt: null
+        };
     }
     if (localAddress || hostname) {
+        if (localAddress) {
+            await assertManagementEndpointAvailability(router._id, [{ host: localAddress }]);
+        }
         router.discoveryInfo = {
             ...(router.discoveryInfo || {}),
             localAddress: localAddress || router.discoveryInfo?.localAddress || null,
             hostname: hostname || router.discoveryInfo?.hostname || null,
             source: 'manual'
+        };
+        router.endpointBinding = {
+            ...(router.endpointBinding || {}),
+            expectedIdentity: hostname || router.endpointBinding?.expectedIdentity || router.name,
+            state: router.connectionMode === 'management_only' && (localAddress || managementEndpoints.length)
+                ? 'local_only'
+                : (router.endpointBinding?.state || 'unknown')
         };
     }
     if (deviceDetails) {
@@ -186,10 +235,33 @@ async function configureRouterAccess(router, req, options = {}) {
     }
 
     await router.save();
+    await clearEndpointMismatchQuarantine(router._id);
+    const nextHost = normalizeText((router.managementEndpoints || [])[0]?.host || router.discoveryInfo?.localAddress);
+    const nextIdentity = normalizeText(router.endpointBinding?.expectedIdentity || router.discoveryInfo?.hostname || router.name);
+    if (previousHost !== nextHost || previousIdentity !== nextIdentity || previousApiPort !== (router.apiPort || null)) {
+        router.endpointHistory = [
+            {
+                changedAt: new Date(),
+                changedBy: req.adminUser?.email || 'admin',
+                reason: normalizeReason(options.reason) || 'Updated router management endpoint',
+                previousHost,
+                nextHost,
+                previousIdentity,
+                nextIdentity,
+                previousApiPort,
+                nextApiPort: router.apiPort || null,
+                validationState: 'pending',
+                validationMessage: null
+            },
+            ...(router.endpointHistory || [])
+        ].slice(0, 25);
+        await router.save();
+    }
     return { pendingCredential };
 }
 
 async function testRouterConnection(routerId, req) {
+    await clearEndpointMismatchQuarantine(routerId);
     const [resource, interfaces] = await Promise.all([
         getSystemResource(routerId, getActorContext(req)),
         getInterfaces(routerId, getActorContext(req))
@@ -274,6 +346,17 @@ function resolveRouterExecutionError(error, fallbackMessage) {
     const message = error?.message || fallbackMessage;
     if (message === 'Router not found') {
         return { status: 404, payload: { success: false, error: message } };
+    }
+    if (message === 'endpoint_mismatch_cooldown' || error?.failureType === 'stale_endpoint') {
+        return {
+            status: 409,
+            payload: {
+                success: false,
+                error: 'Router endpoint mismatch',
+                code: 'endpoint_mismatch',
+                details: message
+            }
+        };
     }
     if (message === 'capability_missing' || error?.failureType === 'capability_missing') {
         return { status: 403, payload: { success: false, error: 'Router capability missing', code: 'capability_missing' } };
@@ -1164,6 +1247,97 @@ function registerAdminRouterRoutes(app) {
         }
     });
 
+    app.post('/api/admin/routers/:id/set-access', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const managementHost = normalizeText(req.body?.managementHost || req.body?.managementIp || req.body?.localAddress);
+            const hostname = normalizeText(req.body?.hostname);
+            const apiPortValue = req.body?.apiPort;
+            const apiPort = apiPortValue == null || apiPortValue === '' ? null : Number(apiPortValue);
+            const sshPortValue = req.body?.sshPort;
+            const sshPort = sshPortValue == null || sshPortValue === '' ? null : Number(sshPortValue);
+
+            if (!managementHost && !hostname && apiPort == null && sshPort == null) {
+                return res.status(400).json({ success: false, error: 'Provide at least one access field to update' });
+            }
+
+            if (apiPort != null && (!Number.isInteger(apiPort) || apiPort < 1 || apiPort > 65535)) {
+                return res.status(400).json({ success: false, error: 'API port must be between 1 and 65535' });
+            }
+
+            if (sshPort != null && (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535)) {
+                return res.status(400).json({ success: false, error: 'SSH port must be between 1 and 65535' });
+            }
+
+            await configureRouterAccess(router, req, {
+                managementHost,
+                hostname,
+                apiPort,
+                sshPort,
+                includeSshFallback: req.body?.includeSshFallback,
+                allowInsecureTls: req.body?.allowInsecureTls,
+                managementTransport: req.body?.managementTransport
+            });
+
+            await audit(req, router, 'admin.routers.set_access', normalizeReason(req.body?.reason) || 'Updated router management endpoint', {
+                managementHost: managementHost || router.discoveryInfo?.localAddress || null,
+                hostname: hostname || router.discoveryInfo?.hostname || null,
+                apiPort: router.apiPort || null,
+                sshPort: sshPort || router.sshPort || null
+            });
+
+            return res.json({
+                success: true,
+                message: 'Router management endpoint updated',
+                data: {
+                    managementHost: router.discoveryInfo?.localAddress || managementHost || null,
+                    hostname: router.discoveryInfo?.hostname || hostname || null,
+                    apiPort: router.apiPort || null,
+                    sshPort: sshPort || router.sshPort || null,
+                    connectionMode: router.connectionMode || 'wireguard',
+                    endpointBinding: router.endpointBinding || null
+                }
+            });
+        } catch (error) {
+            const status = /already bound to router/i.test(String(error?.message || '')) ? 409 : 500;
+            return res.status(status).json({ success: false, error: 'Failed to update router management endpoint', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/safe-mode', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+
+            const enabled = normalizeBoolean(req.body?.enabled, false);
+            const requireBreakGlass = normalizeBoolean(req.body?.requireBreakGlass, true);
+            const breakGlassCode = req.body?.breakGlassCode == null ? undefined : String(req.body.breakGlassCode || '').trim();
+            const note = normalizeText(req.body?.note);
+            const result = await updateRouterSafeMode(req.params.id, {
+                enabled,
+                requireBreakGlass,
+                breakGlassCode,
+                note,
+                actor: req.adminUser?.email || 'admin'
+            });
+
+            await audit(req, router, 'admin.routers.safe_mode', normalizeReason(req.body?.reason) || (enabled ? 'Enabled router safe mode' : 'Disabled router safe mode'), {
+                enabled,
+                requireBreakGlass
+            });
+
+            return res.json({
+                success: true,
+                message: enabled ? 'Router safe mode enabled' : 'Router safe mode disabled',
+                data: result
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to update router safe mode', details: error.message });
+        }
+    });
+
     app.post('/api/admin/routers/:id/test-connection', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.VIEW_CONNECTIVITY), async (req, res) => {
         try {
             const router = await getRouterOr404(req, res);
@@ -1465,6 +1639,23 @@ function registerAdminRouterRoutes(app) {
         }
     });
 
+    app.post('/api/admin/routers/:id/bootstrap-applied', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.REPROVISION), async (req, res) => {
+        try {
+            const router = await getRouterOr404(req, res);
+            if (!router) return;
+            const data = await markRouterBootstrapApplied(req.params.id, {
+                actor: req.adminUser?.email || 'admin',
+                note: normalizeText(req.body?.note || req.body?.reason) || ''
+            });
+            await audit(req, router, 'admin.routers.bootstrap_applied', normalizeReason(req.body?.reason) || 'Marked bootstrap package as applied', {
+                lastAppliedAt: data?.lastAppliedAt || null
+            });
+            return res.json({ success: true, message: 'Bootstrap package marked as applied', data });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to mark bootstrap package as applied', details: error.message });
+        }
+    });
+
     app.post('/api/admin/routers/:id/reassign-ports', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.REASSIGN_PORTS), async (req, res) => {
         try {
             const router = await getRouterOr404(req, res);
@@ -1609,9 +1800,19 @@ function registerAdminRouterRoutes(app) {
             }
 
             const breakGlass = Boolean(req.body?.breakGlass);
+            const breakGlassCode = req.body?.breakGlassCode == null ? undefined : String(req.body.breakGlassCode || '').trim();
+            const mutatingCommand = !/\/print\b|\/export\b|\/ping\b|\/monitor\b|\/get\b/i.test(command);
+            if (router.safeMode?.enabled && mutatingCommand && !breakGlass) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Router safe mode requires break-glass confirmation for mutating commands',
+                    code: 'safe_mode_break_glass_required'
+                });
+            }
             const result = await executeRouterOperation(req.params.id, 'raw_command', {
                 command,
                 breakGlass,
+                breakGlassCode,
                 metadata: {
                     reason,
                     requestedHost: getRouterManagementHost(router)
@@ -1636,6 +1837,17 @@ function registerAdminRouterRoutes(app) {
             const router = await getRouterOr404(req, res);
             if (!router) return;
 
+            const mismatch = getEndpointMismatchCooldownState(router);
+            if (mismatch.active) {
+                return res.status(409).json({
+                    success: false,
+                    error: 'Router endpoint mismatch',
+                    code: 'endpoint_mismatch',
+                    details: mismatch.reason,
+                    interfaces: []
+                });
+            }
+
             const interfaces = await getInterfaces(req.params.id, getActorContext(req));
             return res.json({ success: true, interfaces });
         } catch (error) {
@@ -1648,6 +1860,25 @@ function registerAdminRouterRoutes(app) {
         try {
             const router = await getRouterOr404(req, res);
             if (!router) return;
+
+            const cooldown = getEndpointMismatchCooldownState(router);
+            if (cooldown.active) {
+                return res.json({
+                    success: false,
+                    health: {
+                        uptime: null,
+                        cpuLoad: null,
+                        freeMemory: null,
+                        totalMemory: null,
+                        freeHddSpace: null,
+                        boardName: null,
+                        routerosVersion: null,
+                        reachable: false,
+                        error: cooldown.reason,
+                        cooldownUntil: cooldown.until?.toISOString?.() || null
+                    }
+                });
+            }
 
             const parsed = await getSystemResource(req.params.id, getActorContext(req));
             return res.json({

@@ -7,6 +7,7 @@ const ServicePlan = require('../models/ServicePlan');
 const Transaction = require('../models/Transaction');
 const AdminAuditLog = require('../models/AdminAuditLog');
 const RouterDiscoverySession = require('../models/RouterDiscoverySession');
+const RouterBackup = require('../models/RouterBackup');
 const { allocatePorts, releasePorts } = require('../utils/port-allocator');
 const { generateKeys, getNextAvailableIP } = require('../utils/route-helpers');
 const { startRouterProxy, stopRouterProxy, restartRouterProxy, getProxyStatus } = require('./tcp-proxy-service');
@@ -190,6 +191,327 @@ function isManagementOnlyRouter(router) {
     return router?.connectionMode === 'management_only';
 }
 
+function normalizeBindingIdentity(value) {
+    return String(value || '').trim() || null;
+}
+
+function buildVisibleManagementEndpoints(router) {
+    const storedEndpoints = (router.managementEndpoints || []).map((endpoint) => ({
+        id: endpoint.id,
+        kind: endpoint.kind,
+        host: endpoint.host,
+        port: endpoint.port,
+        transport: endpoint.transport,
+        priority: endpoint.priority,
+        enabled: endpoint.enabled !== false,
+        health: endpoint.health || 'unknown',
+        authScope: endpoint.authScope || 'unknown',
+        lastSuccessAt: endpoint.lastSuccessAt || null,
+        lastFailureAt: endpoint.lastFailureAt || null,
+        failureType: endpoint.failureType || null,
+        latencyMs: endpoint.latencyMs || null,
+        derived: false
+    }));
+
+    if (!isManagementOnlyRouter(router) && router.vpnIp) {
+        storedEndpoints.unshift({
+            id: 'derived-wireguard-management',
+            kind: 'wireguard_management',
+            host: router.vpnIp,
+            port: router.apiPort || 8728,
+            transport: 'api',
+            priority: 1,
+            enabled: true,
+            health: router.endpointBinding?.state === 'verified_wireguard'
+                ? 'healthy'
+                : (router.endpointHealthSummary || 'unknown'),
+            authScope: 'unknown',
+            lastSuccessAt: router.lastApiSuccessAt || null,
+            lastFailureAt: router.lastApiErrorAt || null,
+            failureType: router.lastApiError || null,
+            latencyMs: null,
+            derived: true
+        });
+    }
+
+    return storedEndpoints;
+}
+
+function buildEndpointContractSummary(router) {
+    const bindingState = router.endpointBinding?.state || 'unknown';
+    const managementOnly = isManagementOnlyRouter(router);
+    const fallbackState = managementOnly
+        ? (router.discoveryInfo?.localAddress ? 'local_only' : 'unknown')
+        : (router.vpnIp ? 'tunnel_ready' : 'unknown');
+    const state = router.failureState?.current === 'stale_endpoint'
+        ? 'mismatch'
+        : (bindingState !== 'unknown' ? bindingState : fallbackState);
+
+    return {
+        state,
+        expectedIdentity: normalizeBindingIdentity(router.endpointBinding?.expectedIdentity || router.discoveryInfo?.hostname || router.name),
+        expectedSerial: normalizeBindingIdentity(router.endpointBinding?.expectedSerial || router.routerboardInfo?.serialNumber),
+        verifiedEndpointId: router.endpointBinding?.verifiedEndpointId || null,
+        verifiedEndpointHost: router.endpointBinding?.verifiedEndpointHost || null,
+        verifiedTransport: router.endpointBinding?.verifiedTransport || null,
+        verifiedAt: router.endpointBinding?.verifiedAt || null,
+        mismatchReason: router.endpointBinding?.mismatchReason
+            || router.failureState?.lastError
+            || (state === 'mismatch' ? 'Endpoint identity mismatch detected during live validation.' : null)
+    };
+}
+
+function calculateEndpointConfidence(router) {
+    const contract = buildEndpointContractSummary(router);
+    let score = 25;
+    const factors = [];
+
+    if (router.vpnIp) {
+        score += 20;
+        factors.push('WireGuard management IP assigned');
+    }
+    if (contract.verifiedEndpointHost) {
+        score += 25;
+        factors.push('Endpoint verified against router identity');
+    }
+    if (contract.expectedSerial) {
+        score += 10;
+        factors.push('Expected serial recorded');
+    }
+    if ((router.managementEndpoints || []).some((endpoint) => endpoint.transport === 'ssh')) {
+        score += 5;
+        factors.push('SSH fallback configured');
+    }
+    if (contract.state === 'mismatch' || contract.state === 'conflict') {
+        score -= 60;
+        factors.push('Endpoint mismatch or conflict detected');
+    }
+    if (router.failureState?.current === 'stale_endpoint') {
+        score -= 25;
+        factors.push('Recent stale endpoint failure');
+    }
+
+    return {
+        score: Math.max(0, Math.min(100, score)),
+        band: score >= 80 ? 'high' : (score >= 55 ? 'medium' : 'low'),
+        factors
+    };
+}
+
+function buildManagementPathMap(router) {
+    const derivedPaths = buildVisibleManagementEndpoints(router).map((endpoint) => ({
+        endpointId: endpoint.id,
+        label: `${endpoint.kind}${endpoint.derived ? ' (derived)' : ''}`,
+        host: endpoint.host,
+        port: endpoint.port,
+        transport: endpoint.transport,
+        pathType: endpoint.kind === 'wireguard_management'
+            ? 'wireguard'
+            : (endpoint.kind.includes('public') ? 'public' : 'local'),
+        health: endpoint.health,
+        failureType: endpoint.failureType || null,
+        lastSuccessAt: endpoint.lastSuccessAt || null,
+        lastFailureAt: endpoint.lastFailureAt || null
+    }));
+
+    const recentObservations = (router.managementPathObservations || [])
+        .slice()
+        .sort((a, b) => new Date(b.observedAt || 0).getTime() - new Date(a.observedAt || 0).getTime())
+        .slice(0, 8)
+        .map((item) => ({
+            observedAt: item.observedAt || null,
+            endpointId: item.endpointId || null,
+            host: item.host || null,
+            port: item.port || null,
+            transport: item.transport || null,
+            pathType: item.pathType || 'derived',
+            operationName: item.operationName || null,
+            outcome: item.outcome || 'selected',
+            failureType: item.failureType || null,
+            message: item.message || null
+        }));
+
+    return {
+        primaryPath: derivedPaths[0] || null,
+        candidates: derivedPaths,
+        recentObservations
+    };
+}
+
+function buildEndpointHistorySummary(router) {
+    return (router.endpointHistory || [])
+        .slice()
+        .sort((a, b) => new Date(b.changedAt || 0).getTime() - new Date(a.changedAt || 0).getTime())
+        .slice(0, 10)
+        .map((item) => ({
+            changedAt: item.changedAt || null,
+            changedBy: item.changedBy || 'system',
+            reason: item.reason || '',
+            previousHost: item.previousHost || null,
+            nextHost: item.nextHost || null,
+            previousIdentity: item.previousIdentity || null,
+            nextIdentity: item.nextIdentity || null,
+            previousApiPort: item.previousApiPort ?? null,
+            nextApiPort: item.nextApiPort ?? null,
+            validationState: item.validationState || 'pending',
+            validationMessage: item.validationMessage || null
+        }));
+}
+
+function buildDriftSummary(router) {
+    const events = (router.driftEvents || [])
+        .slice()
+        .sort((a, b) => new Date(b.detectedAt || 0).getTime() - new Date(a.detectedAt || 0).getTime())
+        .slice(0, 10)
+        .map((item) => ({
+            detectedAt: item.detectedAt || null,
+            eventType: item.eventType,
+            severity: item.severity || 'warning',
+            message: item.message,
+            previousValue: item.previousValue || null,
+            currentValue: item.currentValue || null,
+            endpointHost: item.endpointHost || null,
+            resolvedAt: item.resolvedAt || null
+        }));
+
+    return {
+        activeCount: events.filter((item) => !item.resolvedAt).length,
+        lastDetectedAt: events[0]?.detectedAt || null,
+        events
+    };
+}
+
+function buildSafeModeSummary(router) {
+    const safeMode = router.safeMode || {};
+    return {
+        enabled: Boolean(safeMode.enabled),
+        requireBreakGlass: safeMode.requireBreakGlass !== false,
+        breakGlassConfigured: Boolean(String(safeMode.breakGlassCode || '').trim()),
+        lastEnabledAt: safeMode.lastEnabledAt || null,
+        lastEnabledBy: safeMode.lastEnabledBy || null,
+        note: safeMode.note || null
+    };
+}
+
+function buildBootstrapSummary(router) {
+    const bootstrap = router.remoteBootstrap || {};
+    return {
+        managementInterfaceName: bootstrap.managementInterfaceName || 'wg-mgmt',
+        bootstrapMode: bootstrap.bootstrapMode || 'wireguard_with_api_ssh',
+        preferredManagementSubnet: bootstrap.preferredManagementSubnet || null,
+        apiAllowedSources: bootstrap.apiAllowedSources || [],
+        sshAllowedSources: bootstrap.sshAllowedSources || [],
+        generatedAt: bootstrap.generatedAt || null,
+        lastAppliedAt: bootstrap.lastAppliedAt || null
+    };
+}
+
+async function markRouterBootstrapApplied(routerId, { actor = 'admin', note = '' } = {}) {
+    const router = await MikrotikRouter.findById(routerId);
+    if (!router) return null;
+
+    const appliedAt = new Date();
+    router.remoteBootstrap = {
+        ...(router.remoteBootstrap?.toObject ? router.remoteBootstrap.toObject() : (router.remoteBootstrap || {})),
+        lastAppliedAt: appliedAt
+    };
+    if (note) {
+        router.adminNotes = [
+            {
+                body: `Bootstrap package marked applied: ${String(note).trim()}`,
+                category: 'provisioning',
+                pinned: false,
+                author: actor
+            },
+            ...(router.adminNotes || [])
+        ].slice(0, 50);
+    }
+    await router.save();
+
+    return {
+        lastAppliedAt: appliedAt,
+        bootstrap: buildBootstrapSummary(router)
+    };
+}
+
+async function buildBackupSummary(routerId) {
+    const backups = await RouterBackup.find({ routerId })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean();
+
+    return {
+        count: backups.length,
+        latest: backups[0] ? {
+            id: String(backups[0]._id),
+            filename: backups[0].filename,
+            triggeredBy: backups[0].triggeredBy,
+            createdAt: backups[0].createdAt,
+            metadata: backups[0].metadata || {}
+        } : null,
+        recent: backups.map((item) => ({
+            id: String(item._id),
+            filename: item.filename,
+            triggeredBy: item.triggeredBy,
+            createdAt: item.createdAt,
+            sizeBytes: item.sizeBytes || 0,
+            metadata: item.metadata || {}
+        }))
+    };
+}
+
+function appendEndpointHistory(router, entry = {}) {
+    const nextHistory = [
+        entry,
+        ...(router.endpointHistory || [])
+    ].slice(0, 25);
+    router.endpointHistory = nextHistory;
+}
+
+function appendDriftEvent(router, entry = {}) {
+    const nextEvents = [
+        entry,
+        ...(router.driftEvents || [])
+    ].slice(0, 25);
+    router.driftEvents = nextEvents;
+}
+
+function getEndpointMismatchCooldownState(router, now = Date.now()) {
+    const state = router?.endpointBinding?.state || null;
+    if (state !== 'mismatch') {
+        return {
+            active: false,
+            remainingMs: 0,
+            until: null,
+            reason: null
+        };
+    }
+
+    return {
+        active: true,
+        remainingMs: null,
+        until: null,
+        reason: router?.endpointBinding?.mismatchReason
+            || router?.failureState?.lastError
+            || 'Endpoint identity mismatch detected during live validation.'
+    };
+}
+
+async function clearEndpointMismatchQuarantine(routerId) {
+    if (!routerId) return;
+    await MikrotikRouter.findByIdAndUpdate(routerId, {
+        $set: {
+            'endpointBinding.state': 'unknown',
+            'endpointBinding.verifiedEndpointId': null,
+            'endpointBinding.verifiedEndpointHost': null,
+            'endpointBinding.verifiedTransport': null,
+            'endpointBinding.verifiedAt': null,
+            'endpointBinding.mismatchReason': null,
+            'endpointBinding.lastMismatchAt': null
+        }
+    }).catch(() => undefined);
+}
+
 function resolveOwnerTunnelContext(router, ownerRouters = []) {
     const currentRouterId = String(router?._id || '');
     const candidates = (ownerRouters || [])
@@ -365,6 +687,29 @@ function normalizeWireGuardPeerRecord(record = {}) {
 
 async function fetchRouterWireGuardRuntime(routerId) {
     try {
+        const router = await MikrotikRouter.findById(routerId)
+            .select('endpointBinding failureState discoveryInfo name')
+            .lean();
+
+        if (!router) {
+            return {
+                available: false,
+                interfaces: [],
+                peers: [],
+                error: 'Router not found'
+            };
+        }
+
+        const mismatch = getEndpointMismatchCooldownState(router);
+        if (mismatch.active) {
+            return {
+                available: false,
+                interfaces: [],
+                peers: [],
+                error: mismatch.reason || 'Endpoint identity mismatch'
+            };
+        }
+
         const [interfacesResult, peersResult] = await Promise.all([
             executeRouterOperation(routerId, 'get_system_resource', { command: '/interface/wireguard/print' }, { actor: 'system', actorType: 'system' }),
             executeRouterOperation(routerId, 'get_system_resource', { command: '/interface/wireguard/peers/print' }, { actor: 'system', actorType: 'system' })
@@ -788,22 +1133,9 @@ function buildConnectivitySummary(router, client, ownerTunnelContext = null) {
         rekeyEligible: managementOnly ? false : Boolean(client),
         reconciliationState: managementOnly ? 'management_only' : (client ? (client.enabled ? 'managed' : 'disabled') : 'missing'),
         endpointHealthSummary: router.endpointHealthSummary || 'unknown',
+        endpointContract: buildEndpointContractSummary(router),
         ownerTunnel,
-        endpoints: (router.managementEndpoints || []).map((endpoint) => ({
-            id: endpoint.id,
-            kind: endpoint.kind,
-            host: endpoint.host,
-            port: endpoint.port,
-            transport: endpoint.transport,
-            priority: endpoint.priority,
-            enabled: endpoint.enabled !== false,
-            health: endpoint.health || 'unknown',
-            authScope: endpoint.authScope || 'unknown',
-            lastSuccessAt: endpoint.lastSuccessAt || null,
-            lastFailureAt: endpoint.lastFailureAt || null,
-            failureType: endpoint.failureType || null,
-            latencyMs: endpoint.latencyMs || null
-        }))
+        endpoints: buildVisibleManagementEndpoints(router)
     };
 }
 
@@ -1278,6 +1610,10 @@ function buildDiagnostics(bundle) {
     const proxyStatus = getProxyStatus(router._id);
     const issues = [];
     const managementOnly = isManagementOnlyRouter(router);
+    const endpointContract = buildEndpointContractSummary(router);
+    const confidence = calculateEndpointConfidence(router);
+    const pathMap = buildManagementPathMap(router);
+    const drift = buildDriftSummary(router);
 
     if (!managementOnly && !client) issues.push({ code: 'missing_peer', severity: 'critical', message: 'Router does not have a linked WireGuard client.' });
     if (!managementOnly && client && router.vpnIp !== client.ip) issues.push({ code: 'vpn_ip_mismatch', severity: 'critical', message: 'Router VPN IP does not match linked WireGuard client IP.' });
@@ -1289,16 +1625,26 @@ function buildDiagnostics(bundle) {
     if (!managementOnly && router.status !== 'inactive' && !proxyStatus.running) issues.push({ code: 'proxy_not_running', severity: 'warning', message: 'Router TCP proxy is not currently running.' });
     if (!managementOnly && !subscription) issues.push({ code: 'missing_subscription', severity: 'warning', message: 'Router does not have an associated subscription.' });
     if (router.provisioningError) issues.push({ code: 'provisioning_error', severity: 'critical', message: router.provisioningError });
+    if (endpointContract.state === 'mismatch') issues.push({ code: 'endpoint_mismatch', severity: 'critical', message: endpointContract.mismatchReason || 'Router endpoint identity mismatch detected.' });
+    if (drift.activeCount) issues.push({ code: 'drift_detected', severity: 'warning', message: `${drift.activeCount} unresolved drift events detected.` });
 
     return {
         status: issues.some((issue) => issue.severity === 'critical') ? 'critical' : (issues.length ? 'warning' : 'healthy'),
         issues,
         proxyStatus,
+        endpointDiagnostics: {
+            contract: endpointContract,
+            confidence,
+            pathMap,
+            drift
+        },
         recommendedActions: [
             !managementOnly && issues.some((issue) => issue.code === 'missing_ports') ? 'reassign_ports' : null,
             !managementOnly && issues.some((issue) => issue.code === 'missing_peer') ? 'reprovision' : null,
             !managementOnly && issues.some((issue) => issue.code === 'stale_handshake') ? 'reset_peer' : null,
-            !managementOnly && issues.some((issue) => issue.code === 'proxy_not_running') ? 'reactivate' : null
+            !managementOnly && issues.some((issue) => issue.code === 'proxy_not_running') ? 'reactivate' : null,
+            issues.some((issue) => issue.code === 'endpoint_mismatch') ? 'rebind_endpoint' : null,
+            drift.activeCount ? 'review_drift_events' : null
         ].filter(Boolean)
     };
 }
@@ -1313,6 +1659,11 @@ async function getAdminRouterDetail(routerId) {
     const activity = buildRouterActivity(bundle);
     const wireguard = buildWireGuardWorkspace(bundle, ownerTunnelContext);
     const downstreamDiscovery = await getLatestDownstreamDiscoveryRun(router._id).catch(() => null);
+    const backupSummary = await buildBackupSummary(router._id).catch(() => ({
+        count: 0,
+        latest: null,
+        recent: []
+    }));
     wireguard.runtime = await fetchRouterWireGuardRuntime(String(router._id));
     if (!wireguard.available && wireguard.runtime?.available && wireguard.runtime.peers.length) {
         const runtimePeer = wireguard.runtime.peers[0];
@@ -1400,6 +1751,14 @@ async function getAdminRouterDetail(routerId) {
         customer: owner ? buildCustomerSummary(owner, ownerRouters.length, null, subscription) : null,
         accessPorts: buildPortsSummary(router),
         connectivity: buildConnectivitySummary(router, client, ownerTunnelContext),
+        management: {
+            endpointHistory: buildEndpointHistorySummary(router),
+            endpointConfidence: calculateEndpointConfidence(router),
+            pathMap: buildManagementPathMap(router),
+            drift: buildDriftSummary(router),
+            safeMode: buildSafeModeSummary(router),
+            bootstrap: buildBootstrapSummary(router)
+        },
         discovery: {
             localAddress: router.discoveryInfo?.localAddress || null,
             subnet: router.discoveryInfo?.subnet || null,
@@ -1431,6 +1790,7 @@ async function getAdminRouterDetail(routerId) {
             subscription: normalizeSubscription(subscription),
             transactionsPreview: bundle.transactions.slice(0, 10)
         },
+        backupSummary,
         issues: buildDiagnostics(bundle),
         recentActivity: activity.slice(0, 10),
         notes: (router.adminNotes || []).map(normalizeRouterNote),
@@ -1527,6 +1887,24 @@ function buildMikrotikSetupScript(client, serverPublicKey, serverEndpoint, route
     return `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${routerName} $IFACE $IP $LP"} else={:put "FAIL ${routerName}"}`;
 }
 
+function buildRemoteBootstrapScript(router, client, serverPublicKey, serverEndpoint) {
+    const bootstrap = router.remoteBootstrap || {};
+    const ifaceName = bootstrap.managementInterfaceName || client?.interfaceName || 'wg-mgmt';
+    const apiSources = (bootstrap.apiAllowedSources || ['10.0.0.0/24']).join(',');
+    const sshSources = (bootstrap.sshAllowedSources || ['10.0.0.0/24']).join(',');
+    const setupScript = buildMikrotikSetupScript(client, serverPublicKey, serverEndpoint, router.name);
+
+    return [
+        '# Remote management bootstrap package',
+        `# Router: ${router.name}`,
+        `# Mode: ${bootstrap.bootstrapMode || 'wireguard_with_api_ssh'}`,
+        setupScript,
+        `/ip service set api address=${apiSources} disabled=no port=${router.apiPort || 8728}`,
+        `/ip service set ssh address=${sshSources} disabled=no port=${router.sshPort || 22}`,
+        `:put "Remote management interface ${ifaceName} prepared."`
+    ].join('\n');
+}
+
 async function generateRouterSetupArtifacts(routerId) {
     const bundle = await getRouterBundle(routerId);
     if (!bundle) return null;
@@ -1539,6 +1917,10 @@ async function generateRouterSetupArtifacts(routerId) {
     const serverEndpoint = client.endpoint || getServerEndpoint();
 
     router.lastSetupGeneratedAt = new Date();
+    router.remoteBootstrap = {
+        ...(router.remoteBootstrap || {}),
+        generatedAt: router.lastSetupGeneratedAt
+    };
     await router.save();
 
     return {
@@ -1546,6 +1928,8 @@ async function generateRouterSetupArtifacts(routerId) {
         generatedAt: router.lastSetupGeneratedAt,
         wireguardConfig: buildWireGuardConfig(client, serverPublicKey, serverEndpoint),
         mikrotikScript: buildMikrotikSetupScript(client, serverPublicKey, serverEndpoint, router.name),
+        managementBootstrapScript: buildRemoteBootstrapScript(router, client, serverPublicKey, serverEndpoint),
+        bootstrapProfile: buildBootstrapSummary(router),
         connectivity: buildConnectivitySummary(router, client)
     };
 }
@@ -1596,6 +1980,15 @@ async function createRouterAdmin({ userId, name, serverNode = 'wireguard', notes
             lastSetupGeneratedAt: new Date(),
             lastReconfiguredAt: new Date(),
             notes: notes || '',
+            endpointBinding: {
+                state: 'tunnel_ready'
+            },
+            remoteBootstrap: {
+                managementInterfaceName: 'wg-mgmt',
+                bootstrapMode: 'wireguard_with_api_ssh',
+                apiAllowedSources: ['10.0.0.0/24'],
+                sshAllowedSources: ['10.0.0.0/24']
+            },
             safetyPolicy: {
                 defaultMaxClass: 'network_core_mutation',
                 allowPublicEndpointWrites: false,
@@ -1684,6 +2077,16 @@ async function createManagementOnlyRouterAdmin({ userId, name, notes = '' }) {
         status: 'active',
         lastSeen: new Date(),
         notes: notes || '',
+        endpointBinding: {
+            expectedIdentity: trimmedName,
+            state: 'unknown'
+        },
+        remoteBootstrap: {
+            managementInterfaceName: 'wg-mgmt',
+            bootstrapMode: 'wireguard_with_api_ssh',
+            apiAllowedSources: ['10.0.0.0/24'],
+            sshAllowedSources: ['10.0.0.0/24']
+        },
         safetyPolicy: {
             ...getManagementPolicyProfile('full_remote_admin')
         }
@@ -1921,6 +2324,23 @@ async function updateRouterManagementPolicy(routerId, { policyProfile } = {}) {
     };
 }
 
+async function updateRouterSafeMode(routerId, { enabled, requireBreakGlass, breakGlassCode, note, actor } = {}) {
+    const router = await MikrotikRouter.findById(routerId);
+    if (!router) return null;
+
+    router.safeMode = {
+        ...(router.safeMode?.toObject ? router.safeMode.toObject() : (router.safeMode || {})),
+        enabled: Boolean(enabled),
+        requireBreakGlass: requireBreakGlass !== false,
+        breakGlassCode: breakGlassCode == null ? (router.safeMode?.breakGlassCode || null) : String(breakGlassCode || '').trim() || null,
+        lastEnabledAt: enabled ? new Date() : (router.safeMode?.lastEnabledAt || null),
+        lastEnabledBy: enabled ? (actor || 'admin') : (router.safeMode?.lastEnabledBy || null),
+        note: note == null ? (router.safeMode?.note || null) : String(note || '').trim() || null
+    };
+    await router.save();
+    return buildSafeModeSummary(router);
+}
+
 async function deleteRouterAdmin(routerId) {
     const bundle = await getRouterBundle(routerId);
     if (!bundle) return null;
@@ -2001,7 +2421,10 @@ module.exports = {
     createRouterAdmin,
     createManagementOnlyRouterAdmin,
     trackRouterRuntimePeer,
+    clearEndpointMismatchQuarantine,
+    getEndpointMismatchCooldownState,
     generateRouterSetupArtifacts,
+    markRouterBootstrapApplied,
     disableRouter,
     reactivateRouter,
     resetRouterPeer,
@@ -2009,6 +2432,7 @@ module.exports = {
     reassignRouterPorts,
     markRouterProvisioningReviewed,
     updateRouterManagementPolicy,
+    updateRouterSafeMode,
     MANAGEMENT_POLICY_PROFILES,
     deleteRouterAdmin
 };

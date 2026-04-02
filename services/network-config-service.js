@@ -22,6 +22,33 @@ function normalizeRecords(result) {
     return [];
 }
 
+async function executeFirstSuccessfulCommand(routerId, candidates = [], options = {}) {
+    const attempts = [];
+
+    for (const candidate of candidates) {
+        try {
+            const result = await executeCommand(routerId, candidate.command, candidate.attributes || {}, {
+                operationName: options.operationName || 'get_system_resource',
+                scope: options.scope || 'interfaces'
+            });
+            return {
+                command: candidate.command,
+                records: normalizeRecords(result),
+                attempts
+            };
+        } catch (error) {
+            attempts.push({
+                command: candidate.command,
+                error: error.message || 'unknown error'
+            });
+        }
+    }
+
+    const finalError = new Error(attempts[attempts.length - 1]?.error || 'All command candidates failed');
+    finalError.attempts = attempts;
+    throw finalError;
+}
+
 async function listDhcpLeases(routerId) {
     const result = await executeCommand(routerId, '/ip/dhcp-server/lease/print', {}, {
         operationName: 'get_system_resource',
@@ -58,11 +85,13 @@ async function deleteLease(routerId, routerosId) {
 }
 
 async function listWirelessClients(routerId) {
-    const result = await executeCommand(routerId, '/interface/wireless/registration-table/print', {}, {
+    const { records } = await executeFirstSuccessfulCommand(routerId, [
+        { command: '/interface/wireless/registration-table/print' },
+        { command: '/interface/wifi/registration-table/print' }
+    ], {
         operationName: 'get_system_resource',
         scope: 'interfaces'
     });
-    const records = normalizeRecords(result);
 
     return records.map((record) => ({
         macAddress: record['mac-address'] || '',

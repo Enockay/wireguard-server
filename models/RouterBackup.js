@@ -34,6 +34,40 @@ const routerBackupSchema = new mongoose.Schema({
         type: String,
         trim: true,
         default: ''
+    },
+    metadata: {
+        routerosVersion: {
+            type: String,
+            trim: true,
+            default: null
+        },
+        boardName: {
+            type: String,
+            trim: true,
+            default: null
+        },
+        model: {
+            type: String,
+            trim: true,
+            default: null
+        },
+        serialNumber: {
+            type: String,
+            trim: true,
+            default: null
+        },
+        restoreCompatible: {
+            type: Boolean,
+            default: true
+        },
+        lastRestoreTestAt: {
+            type: Date,
+            default: null
+        },
+        restoreValidationSignals: {
+            type: [String],
+            default: []
+        }
     }
 }, {
     timestamps: true,

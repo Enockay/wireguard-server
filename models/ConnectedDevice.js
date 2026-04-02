@@ -157,9 +157,13 @@ const connectedDeviceSchema = new mongoose.Schema({
     },
     discoverySource: {
         type: String,
-        enum: ['wireless', 'arp', 'bgp', 'neighbor', 'wireguard', 'pppoe', 'hotspot', 'manual', 'unknown'],
+        enum: ['wireless', 'arp', 'bgp', 'neighbor', 'wireguard', 'pppoe', 'hotspot', 'route_next_hop', 'manual', 'unknown'],
         default: 'manual',
         index: true
+    },
+    hopCount: {
+        type: Number,
+        default: null
     }
 }, {
     timestamps: true,
