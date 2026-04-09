@@ -5,6 +5,22 @@ const User = require('../models/User');
 const { log } = require('../wg-core');
 const { authenticateToken } = require('./auth');
 const { getUserBillingSummary } = require('../services/billing-service');
+const { verifyJsonWebhookSignature } = require('../utils/runtime-security');
+
+function ensureVerifiedWebhook(req, res, secretEnvName) {
+    const verification = verifyJsonWebhookSignature(req, process.env[secretEnvName]);
+    if (verification.ok) {
+        return true;
+    }
+
+    if (verification.code === 'missing_secret') {
+        res.status(503).json({ success: false, error: 'Payment webhook is not configured' });
+        return false;
+    }
+
+    res.status(401).json({ success: false, error: 'Invalid payment webhook signature' });
+    return false;
+}
 
 function registerBillingRoutes(app) {
     // Get billing summary
@@ -200,6 +216,10 @@ function registerBillingRoutes(app) {
     // Complete payment (webhook callback)
     app.post('/api/billing/payment-callback', async (req, res) => {
         try {
+            if (!ensureVerifiedWebhook(req, res, 'PAYMENT_CALLBACK_SECRET')) {
+                return;
+            }
+
             const { transactionId, status, paymentGatewayId, paymentMethod } = req.body;
 
             const transaction = await Transaction.findOne({ transactionId });
@@ -226,6 +246,7 @@ function registerBillingRoutes(app) {
 
                 transaction.status = 'completed';
                 transaction.paymentGatewayId = paymentGatewayId;
+                transaction.paymentMethod = paymentMethod || transaction.paymentMethod;
                 await transaction.save();
 
                 log('info', 'balance_added', { 

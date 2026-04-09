@@ -101,9 +101,14 @@ function registerReferralRoutes(app) {
                         joinedAt: ref.referredId?.createdAt
                     },
                     status: ref.status,
+                    reviewStatus: ref.reviewStatus,
+                    payoutStatus: ref.payoutStatus,
+                    payoutMethod: ref.payoutMethod,
                     rewardGiven: ref.rewardGiven,
                     rewardAmount: ref.rewardAmount,
+                    rewardCurrency: ref.rewardCurrency,
                     completedAt: ref.completedAt,
+                    paidAt: ref.paidAt,
                     createdAt: ref.createdAt
                 })),
                 pagination: {

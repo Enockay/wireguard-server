@@ -230,13 +230,13 @@ async function invokeRoute(routes, method, rawPath, { token = 'admin', body, hea
     return { response: { status: res.statusCode }, json: res.payload, headers: res.headers };
 }
 
-async function withRouteApp({ routeModulePath, mocks }, run) {
+async function withRouteApp({ routeModulePath, mocks, routeArgs = [] }, run) {
     return withMockedModules(mocks, async () => {
         const resolvedRoute = require.resolve(path.join(ROOT, routeModulePath));
         delete require.cache[resolvedRoute];
         const registerRoutes = require(resolvedRoute);
         const { app, routes } = createRouteCollector();
-        registerRoutes(app);
+        registerRoutes(app, ...routeArgs);
 
         try {
             return await run({

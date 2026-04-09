@@ -21,12 +21,38 @@ function normalizeIdentity(value) {
         .replace(/\s+/g, '');
 }
 
+function isWireGuardManagedRouter(router) {
+    return router?.connectionMode !== 'management_only';
+}
+
+function isWireGuardOnlyExecution(router, context = {}) {
+    return isWireGuardManagedRouter(router)
+        && !context?.breakGlass
+        && !context?.allowLegacyTransport;
+}
+
+function getExplicitExpectedIdentity(router) {
+    const explicitHostname = normalizeIdentity(router?.discoveryInfo?.hostname);
+    if (explicitHostname) {
+        return explicitHostname;
+    }
+
+    const explicitRouterboardIdentity = normalizeIdentity(router?.routerboardInfo?.identity);
+    if (explicitRouterboardIdentity) {
+        return explicitRouterboardIdentity;
+    }
+
+    const storedExpectedIdentity = normalizeIdentity(router?.endpointBinding?.expectedIdentity);
+    const labelIdentity = normalizeIdentity(router?.name);
+    if (storedExpectedIdentity && storedExpectedIdentity !== labelIdentity) {
+        return storedExpectedIdentity;
+    }
+
+    return '';
+}
+
 function getExpectedEndpointBinding(router) {
-    const expectedIdentity = normalizeIdentity(
-        router?.discoveryInfo?.hostname
-        || router?.routerboardInfo?.identity
-        || router?.name
-    );
+    const expectedIdentity = getExplicitExpectedIdentity(router);
     const expectedSerial = String(router?.routerboardInfo?.serialNumber || '').trim().toLowerCase();
 
     return {
@@ -70,7 +96,21 @@ function appendDriftEvent(router, event = {}) {
 }
 
 async function updateEndpointHistoryValidation(routerId, matcher = () => false, updates = {}) {
-    const router = await MikrotikRouter.findById(routerId).select('endpointHistory').catch(() => null);
+    let routerQuery = null;
+    try {
+        routerQuery = MikrotikRouter.findById(routerId);
+    } catch (error) {
+        routerQuery = null;
+    }
+    if (!routerQuery) {
+        return;
+    }
+
+    const router = await (
+        typeof routerQuery.select === 'function'
+            ? routerQuery.select('endpointHistory')
+            : routerQuery
+    ).catch(() => null);
     if (!router || !Array.isArray(router.endpointHistory) || !router.endpointHistory.length) {
         return;
     }
@@ -270,13 +310,19 @@ async function verifyEndpointBinding(router, endpoint, credential, context = {})
 }
 
 function buildDefaultEndpoints(router, credential) {
-    const endpoints = Array.isArray(router.managementEndpoints) ? [...router.managementEndpoints] : [];
+    const wireGuardOnly = isWireGuardOnlyExecution(router);
+    const allowedStoredKinds = wireGuardOnly
+        ? new Set(['wireguard_management', 'wireguard_api', 'public_api_tls'])
+        : null;
+    const endpoints = Array.isArray(router.managementEndpoints)
+        ? router.managementEndpoints.filter((endpoint) => !allowedStoredKinds || allowedStoredKinds.has(String(endpoint?.kind || '').trim()))
+        : [];
     const vpnHost = stripCidrSuffix(router.vpnIp);
     const localHost = stripCidrSuffix(router.discoveryInfo?.localAddress);
     const openPorts = Array.isArray(router.discoveryInfo?.openPorts) ? router.discoveryInfo.openPorts : [];
-    const prefersRemoteManagement = router.connectionMode !== 'management_only' && router.status === 'active';
+    const prefersRemoteManagement = isWireGuardManagedRouter(router) && router.status === 'active';
 
-    if (localHost && openPorts.includes(8728)) {
+    if (!wireGuardOnly && localHost && openPorts.includes(8728)) {
         endpoints.push({
             id: 'derived-local-api-8728',
             kind: 'local_api',
@@ -312,7 +358,7 @@ function buildDefaultEndpoints(router, credential) {
         });
     }
 
-    if (localHost) {
+    if (!wireGuardOnly && localHost) {
         endpoints.push({
             id: 'derived-local-api',
             kind: 'local_api',
@@ -330,7 +376,7 @@ function buildDefaultEndpoints(router, credential) {
         });
     }
 
-    if (vpnHost || localHost) {
+    if (vpnHost || (!wireGuardOnly && localHost)) {
         endpoints.push({
             id: 'derived-ssh-fallback',
             kind: 'ssh_fallback',
@@ -374,15 +420,26 @@ function sortEndpoints(endpoints = []) {
 }
 
 function filterEndpoints(endpoints = [], context = {}) {
+    const hasStructuredAttributes = Boolean(
+        context.attributes
+        && typeof context.attributes === 'object'
+        && Object.keys(context.attributes).length
+    );
     const allowedTransports = Array.isArray(context.allowedTransports)
         ? context.allowedTransports.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
         : [];
 
-    if (!allowedTransports.length) {
-        return endpoints;
+    let filtered = [...endpoints];
+
+    if (hasStructuredAttributes) {
+        filtered = filtered.filter((endpoint) => String(endpoint.transport || '').toLowerCase() !== 'ssh');
     }
 
-    return endpoints.filter((endpoint) => allowedTransports.includes(String(endpoint.transport || '').toLowerCase()));
+    if (!allowedTransports.length) {
+        return filtered;
+    }
+
+    return filtered.filter((endpoint) => allowedTransports.includes(String(endpoint.transport || '').toLowerCase()));
 }
 
 function resolveManagementEndpoints(router, credential, context = {}) {
@@ -458,6 +515,7 @@ async function persistEndpointResult(routerId, endpoint, { success, failureType 
     const openPorts = Array.isArray(router.discoveryInfo?.openPorts) ? router.discoveryInfo.openPorts : [];
     const shouldPromotePlainLocalApi =
         success
+        && !isWireGuardManagedRouter(router)
         && endpoint.transport === 'api'
         && endpoint.port === 8728
         && endpoint.host

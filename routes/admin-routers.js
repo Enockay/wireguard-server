@@ -40,11 +40,14 @@ const {
     createManagementOnlyRouterAdmin,
     clearEndpointMismatchQuarantine,
     getEndpointMismatchCooldownState,
+    observeRouterRuntimePeer,
+    promoteObservedRuntimePeerToRouter,
     trackRouterRuntimePeer,
     generateRouterSetupArtifacts,
     markRouterBootstrapApplied,
     disableRouter,
     reactivateRouter,
+    unlinkRouterClient,
     resetRouterPeer,
     reprovisionRouter,
     reassignRouterPorts,
@@ -81,14 +84,54 @@ function normalizePortValue(value, fallback = null) {
     return parsed;
 }
 
+function parseManagementAddress(value) {
+    const raw = normalizeText(value);
+    if (!raw) {
+        return {
+            host: null,
+            port: null
+        };
+    }
+
+    // Keep IPv6 literals intact unless the value is bracketed with an explicit port.
+    const bracketedIpv6 = raw.match(/^\[([^\]]+)\](?::(\d{1,5}))?$/);
+    if (bracketedIpv6) {
+        return {
+            host: normalizeText(bracketedIpv6[1]),
+            port: normalizePortValue(bracketedIpv6[2], null)
+        };
+    }
+
+    const colonCount = (raw.match(/:/g) || []).length;
+    if (colonCount === 1) {
+        const separator = raw.lastIndexOf(':');
+        const nextHost = normalizeText(raw.slice(0, separator));
+        const nextPort = normalizePortValue(raw.slice(separator + 1), null);
+        return {
+            host: nextHost,
+            port: nextPort
+        };
+    }
+
+    return {
+        host: raw,
+        port: null
+    };
+}
+
 function buildManualManagementEndpoints(payload = {}, connectionMode = 'wireguard') {
-    const managementHost = normalizeText(payload.managementHost || payload.managementIp || payload.localAddress || payload.host);
+    if (connectionMode !== 'management_only') {
+        return [];
+    }
+
+    const address = parseManagementAddress(payload.managementHost || payload.managementIp || payload.localAddress || payload.host);
+    const managementHost = address.host;
     if (!managementHost) return [];
 
     const useTls = normalizeBoolean(payload.apiUseTls, false);
     const preferredTransport = normalizeText(payload.managementTransport || payload.transport);
     const transport = preferredTransport || (useTls ? 'api_ssl' : 'api');
-    const apiPort = normalizePortValue(payload.apiPort, useTls ? 8729 : 8728);
+    const apiPort = normalizePortValue(payload.apiPort, address.port != null ? address.port : (useTls ? 8729 : 8728));
     const sshPort = normalizePortValue(payload.sshPort, 22);
     const allowInsecureTls = normalizeBoolean(payload.allowInsecureTls, false);
     const endpoints = [];
@@ -135,9 +178,27 @@ function buildManualManagementEndpoints(payload = {}, connectionMode = 'wireguar
     return endpoints;
 }
 
+function markLegacyManagementEndpointsStale(endpoints = []) {
+    return (Array.isArray(endpoints) ? endpoints : []).map((endpoint) => {
+        const kind = String(endpoint?.kind || '').trim();
+        if (['wireguard_management', 'wireguard_api', 'public_api_tls'].includes(kind)) {
+            return endpoint;
+        }
+
+        return {
+            ...(endpoint.toObject ? endpoint.toObject() : endpoint),
+            enabled: false,
+            health: 'stale',
+            failureType: 'stale_endpoint',
+            lastFailureAt: new Date()
+        };
+    });
+}
+
 async function assertManagementEndpointAvailability(routerId, endpoints = []) {
     const hosts = [...new Set((endpoints || []).map((endpoint) => String(endpoint?.host || '').trim()).filter(Boolean))];
     if (!hosts.length) return;
+    if (typeof MikrotikRouter.findOne !== 'function') return;
 
     const conflict = await MikrotikRouter.findOne({
         _id: { $ne: routerId },
@@ -161,7 +222,8 @@ async function configureRouterAccess(router, req, options = {}) {
     const apiPort = normalizePortValue(options.apiPort, null);
     const sshPort = normalizePortValue(options.sshPort, null);
     const managementEndpoints = buildManualManagementEndpoints(options, router.connectionMode || 'wireguard');
-    const localAddress = normalizeText(options.localAddress || options.managementIp || options.managementHost);
+    const parsedManagementAddress = parseManagementAddress(options.localAddress || options.managementIp || options.managementHost);
+    const localAddress = parsedManagementAddress.host;
     const hostname = normalizeText(options.hostname);
     const deviceDetails = normalizeText(options.deviceDetails || options.notes);
 
@@ -187,6 +249,18 @@ async function configureRouterAccess(router, req, options = {}) {
             mismatchReason: null,
             lastMismatchAt: null
         };
+    } else if ((router.connectionMode || 'wireguard') !== 'management_only') {
+        router.managementEndpoints = markLegacyManagementEndpointsStale(router.managementEndpoints);
+        router.endpointBinding = {
+            ...(router.endpointBinding || {}),
+            state: router.vpnIp ? 'tunnel_ready' : 'unknown',
+            verifiedEndpointId: null,
+            verifiedEndpointHost: null,
+            verifiedTransport: null,
+            verifiedAt: null,
+            mismatchReason: null,
+            lastMismatchAt: null
+        };
     }
     if (localAddress || hostname) {
         if (localAddress) {
@@ -200,7 +274,7 @@ async function configureRouterAccess(router, req, options = {}) {
         };
         router.endpointBinding = {
             ...(router.endpointBinding || {}),
-            expectedIdentity: hostname || router.endpointBinding?.expectedIdentity || router.name,
+            expectedIdentity: hostname || router.endpointBinding?.expectedIdentity || null,
             state: router.connectionMode === 'management_only' && (localAddress || managementEndpoints.length)
                 ? 'local_only'
                 : (router.endpointBinding?.state || 'unknown')
@@ -235,7 +309,9 @@ async function configureRouterAccess(router, req, options = {}) {
     }
 
     await router.save();
-    await clearEndpointMismatchQuarantine(router._id);
+    if (typeof clearEndpointMismatchQuarantine === 'function') {
+        await clearEndpointMismatchQuarantine(router._id);
+    }
     const nextHost = normalizeText((router.managementEndpoints || [])[0]?.host || router.discoveryInfo?.localAddress);
     const nextIdentity = normalizeText(router.endpointBinding?.expectedIdentity || router.discoveryInfo?.hostname || router.name);
     if (previousHost !== nextHost || previousIdentity !== nextIdentity || previousApiPort !== (router.apiPort || null)) {
@@ -261,7 +337,9 @@ async function configureRouterAccess(router, req, options = {}) {
 }
 
 async function testRouterConnection(routerId, req) {
-    await clearEndpointMismatchQuarantine(routerId);
+    if (typeof clearEndpointMismatchQuarantine === 'function') {
+        await clearEndpointMismatchQuarantine(routerId);
+    }
     const [resource, interfaces] = await Promise.all([
         getSystemResource(routerId, getActorContext(req)),
         getInterfaces(routerId, getActorContext(req))
@@ -517,7 +595,12 @@ async function resolveCustomerUser(identifier) {
     const value = String(identifier || '').trim();
     if (!value) return null;
     const query = value.includes('@') ? { email: value.toLowerCase() } : { _id: value };
-    const user = await User.findOne(query);
+    let user = null;
+    if (typeof User.findOne === 'function') {
+        user = await User.findOne(query);
+    } else if (!value.includes('@') && typeof User.findById === 'function') {
+        user = await User.findById(value);
+    }
     if (!user || user.role !== 'user') return null;
     return user;
 }
@@ -1185,6 +1268,111 @@ function registerAdminRouterRoutes(app) {
         }
     });
 
+    app.post('/api/admin/routers/:id/wireguard/runtime-peers/:peerId/observe', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const classification = normalizeText(req.body?.classification) || 'unknown';
+            const assetLabel = normalizeText(req.body?.assetLabel || req.body?.name) || '';
+            const reason = normalizeReason(req.body?.reason);
+
+            const result = await observeRouterRuntimePeer({
+                routerId: req.params.id,
+                peerId: req.params.peerId,
+                classification,
+                assetLabel,
+                reason,
+                actor: req.adminUser?.email || 'admin'
+            });
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: result.sourceRouter.userId?._id || result.sourceRouter.userId || null,
+                targetRouterId: result.sourceRouter._id,
+                action: 'admin_observe_router_runtime_peer',
+                reason,
+                metadata: {
+                    runtimePeerId: result.runtimePeer.id || null,
+                    runtimePeerInterface: result.runtimePeer.interface || null,
+                    runtimePeerPublicKey: result.runtimePeer.publicKey || null,
+                    observedPeerId: result.observedPeer.id,
+                    classification: result.observedPeer.classification,
+                    confidenceScore: result.observedPeer.confidenceScore
+                }
+            });
+
+            return res.status(201).json({
+                success: true,
+                message: 'Runtime WireGuard peer added to tracked peer inventory',
+                data: result.observedPeer
+            });
+        } catch (error) {
+            if (error.message === 'Router not found' || error.message === 'Runtime WireGuard peer not found') {
+                return res.status(404).json({ success: false, error: error.message });
+            }
+            return res.status(500).json({ success: false, error: 'Failed to observe runtime WireGuard peer', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/wireguard/observed-peers/:observedPeerId/promote-router', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.CREATE), async (req, res) => {
+        try {
+            const name = String(req.body?.name || '').trim();
+            const reason = normalizeReason(req.body?.reason);
+
+            if (!name) {
+                return res.status(400).json({ success: false, error: 'Router name is required' });
+            }
+
+            const result = await promoteObservedRuntimePeerToRouter({
+                routerId: req.params.id,
+                observedPeerId: req.params.observedPeerId,
+                name,
+                reason,
+                actor: req.adminUser?.email || 'admin'
+            });
+
+            await recordAdminAction({
+                req,
+                actorUserId: req.adminUser._id,
+                targetUserId: result.createdRouter.userId?._id || result.createdRouter.userId || null,
+                targetRouterId: result.createdRouter._id,
+                action: 'admin_promote_observed_runtime_peer_router',
+                reason,
+                metadata: {
+                    sourceRouterId: String(result.sourceRouter._id),
+                    observedPeerId: req.params.observedPeerId,
+                    observedPeerPublicKey: result.observedPeer.publicKey || null
+                }
+            });
+
+            return res.status(201).json({
+                success: true,
+                message: 'Observed WireGuard peer promoted as a management-only router',
+                data: {
+                    id: String(result.createdRouter._id),
+                    name: result.createdRouter.name,
+                    connectionMode: result.createdRouter.connectionMode || 'management_only',
+                    status: result.createdRouter.status
+                }
+            });
+        } catch (error) {
+            if (['Router not found', 'Observed WireGuard peer not found'].includes(error.message)) {
+                return res.status(404).json({ success: false, error: error.message });
+            }
+            if (['observed_peer_not_promotable', 'observed_peer_not_ready'].includes(error.code)) {
+                return res.status(409).json({ success: false, error: error.message, code: error.code });
+            }
+            if (error.code === 'runtime_peer_already_tracked') {
+                return res.status(409).json({
+                    success: false,
+                    error: error.message,
+                    code: error.code,
+                    trackedRouterIds: error.routerIds || []
+                });
+            }
+            return res.status(500).json({ success: false, error: 'Failed to promote observed runtime peer', details: error.message });
+        }
+    });
+
     app.post('/api/admin/routers/:id/set-credentials', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
         try {
             const router = await getRouterOr404(req, res);
@@ -1292,7 +1480,9 @@ function registerAdminRouterRoutes(app) {
                 success: true,
                 message: 'Router management endpoint updated',
                 data: {
-                    managementHost: router.discoveryInfo?.localAddress || managementHost || null,
+                    managementHost: router.connectionMode === 'management_only'
+                        ? (router.discoveryInfo?.localAddress || managementHost || null)
+                        : (router.vpnIp || null),
                     hostname: router.discoveryInfo?.hostname || hostname || null,
                     apiPort: router.apiPort || null,
                     sshPort: sshPort || router.sshPort || null,
@@ -1386,7 +1576,8 @@ function registerAdminRouterRoutes(app) {
                 }
             });
         } catch (error) {
-            return res.status(502).json({ success: false, error: 'Failed to connect to router via RouterOS API', details: error.message });
+            const resolved = resolveRouterExecutionError(error, 'Failed to connect to router via RouterOS API');
+            return res.status(resolved.status).json(resolved.payload);
         }
     });
 
@@ -1599,6 +1790,32 @@ function registerAdminRouterRoutes(app) {
             return res.json({ success: true, message: 'Router reactivated successfully' });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to reactivate router', details: error.message });
+        }
+    });
+
+    app.post('/api/admin/routers/:id/unlink-client', requireAdminPermission(ADMIN_ROUTER_PERMISSIONS.MANAGE_STATUS), async (req, res) => {
+        try {
+            const bundle = await unlinkRouterClient(req.params.id);
+            if (!bundle) {
+                return res.status(404).json({ success: false, error: 'Router not found' });
+            }
+
+            await audit(req, bundle.router, 'admin.routers.unlink_client', normalizeReason(req.body?.reason), {
+                detachedClientId: bundle.detachedClientId || null,
+                unlinked: Boolean(bundle.unlinked)
+            });
+
+            return res.json({
+                success: true,
+                message: bundle.unlinked ? 'Router unlinked from VPN client successfully' : 'Router did not have a linked VPN client',
+                data: {
+                    routerId: String(bundle.router._id),
+                    detachedClientId: bundle.detachedClientId || null,
+                    unlinked: Boolean(bundle.unlinked)
+                }
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to unlink router client', details: error.message });
         }
     });
 

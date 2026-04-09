@@ -1105,6 +1105,71 @@ async function listSupportAgents() {
     }));
 }
 
+async function listSupportContextOptions(query = {}) {
+    const q = String(query.q || '').trim();
+    const pattern = q ? new RegExp(escapeRegex(q), 'i') : null;
+    const limit = Math.max(1, Math.min(10, Number(query.limit) || 6));
+    const searchQuery = (conditions) => (pattern ? { $or: conditions } : {});
+
+    const [routers, vpnServers, incidents, subscriptions, transactions] = await Promise.all([
+        MikrotikRouter.find(searchQuery([{ name: pattern }, { routerId: pattern }, { vpnIp: pattern }]))
+            .select('name routerId status vpnIp')
+            .sort({ updatedAt: -1 })
+            .limit(limit)
+            .lean(),
+        VpnServer.find(searchQuery([{ name: pattern }, { nodeId: pattern }, { region: pattern }, { hostname: pattern }]))
+            .select('name nodeId region status')
+            .sort({ updatedAt: -1 })
+            .limit(limit)
+            .lean(),
+        MonitoringIncident.find(searchQuery([{ title: pattern }, { summary: pattern }]))
+            .select('title severity status')
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .lean(),
+        Subscription.find(searchQuery([{ planType: pattern }, { status: pattern }]))
+            .select('status planType nextBillingDate userId')
+            .populate('userId', 'name email')
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .lean(),
+        Transaction.find(searchQuery([{ transactionId: pattern }, { status: pattern }, { type: pattern }]))
+            .select('transactionId type status amount currency userId')
+            .populate('userId', 'name email')
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .lean()
+    ]);
+
+    return {
+        routers: routers.map((router) => ({
+            id: String(router._id),
+            label: router.name,
+            description: [router.routerId, router.vpnIp, router.status].filter(Boolean).join(' · ')
+        })),
+        vpnServers: vpnServers.map((server) => ({
+            id: String(server._id),
+            label: server.name,
+            description: [server.nodeId, server.region, server.status].filter(Boolean).join(' · ')
+        })),
+        incidents: incidents.map((incident) => ({
+            id: String(incident._id),
+            label: incident.title,
+            description: [incident.severity, incident.status].filter(Boolean).join(' · ')
+        })),
+        subscriptions: subscriptions.map((subscription) => ({
+            id: String(subscription._id),
+            label: `${subscription.planType || 'subscription'} · ${subscription.status || 'unknown'}`,
+            description: [subscription.userId?.name || subscription.userId?.email || 'Unassigned', subscription.nextBillingDate ? new Date(subscription.nextBillingDate).toISOString().slice(0, 10) : null].filter(Boolean).join(' · ')
+        })),
+        transactions: transactions.map((transaction) => ({
+            id: String(transaction._id),
+            label: transaction.transactionId || `${transaction.type || 'transaction'} payment`,
+            description: [transaction.userId?.name || transaction.userId?.email || 'Unassigned', `${transaction.amount || 0} ${transaction.currency || ''}`.trim(), transaction.status].filter(Boolean).join(' · ')
+        }))
+    };
+}
+
 module.exports = {
     ADMIN_SUPPORT_PERMISSIONS,
     SUPPORT_NOTE_CATEGORIES,
@@ -1142,6 +1207,7 @@ module.exports = {
     getTeamTickets,
     getAssigneeTickets,
     listSupportAgents,
+    listSupportContextOptions,
     SUPPORT_TEAMS,
     SUPPORT_STAFF_ROLES,
     deriveSlaPolicy,

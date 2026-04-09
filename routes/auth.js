@@ -6,12 +6,59 @@ const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/e
 const UserSession = require('../models/UserSession');
 const { recordSecurityEvent, createUserSession, touchSession, revokeSession, getRequestIp, getRequestUserAgent } = require('../services/security-event-service');
 const { verifyTotpCode } = require('../utils/totp');
+const { getJwtSecret } = require('../utils/runtime-security');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
 const TWO_FACTOR_CHALLENGE_EXPIRY = '10m';
 const AUTH_COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'mikrotik_admin_session';
 const REMEMBER_DEVICE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
+const AUTH_RATE_LIMIT_WINDOW_MS = Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS || (15 * 60 * 1000));
+const AUTH_RATE_LIMIT_MAX_ATTEMPTS = Number(process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS || 10);
+const authRateBuckets = new Map();
+
+function requireJwtSecretOrThrow() {
+    const secret = getJwtSecret();
+    if (!secret) {
+        const error = new Error('JWT_SECRET is required');
+        error.code = 'JWT_SECRET_MISSING';
+        throw error;
+    }
+    return secret;
+}
+
+function getAuthRateKey(req, scope) {
+    const ip = getRequestIp(req) || req.ip || 'unknown';
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    return `${scope}:${ip}:${email}`;
+}
+
+function enforceAuthRateLimit(scope, options = {}) {
+    const maxAttempts = Number(options.maxAttempts || AUTH_RATE_LIMIT_MAX_ATTEMPTS);
+    const windowMs = Number(options.windowMs || AUTH_RATE_LIMIT_WINDOW_MS);
+
+    return (req, res, next) => {
+        const now = Date.now();
+        const key = getAuthRateKey(req, scope);
+        const bucket = authRateBuckets.get(key);
+
+        if (!bucket || (now - bucket.windowStartedAt) >= windowMs) {
+            authRateBuckets.set(key, { count: 1, windowStartedAt: now });
+            return next();
+        }
+
+        bucket.count += 1;
+        if (bucket.count > maxAttempts) {
+            const retryAfterSeconds = Math.max(1, Math.ceil((bucket.windowStartedAt + windowMs - now) / 1000));
+            res.setHeader('Retry-After', String(retryAfterSeconds));
+            return res.status(429).json({
+                success: false,
+                error: 'Too many authentication attempts. Please try again later.'
+            });
+        }
+
+        return next();
+    };
+}
 
 function buildSessionUser(user) {
     return {
@@ -22,14 +69,16 @@ function buildSessionUser(user) {
 }
 
 function createSessionToken({ user, sessionId }) {
+    const jwtSecret = requireJwtSecretOrThrow();
     return jwt.sign(
         { userId: user._id, email: user.email, sid: sessionId },
-        JWT_SECRET,
+        jwtSecret,
         { expiresIn: JWT_EXPIRY }
     );
 }
 
 function createTwoFactorChallengeToken({ user, req, rememberDevice = false }) {
+    const jwtSecret = requireJwtSecretOrThrow();
     return jwt.sign(
         {
             userId: user._id,
@@ -39,7 +88,7 @@ function createTwoFactorChallengeToken({ user, req, rememberDevice = false }) {
             ipAddress: getRequestIp(req),
             userAgent: getRequestUserAgent(req),
         },
-        JWT_SECRET,
+        jwtSecret,
         { expiresIn: TWO_FACTOR_CHALLENGE_EXPIRY }
     );
 }
@@ -68,6 +117,20 @@ function getTokenExpiry(token) {
     }
 
     return new Date(decoded.exp * 1000).toISOString();
+}
+
+function printVerificationToken(user, token, context = 'signup') {
+    if (!user || !token) return;
+
+    const verificationPath = `/api/auth/verify-email?token=${token}`;
+    console.log(`[auth] verification token (${context}) for ${user.email}: ${token}`);
+    console.log(`[auth] verification url (${context}) for ${user.email}: ${verificationPath}`);
+    log('info', 'verification_token_printed', {
+        context,
+        userId: user._id,
+        email: user.email,
+        verificationPath
+    });
 }
 
 function setAuthCookie(res, token, rememberDevice = false) {
@@ -182,6 +245,8 @@ function registerAuthRoutes(app) {
                 // Don't fail signup if email fails, but log it
             }
 
+            printVerificationToken(user, verificationToken, 'signup');
+
             user.lastLoginAt = new Date();
             user.failedLoginCount = 0;
             await user.save();
@@ -201,11 +266,7 @@ function registerAuthRoutes(app) {
             });
 
             // Generate JWT token
-            const token = jwt.sign(
-                { userId: user._id, email: user.email, sid: session.sessionId },
-                JWT_SECRET,
-                { expiresIn: JWT_EXPIRY }
-            );
+            const token = createSessionToken({ user, sessionId: session.sessionId });
 
             res.status(201).json({
                 success: true,
@@ -328,6 +389,8 @@ function registerAuthRoutes(app) {
                 });
             }
 
+            printVerificationToken(user, verificationToken, 'resend');
+
             res.json({
                 success: true,
                 message: 'Verification email sent successfully'
@@ -343,7 +406,7 @@ function registerAuthRoutes(app) {
     });
 
     // User login
-    app.post('/api/auth/login', async (req, res) => {
+    app.post('/api/auth/login', enforceAuthRateLimit('login'), async (req, res) => {
         try {
             const { email, password, rememberDevice = false } = req.body;
 
@@ -417,21 +480,22 @@ function registerAuthRoutes(app) {
                 });
             }
 
-            if (user.role !== 'admin') {
+            if (!user.emailVerified) {
                 await recordSecurityEvent({
                     eventType: 'login_blocked',
-                    category: 'auth',
-                    severity: 'high',
-                    source: 'system',
+                    category: 'account',
+                    severity: 'medium',
+                    source: 'user',
                     success: false,
                     userId: user._id,
                     ipAddress: getRequestIp(req),
                     userAgent: getRequestUserAgent(req),
-                    reason: 'Non-admin account attempted admin console login'
+                    reason: 'Email address is not verified'
                 });
                 return res.status(403).json({
                     success: false,
-                    error: 'Only admin accounts can sign in to this console'
+                    error: 'Please verify your email address before logging in',
+                    code: 'EMAIL_NOT_VERIFIED'
                 });
             }
 
@@ -486,6 +550,7 @@ function registerAuthRoutes(app) {
                 message: 'Login successful',
                 data: {
                     user: buildSessionUser(user),
+                    token,
                     sessionExpiresAt: getTokenExpiry(token)
                 }
             });
@@ -512,7 +577,7 @@ function registerAuthRoutes(app) {
 
             let challenge;
             try {
-                challenge = jwt.verify(challengeToken, JWT_SECRET);
+                challenge = jwt.verify(challengeToken, requireJwtSecretOrThrow());
             } catch (error) {
                 return res.status(401).json({
                     success: false,
@@ -606,6 +671,7 @@ function registerAuthRoutes(app) {
                 message: 'Two-factor login successful',
                 data: {
                     user: buildSessionUser(user),
+                    token,
                     sessionExpiresAt: getTokenExpiry(token),
                 }
             });
@@ -688,7 +754,7 @@ function registerAuthRoutes(app) {
     });
 
     // Request password reset
-    app.post('/api/auth/forgot-password', async (req, res) => {
+    app.post('/api/auth/forgot-password', enforceAuthRateLimit('forgot_password', { maxAttempts: 5 }), async (req, res) => {
         try {
             const { email } = req.body;
 
@@ -747,7 +813,7 @@ function registerAuthRoutes(app) {
     });
 
     // Reset password with token
-    app.post('/api/auth/reset-password', async (req, res) => {
+    app.post('/api/auth/reset-password', enforceAuthRateLimit('reset_password', { maxAttempts: 5 }), async (req, res) => {
         try {
             const { token, password } = req.body;
 
@@ -820,7 +886,17 @@ function authenticateToken(req, res, next) {
         });
     }
 
-    jwt.verify(token, JWT_SECRET, async (err, user) => {
+    let jwtSecret;
+    try {
+        jwtSecret = requireJwtSecretOrThrow();
+    } catch (error) {
+        return res.status(503).json({
+            success: false,
+            error: 'Authentication service is not configured'
+        });
+    }
+
+    jwt.verify(token, jwtSecret, async (err, user) => {
         if (err) {
             return res.status(403).json({
                 success: false,

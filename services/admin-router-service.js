@@ -8,8 +8,10 @@ const Transaction = require('../models/Transaction');
 const AdminAuditLog = require('../models/AdminAuditLog');
 const RouterDiscoverySession = require('../models/RouterDiscoverySession');
 const RouterBackup = require('../models/RouterBackup');
+const ManagedTunnelPeer = require('../models/ManagedTunnelPeer');
 const { allocatePorts, releasePorts } = require('../utils/port-allocator');
-const { generateKeys, getNextAvailableIP } = require('../utils/route-helpers');
+const { generateKeys, getNextAvailableIP, syncWireGuardPeerRoutesFromDatabase } = require('../utils/route-helpers');
+const { buildClientPeerAllowedIps } = require('../utils/wireguard-peer-routes');
 const { startRouterProxy, stopRouterProxy, restartRouterProxy, getProxyStatus } = require('./tcp-proxy-service');
 const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive, getServerEndpoint, getServerPublicKey, log } = require('../wg-core');
 const { createSubscription } = require('./billing-service');
@@ -195,13 +197,30 @@ function normalizeBindingIdentity(value) {
     return String(value || '').trim() || null;
 }
 
+function hasExplicitExpectedIdentity(router) {
+    const discoveryHostname = normalizeBindingIdentity(router?.discoveryInfo?.hostname);
+    if (discoveryHostname) return true;
+
+    const routerboardIdentity = normalizeBindingIdentity(router?.routerboardInfo?.identity);
+    if (routerboardIdentity) return true;
+
+    const storedExpectedIdentity = normalizeBindingIdentity(router?.endpointBinding?.expectedIdentity);
+    if (!storedExpectedIdentity) return false;
+
+    const labelIdentity = normalizeBindingIdentity(router?.name);
+    return !labelIdentity || storedExpectedIdentity.toLowerCase() !== labelIdentity.toLowerCase();
+}
+
 function buildVisibleManagementEndpoints(router) {
-    const storedEndpoints = (router.managementEndpoints || []).map((endpoint) => ({
+    const managementOnly = isManagementOnlyRouter(router);
+    const storedEndpoints = (router.managementEndpoints || [])
+        .map((endpoint) => ({
         id: endpoint.id,
         kind: endpoint.kind,
         host: endpoint.host,
         port: endpoint.port,
         transport: endpoint.transport,
+        source: endpoint.source || 'manual',
         priority: endpoint.priority,
         enabled: endpoint.enabled !== false,
         health: endpoint.health || 'unknown',
@@ -211,15 +230,17 @@ function buildVisibleManagementEndpoints(router) {
         failureType: endpoint.failureType || null,
         latencyMs: endpoint.latencyMs || null,
         derived: false
-    }));
+        }))
+        .filter((endpoint) => managementOnly || ['wireguard_management', 'wireguard_api', 'public_api_tls'].includes(String(endpoint.kind || '')));
 
-    if (!isManagementOnlyRouter(router) && router.vpnIp) {
+    if (!managementOnly && router.vpnIp) {
         storedEndpoints.unshift({
             id: 'derived-wireguard-management',
             kind: 'wireguard_management',
             host: router.vpnIp,
             port: router.apiPort || 8728,
             transport: 'api',
+            source: 'derived',
             priority: 1,
             enabled: true,
             health: router.endpointBinding?.state === 'verified_wireguard'
@@ -478,7 +499,7 @@ function appendDriftEvent(router, entry = {}) {
 
 function getEndpointMismatchCooldownState(router, now = Date.now()) {
     const state = router?.endpointBinding?.state || null;
-    if (state !== 'mismatch') {
+    if (state !== 'mismatch' || !hasExplicitExpectedIdentity(router)) {
         return {
             active: false,
             remainingMs: 0,
@@ -738,6 +759,304 @@ function buildRuntimePeerTrackingMarker(sourceRouterId, peerPublicKey) {
     return `[tracked-wireguard-peer sourceRouter=${String(sourceRouterId || '').trim()} peerPublicKey=${String(peerPublicKey || '').trim()}]`;
 }
 
+function stripCidr(value) {
+    return String(value || '').trim().split('/')[0].trim();
+}
+
+function normalizeObservedPeerClassification(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (['mikrotik_router', 'wireguard_service', 'site_gateway', 'unknown'].includes(normalized)) {
+        return normalized;
+    }
+    return 'unknown';
+}
+
+function getRuntimePeerEndpoint(peer = {}) {
+    const host = peer.currentEndpointAddress || peer.endpointAddress || null;
+    const port = peer.currentEndpointPort || peer.endpointPort || null;
+    if (!host) return null;
+    return port ? `${host}:${port}` : host;
+}
+
+function getRuntimePeerAllowedIps(peer = {}) {
+    return String(peer.allowedAddress || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
+function deriveObservedPeerHeuristics(runtimePeer = {}) {
+    const endpointHost = stripCidr(runtimePeer.currentEndpointAddress || runtimePeer.endpointAddress || '');
+    const interfaceName = String(runtimePeer.interface || '').toLowerCase();
+    const allowedIps = getRuntimePeerAllowedIps(runtimePeer);
+    const privateAllowedIps = allowedIps.filter((entry) => /^(10\.|172\.(1[6-9]|2\d|3[0-1])\.|192\.168\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(stripCidr(entry)));
+    const routerLikeName = /mikrotik|router|routeros|rb\d|hax|hEX|chateau|audience|crs/i.test(runtimePeer.interface || '');
+    const routerApiPort = [8728, 8729, 8291, 22].includes(Number(runtimePeer.currentEndpointPort || runtimePeer.endpointPort || 0));
+
+    let classification = 'unknown';
+    let confidenceScore = 25;
+    const evidence = [{
+        kind: 'runtime_observation',
+        summary: `Observed WireGuard runtime peer on interface ${runtimePeer.interface || 'unknown'}`,
+        confidence: 30,
+        observedAt: new Date(),
+        details: {
+            endpoint: getRuntimePeerEndpoint(runtimePeer),
+            allowedIPs: allowedIps
+        }
+    }];
+
+    if (routerLikeName || routerApiPort) {
+        classification = 'mikrotik_router';
+        confidenceScore = routerLikeName && routerApiPort ? 82 : 68;
+        evidence.push({
+            kind: 'heuristic',
+            summary: routerLikeName
+                ? 'Peer naming pattern looks like a MikroTik or router asset'
+                : 'Peer endpoint uses a port commonly associated with MikroTik management',
+            confidence: routerLikeName && routerApiPort ? 82 : 65,
+            observedAt: new Date(),
+            details: {
+                interface: runtimePeer.interface || null,
+                endpointHost,
+                endpointPort: runtimePeer.currentEndpointPort || runtimePeer.endpointPort || null
+            }
+        });
+    } else if (privateAllowedIps.length >= 2) {
+        classification = 'site_gateway';
+        confidenceScore = 62;
+        evidence.push({
+            kind: 'heuristic',
+            summary: 'Peer exposes multiple private routed prefixes and looks like a site gateway',
+            confidence: 62,
+            observedAt: new Date(),
+            details: { allowedIPs: privateAllowedIps }
+        });
+    } else if (endpointHost || allowedIps.length) {
+        classification = 'wireguard_service';
+        confidenceScore = 48;
+        evidence.push({
+            kind: 'heuristic',
+            summary: 'Peer appears to be an external WireGuard service or endpoint',
+            confidence: 48,
+            observedAt: new Date(),
+            details: {
+                endpointHost,
+                allowedIPs: allowedIps
+            }
+        });
+    }
+
+    return {
+        classification,
+        confidenceScore,
+        evidence
+    };
+}
+
+function mergeObservedPeerEvidence(existing = [], next = []) {
+    const merged = [...(Array.isArray(existing) ? existing : [])];
+    for (const item of (Array.isArray(next) ? next : [])) {
+        const signature = `${item.kind}|${item.summary}|${JSON.stringify(item.details || {})}`;
+        if (merged.some((candidate) => `${candidate.kind}|${candidate.summary}|${JSON.stringify(candidate.details || {})}` === signature)) {
+            continue;
+        }
+        merged.push(item);
+    }
+    return merged
+        .sort((a, b) => new Date(b.observedAt || 0).getTime() - new Date(a.observedAt || 0).getTime())
+        .slice(0, 20);
+}
+
+function mergePeerSightings(existing = [], nextSighting) {
+    const items = Array.isArray(existing) ? [...existing] : [];
+    const index = items.findIndex((candidate) => String(candidate.routerId || '') === String(nextSighting.routerId || ''));
+    if (index >= 0) {
+        items[index] = {
+            ...(items[index].toObject ? items[index].toObject() : items[index]),
+            ...nextSighting
+        };
+    } else {
+        items.push(nextSighting);
+    }
+    return items.sort((a, b) => new Date(b.lastSeenAt || 0).getTime() - new Date(a.lastSeenAt || 0).getTime());
+}
+
+function normalizeManagedTunnelPeer(peer, ownerRouters = []) {
+    if (!peer) return null;
+
+    const promotedRouters = (peer.promotedRouterIds || [])
+        .map((item) => String(item?._id || item))
+        .filter(Boolean);
+    const managedRouters = (ownerRouters || []).filter((candidate) => promotedRouters.includes(String(candidate._id)));
+    const evidence = (peer.evidence || []).map((item) => ({
+        kind: item.kind,
+        summary: item.summary,
+        confidence: item.confidence ?? 0,
+        sourceRouterId: item.sourceRouterId ? String(item.sourceRouterId) : null,
+        observedAt: item.observedAt || null,
+        details: item.details || null
+    }));
+
+    return {
+        id: String(peer._id),
+        assetLabel: peer.assetLabel || null,
+        publicKey: peer.publicKey || null,
+        interfaceName: peer.interfaceName || null,
+        endpoint: peer.endpoint || null,
+        allowedIPs: peer.allowedIPs || [],
+        sourceRouterId: peer.sourceRouterId ? String(peer.sourceRouterId) : null,
+        lastSeenAt: peer.lastSeenAt || null,
+        seenOnRouters: (peer.seenOnRouters || []).map((item) => ({
+            routerId: item.routerId ? String(item.routerId) : null,
+            routerName: item.routerName || null,
+            interfaceName: item.interfaceName || null,
+            endpoint: item.endpoint || null,
+            allowedIPs: item.allowedIPs || [],
+            lastSeenAt: item.lastSeenAt || null
+        })),
+        classification: peer.classification || 'unknown',
+        classificationSource: peer.classificationSource || 'manual',
+        confidenceScore: Number(peer.confidenceScore || 0),
+        promotionEligible: Boolean(peer.promotionEligible),
+        promotionReadinessReason: peer.promotionReadinessReason || null,
+        evidence,
+        promotedRouterIds: managedRouters.map((item) => String(item._id)),
+        promotedRouterCount: managedRouters.length
+    };
+}
+
+async function buildObservedPeerEvidence(router, runtimePeer, classification) {
+    const heuristics = deriveObservedPeerHeuristics(runtimePeer);
+    const evidence = [...heuristics.evidence];
+    let confidenceScore = heuristics.confidenceScore;
+    let classificationSource = classification === heuristics.classification ? 'heuristic' : 'manual';
+    let promotionEligible = classification === 'mikrotik_router' && heuristics.confidenceScore >= 65;
+    let promotionReadinessReason = classification === 'mikrotik_router'
+        ? (promotionEligible
+            ? 'Runtime peer looks RouterOS-capable. Confirm with downstream discovery before promotion if possible.'
+            : 'Peer is marked as a router, but confidence is still low. Prefer downstream discovery confirmation first.')
+        : 'Only peers classified as MikroTik routers can be promoted into managed router records.';
+
+    const discovery = await getLatestDownstreamDiscoveryRun(router._id).catch(() => null);
+    if (discovery?.discoveredRouters?.length) {
+        const candidateIps = new Set([
+            stripCidr(runtimePeer.currentEndpointAddress),
+            stripCidr(runtimePeer.endpointAddress),
+            ...getRuntimePeerAllowedIps(runtimePeer).map(stripCidr)
+        ].filter(Boolean));
+        const match = discovery.discoveredRouters.find((item) => candidateIps.has(stripCidr(item.ipAddress)));
+        if (match) {
+            evidence.push({
+                kind: 'downstream_discovery',
+                summary: `Downstream discovery saw ${match.ipAddress} with ${match.confidence} confidence`,
+                confidence: match.confidence === 'high' ? 92 : (match.confidence === 'medium' ? 76 : 58),
+                sourceRouterId: router._id,
+                observedAt: discovery.completedAt || discovery.startedAt || new Date(),
+                details: {
+                    identity: match.identity || null,
+                    platform: match.platform || null,
+                    evidence: match.evidence || [],
+                    sourceMethod: match.sourceMethod || []
+                }
+            });
+            if (classification === 'mikrotik_router') {
+                confidenceScore = Math.max(confidenceScore, match.confidence === 'high' ? 92 : 76);
+                classificationSource = heuristics.classification === classification ? 'mixed' : 'discovery';
+                promotionEligible = true;
+                promotionReadinessReason = 'Peer matches downstream MikroTik discovery evidence and is ready for promotion.';
+            }
+        }
+    }
+
+    return {
+        evidence,
+        confidenceScore,
+        classificationSource,
+        promotionEligible,
+        promotionReadinessReason
+    };
+}
+
+async function observeRouterRuntimePeer({ routerId, peerId, classification = 'unknown', assetLabel = '', reason = '', actor = 'admin' }) {
+    const bundle = await getRouterBundle(routerId);
+    if (!bundle) {
+        throw new Error('Router not found');
+    }
+
+    const { router, owner, ownerRouters = [] } = bundle;
+    const runtime = await fetchRouterWireGuardRuntime(String(router._id));
+    const runtimePeer = (runtime?.peers || []).find((peer) => String(peer.id || '') === String(peerId || ''));
+
+    if (!runtime.available || !runtimePeer) {
+        throw new Error('Runtime WireGuard peer not found');
+    }
+
+    if (!runtimePeer.publicKey) {
+        throw new Error('Runtime WireGuard peer is missing a public key');
+    }
+
+    const normalizedClassification = normalizeObservedPeerClassification(classification);
+    const suggested = deriveObservedPeerHeuristics(runtimePeer);
+    const effectiveClassification = normalizedClassification === 'unknown' ? suggested.classification : normalizedClassification;
+    const observed = await ManagedTunnelPeer.findOne({
+        ownerUserId: owner._id,
+        publicKey: runtimePeer.publicKey
+    });
+
+    const evidenceBundle = await buildObservedPeerEvidence(router, runtimePeer, effectiveClassification);
+    const nextEvidence = [...evidenceBundle.evidence];
+    if (reason) {
+        nextEvidence.push({
+            kind: 'manual_classification',
+            summary: `Admin ${actor} classified this peer as ${effectiveClassification.replace(/_/g, ' ')}`,
+            confidence: effectiveClassification === 'unknown' ? 35 : 70,
+            sourceRouterId: router._id,
+            observedAt: new Date(),
+            details: {
+                reason
+            }
+        });
+    }
+
+    const nextSighting = {
+        routerId: router._id,
+        routerName: router.name || null,
+        interfaceName: runtimePeer.interface || null,
+        endpoint: getRuntimePeerEndpoint(runtimePeer),
+        allowedIPs: getRuntimePeerAllowedIps(runtimePeer),
+        lastSeenAt: new Date()
+    };
+
+    const peerDoc = observed || new ManagedTunnelPeer({
+        ownerUserId: owner._id,
+        publicKey: runtimePeer.publicKey,
+        sourceRouterId: router._id
+    });
+
+    peerDoc.assetLabel = String(assetLabel || '').trim() || peerDoc.assetLabel || runtimePeer.interface || null;
+    peerDoc.interfaceName = runtimePeer.interface || peerDoc.interfaceName || null;
+    peerDoc.endpoint = getRuntimePeerEndpoint(runtimePeer) || peerDoc.endpoint || null;
+    peerDoc.allowedIPs = getRuntimePeerAllowedIps(runtimePeer);
+    peerDoc.sourceRouterId = router._id;
+    peerDoc.lastSeenAt = new Date();
+    peerDoc.seenOnRouters = mergePeerSightings(peerDoc.seenOnRouters, nextSighting);
+    peerDoc.classification = effectiveClassification;
+    peerDoc.classificationSource = evidenceBundle.classificationSource;
+    peerDoc.confidenceScore = Math.max(Number(peerDoc.confidenceScore || 0), Number(evidenceBundle.confidenceScore || 0));
+    peerDoc.promotionEligible = Boolean(evidenceBundle.promotionEligible);
+    peerDoc.promotionReadinessReason = evidenceBundle.promotionReadinessReason;
+    peerDoc.evidence = mergeObservedPeerEvidence(peerDoc.evidence, nextEvidence);
+    await peerDoc.save();
+
+    return {
+        sourceRouter: router,
+        runtime,
+        runtimePeer,
+        observedPeer: normalizeManagedTunnelPeer(peerDoc, ownerRouters)
+    };
+}
+
 function parseRuntimePeerTrackingMetadata(notes = '') {
     const body = String(notes || '');
     const markerMatch = body.match(/\[tracked-wireguard-peer\s+sourceRouter=([^\s\]]+)\s+peerPublicKey=([^\]]+)\]/);
@@ -828,7 +1147,7 @@ async function resolveUniqueRouterName(userId, requestedName) {
     throw new Error('Unable to allocate a unique router name');
 }
 
-function enrichRuntimePeersWithTracking(router, runtime, ownerRouters = []) {
+function enrichRuntimePeersWithTracking(router, runtime, ownerRouters = [], observedPeers = []) {
     if (!runtime || !Array.isArray(runtime.peers)) {
         return runtime;
     }
@@ -836,13 +1155,26 @@ function enrichRuntimePeersWithTracking(router, runtime, ownerRouters = []) {
     return {
         ...runtime,
         peers: runtime.peers.map((peer) => {
-            const trackedDevices = getTrackedRuntimePeerRouters(router, peer, ownerRouters)
+            const legacyTrackedDevices = getTrackedRuntimePeerRouters(router, peer, ownerRouters)
                 .map((candidate) => buildTrackedRuntimePeerDeviceEntry(candidate));
+            const observedPeer = (observedPeers || []).find((candidate) => String(candidate.publicKey || '') === String(peer.publicKey || '')) || null;
+            const promotedTrackedDevices = observedPeer
+                ? (ownerRouters || [])
+                    .filter((candidate) => (observedPeer.promotedRouterIds || []).includes(String(candidate._id)))
+                    .map((candidate) => buildTrackedRuntimePeerDeviceEntry(candidate))
+                : [];
+            const trackedDevices = [...legacyTrackedDevices];
+            for (const device of promotedTrackedDevices) {
+                if (!trackedDevices.some((candidate) => String(candidate.routerId) === String(device.routerId))) {
+                    trackedDevices.push(device);
+                }
+            }
             return {
                 ...peer,
                 trackedDevices,
                 trackedDeviceCount: trackedDevices.length,
-                trackingMarker: getRuntimePeerTrackingMarker(router, peer)
+                trackingMarker: getRuntimePeerTrackingMarker(router, peer),
+                observedPeer
             };
         })
     };
@@ -870,49 +1202,90 @@ function buildRuntimePeerTrackedNote(router, runtimePeer, reason = '') {
 }
 
 async function trackRouterRuntimePeer({ routerId, peerId, name, reason = '', actor = 'admin' }) {
+    const observation = await observeRouterRuntimePeer({
+        routerId,
+        peerId,
+        classification: 'mikrotik_router',
+        assetLabel: name,
+        reason,
+        actor
+    });
+
+    const promoted = await promoteObservedRuntimePeerToRouter({
+        routerId,
+        observedPeerId: observation.observedPeer.id,
+        name,
+        reason,
+        actor
+    });
+
+    return {
+        ...observation,
+        requestedName: name,
+        createdRouter: promoted.createdRouter,
+        trackedDevices: promoted.trackedDevices,
+        observedPeer: promoted.observedPeer
+    };
+}
+
+async function promoteObservedRuntimePeerToRouter({ routerId, observedPeerId, name, reason = '', actor = 'admin' }) {
     const bundle = await getRouterBundle(routerId);
     if (!bundle) {
         throw new Error('Router not found');
     }
 
-    const { router, ownerRouters = [] } = bundle;
-    const runtime = await fetchRouterWireGuardRuntime(String(router._id));
-    const runtimePeer = (runtime?.peers || []).find((peer) => String(peer.id || '') === String(peerId || ''));
+    const { router, owner, ownerRouters = [] } = bundle;
+    const observedPeer = await ManagedTunnelPeer.findOne({
+        _id: observedPeerId,
+        ownerUserId: owner._id
+    });
 
-    if (!runtime.available || !runtimePeer) {
-        throw new Error('Runtime WireGuard peer not found');
+    if (!observedPeer) {
+        throw new Error('Observed WireGuard peer not found');
     }
 
-    if (!runtimePeer.publicKey) {
-        throw new Error('Runtime WireGuard peer is missing a public key');
-    }
-
-    const existingTrackedRouters = getTrackedRuntimePeerRouters(router, runtimePeer, ownerRouters);
-    if (existingTrackedRouters.length) {
-        const error = new Error('A managed router already tracks this runtime peer');
-        error.code = 'runtime_peer_already_tracked';
-        error.routerIds = existingTrackedRouters.map((candidate) => String(candidate._id));
+    if (observedPeer.classification !== 'mikrotik_router') {
+        const error = new Error('Only observed peers classified as MikroTik routers can be promoted');
+        error.code = 'observed_peer_not_promotable';
         throw error;
     }
 
-    const uniqueName = await resolveUniqueRouterName(bundle.owner._id, name);
+    if (!observedPeer.promotionEligible) {
+        const error = new Error(observedPeer.promotionReadinessReason || 'Observed peer is not ready for promotion');
+        error.code = 'observed_peer_not_ready';
+        throw error;
+    }
+
+    const alreadyPromoted = (ownerRouters || []).filter((candidate) =>
+        (observedPeer.promotedRouterIds || []).map((item) => String(item)).includes(String(candidate._id))
+    );
+    if (alreadyPromoted.length) {
+        const error = new Error('A managed router already represents this observed peer');
+        error.code = 'runtime_peer_already_tracked';
+        error.routerIds = alreadyPromoted.map((candidate) => String(candidate._id));
+        throw error;
+    }
+
+    const runtime = await fetchRouterWireGuardRuntime(String(router._id));
+    const runtimePeer = (runtime?.peers || []).find((peer) => String(peer.publicKey || '') === String(observedPeer.publicKey || ''));
+    const uniqueName = await resolveUniqueRouterName(bundle.owner._id, name || observedPeer.assetLabel || observedPeer.interfaceName || 'tracked-router');
 
     const created = await createManagementOnlyRouterAdmin({
         userId: String(bundle.owner._id),
         name: uniqueName,
-        notes: buildRuntimePeerTrackedNote(router, runtimePeer, reason)
+        notes: buildRuntimePeerTrackedNote(router, runtimePeer || observedPeer, reason)
     });
 
     created.router.discoveryInfo = {
         ...(created.router.discoveryInfo || {}),
-        hostname: runtimePeer.interface || created.router.discoveryInfo?.hostname || null,
-        localAddress: runtimePeer.currentEndpointAddress || runtimePeer.endpointAddress || null,
+        hostname: observedPeer.assetLabel || observedPeer.interfaceName || created.router.discoveryInfo?.hostname || null,
+        localAddress: stripCidr(observedPeer.endpoint || ''),
         source: 'wireguard_runtime'
     };
     created.router.adminNotes = [
         ...(created.router.adminNotes || []),
         {
-            body: `Tracked runtime WireGuard peer ${runtimePeer.interface || runtimePeer.publicKey || peerId} from source router ${router.name || router._id}.`,
+            body: `Promoted observed WireGuard peer ${observedPeer.assetLabel || observedPeer.publicKey || observedPeerId} from source router ${router.name || router._id}.`,
             category: 'infrastructure',
             pinned: false,
             author: actor,
@@ -922,23 +1295,40 @@ async function trackRouterRuntimePeer({ routerId, peerId, name, reason = '', act
     router.adminNotes = [
         ...(router.adminNotes || []),
         {
-            body: `Runtime WireGuard peer ${runtimePeer.interface || runtimePeer.publicKey || peerId} was tracked as management-only router ${created.router.name}.`,
+            body: `Observed WireGuard peer ${observedPeer.assetLabel || observedPeer.publicKey || observedPeerId} was promoted as management-only router ${created.router.name}.`,
             category: 'infrastructure',
             pinned: false,
             author: actor,
             createdAt: new Date()
         }
     ];
+
+    observedPeer.promotedRouterIds = [
+        ...new Set([...(observedPeer.promotedRouterIds || []).map((item) => String(item)), String(created.router._id)])
+    ];
+    observedPeer.evidence = mergeObservedPeerEvidence(observedPeer.evidence, [{
+        kind: 'promotion',
+        summary: `Observed peer promoted to managed router ${created.router.name}`,
+        confidence: Math.max(80, Number(observedPeer.confidenceScore || 0)),
+        sourceRouterId: router._id,
+        observedAt: new Date(),
+        details: {
+            routerId: String(created.router._id),
+            reason: reason || null
+        }
+    }]);
+
     await router.save();
     await created.router.save();
+    await observedPeer.save();
+
+    const trackedRouter = await MikrotikRouter.findById(created.router._id).lean();
 
     return {
         sourceRouter: router,
-        runtime,
-        runtimePeer,
-        requestedName: name,
+        observedPeer: normalizeManagedTunnelPeer(observedPeer, [...ownerRouters, trackedRouter].filter(Boolean)),
         createdRouter: created.router,
-        trackedDevices: [buildTrackedRuntimePeerDeviceEntry(created.router)]
+        trackedDevices: trackedRouter ? [buildTrackedRuntimePeerDeviceEntry(trackedRouter)] : []
     };
 }
 
@@ -1140,15 +1530,17 @@ function buildConnectivitySummary(router, client, ownerTunnelContext = null) {
 }
 
 function buildApiAccessSummary(router) {
+    const managementOnly = isManagementOnlyRouter(router);
     const preferredEndpoint = (router.managementEndpoints || [])
         .filter((endpoint) => endpoint.enabled !== false && ['api', 'api_ssl', 'rest_https'].includes(endpoint.transport))
+        .filter((endpoint) => managementOnly || ['wireguard_management', 'wireguard_api', 'public_api_tls'].includes(String(endpoint.kind || '')))
         .sort((a, b) => (a.priority || 999) - (b.priority || 999))[0];
     const hasCredentials = Boolean(router.credentialState?.secretRef || (router.apiUsername || '').trim() || (router.apiPassword || '').trim());
     const lastSuccessAt = router.lastApiSuccessAt || null;
     const lastErrorAt = router.lastApiErrorAt || null;
     return {
         username: router.apiUsername || 'admin',
-        apiPort: preferredEndpoint?.port || router.apiPort || 8728,
+        apiPort: (!managementOnly && router.apiPort) ? router.apiPort : (preferredEndpoint?.port || router.apiPort || 8728),
         hasPassword: Boolean(router.apiPassword),
         hasCredentials,
         credentialState: {
@@ -1665,6 +2057,12 @@ async function getAdminRouterDetail(routerId) {
         recent: []
     }));
     wireguard.runtime = await fetchRouterWireGuardRuntime(String(router._id));
+    const observedPeers = await ManagedTunnelPeer.find({
+        ownerUserId: owner._id,
+        publicKey: {
+            $in: (wireguard.runtime?.peers || []).map((peer) => peer.publicKey).filter(Boolean)
+        }
+    }).lean();
     if (!wireguard.available && wireguard.runtime?.available && wireguard.runtime.peers.length) {
         const runtimePeer = wireguard.runtime.peers[0];
         wireguard.available = true;
@@ -1693,7 +2091,12 @@ async function getAdminRouterDetail(routerId) {
             persistentKeepalive: runtimePeer.persistentKeepalive ?? null
         };
     }
-    wireguard.runtime = enrichRuntimePeersWithTracking(router, wireguard.runtime, ownerRouters);
+    wireguard.runtime = enrichRuntimePeersWithTracking(
+        router,
+        wireguard.runtime,
+        ownerRouters,
+        observedPeers.map((peer) => normalizeManagedTunnelPeer(peer, ownerRouters))
+    );
 
     return {
         id: String(router._id),
@@ -2078,7 +2481,7 @@ async function createManagementOnlyRouterAdmin({ userId, name, notes = '' }) {
         lastSeen: new Date(),
         notes: notes || '',
         endpointBinding: {
-            expectedIdentity: trimmedName,
+            expectedIdentity: null,
             state: 'unknown'
         },
         remoteBootstrap: {
@@ -2132,9 +2535,11 @@ async function ensureRouterHasClient(router, dbInitialized = true) {
     return client;
 }
 
-async function attachPeerToWireGuard(client) {
+async function attachPeerToWireGuard(client, routers = []) {
     const keepalive = validateKeepalive(client.persistentKeepalive || KEEPALIVE_TIME);
-    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'allowed-ips', client.ip, 'persistent-keepalive', String(keepalive)]));
+    const allowedIps = buildClientPeerAllowedIps(client, routers);
+    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'allowed-ips', allowedIps, 'persistent-keepalive', String(keepalive)]));
+    await syncWireGuardPeerRoutesFromDatabase(true).catch(() => undefined);
 }
 
 async function detachPeerFromWireGuard(client) {
@@ -2144,6 +2549,46 @@ async function detachPeerFromWireGuard(client) {
     } catch (error) {
         // Ignore missing peers; admin action should still proceed.
     }
+}
+
+async function unlinkRouterClient(routerId) {
+    const bundle = await getRouterBundle(routerId);
+    if (!bundle) return null;
+
+    const { router, client } = bundle;
+    if (!client) {
+        return {
+            ...bundle,
+            unlinked: false,
+            detachedClientId: null
+        };
+    }
+
+    const detachedClientId = String(client._id);
+    router.wireguardClientId = null;
+    router.vpnIp = null;
+    router.lastReconfiguredAt = new Date();
+    await router.save();
+
+    stopRouterProxy(router._id);
+
+    if (client.enabled) {
+        const remainingRouters = await MikrotikRouter.find({
+            wireguardClientId: client._id
+        }).select('wireguardClientId managementEndpoints discoveryInfo.localAddress remoteBootstrap.preferredManagementSubnet').lean();
+
+        try {
+            await attachPeerToWireGuard(client, remainingRouters);
+        } catch (error) {
+            // Keep unlinking resilient even if peer reconciliation needs follow-up.
+        }
+    }
+
+    return {
+        ...(await getRouterBundle(routerId)),
+        unlinked: true,
+        detachedClientId
+    };
 }
 
 async function disableRouter(routerId) {
@@ -2174,7 +2619,7 @@ async function reactivateRouter(routerId) {
 
     client.enabled = true;
     await client.save();
-    await attachPeerToWireGuard(client);
+    await attachPeerToWireGuard(client, router);
 
     router.status = 'pending';
     router.lastReconfiguredAt = new Date();
@@ -2197,7 +2642,7 @@ async function resetRouterPeer(routerId) {
     client.publicKey = publicKey;
     client.enabled = true;
     await client.save();
-    await attachPeerToWireGuard(client);
+    await attachPeerToWireGuard(client, router);
 
     router.status = 'pending';
     router.lastReconfiguredAt = new Date();
@@ -2217,7 +2662,7 @@ async function reprovisionRouter(routerId, options = {}) {
     await ensureRouterHasPorts(router);
     client.enabled = true;
     await client.save();
-    await attachPeerToWireGuard(client);
+    await attachPeerToWireGuard(client, router);
 
     router.status = 'pending';
     router.lastReconfiguredAt = new Date();
@@ -2420,6 +2865,8 @@ module.exports = {
     getAdminRouterFlags,
     createRouterAdmin,
     createManagementOnlyRouterAdmin,
+    observeRouterRuntimePeer,
+    promoteObservedRuntimePeerToRouter,
     trackRouterRuntimePeer,
     clearEndpointMismatchQuarantine,
     getEndpointMismatchCooldownState,
@@ -2427,6 +2874,7 @@ module.exports = {
     markRouterBootstrapApplied,
     disableRouter,
     reactivateRouter,
+    unlinkRouterClient,
     resetRouterPeer,
     reprovisionRouter,
     reassignRouterPorts,

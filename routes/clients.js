@@ -10,16 +10,79 @@ const {
 } = require("../wg-core");
 const {
     generateKeys,
-    getNextAvailableIP
+    getNextAvailableIP,
+    syncWireGuardPeerRoutesFromDatabase
 } = require("../utils/route-helpers");
+const MikrotikRouter = require("../models/MikrotikRouter");
+const { buildClientPeerAllowedIps } = require("../utils/wireguard-peer-routes");
 const { getTimeAgo } = require("../utils/route-helpers");
+const { requireAdmin } = require('../middleware/admin-auth');
 const dotenv = require('dotenv');
 dotenv.config();
+
+async function getClientLinkedRouters(clientId) {
+    return MikrotikRouter.find({
+        wireguardClientId: clientId
+    }).select('wireguardClientId managementEndpoints discoveryInfo.localAddress remoteBootstrap.preferredManagementSubnet').lean();
+}
+
+async function getClientLinkedRouterSummaries(clientIds) {
+    const normalizedIds = []
+        .concat(clientIds || [])
+        .filter(Boolean)
+        .map((value) => String(value));
+
+    if (!normalizedIds.length) {
+        return new Map();
+    }
+
+    const routers = await MikrotikRouter.find({
+        wireguardClientId: { $in: normalizedIds }
+    }).select('_id name status vpnIp wireguardClientId').lean();
+
+    const grouped = new Map();
+    for (const router of routers) {
+        const key = String(router.wireguardClientId || '');
+        if (!key) continue;
+
+        const current = grouped.get(key) || [];
+        current.push({
+            _id: String(router._id),
+            name: router.name || 'Unnamed router',
+            status: router.status || 'unknown',
+            vpnIp: router.vpnIp || null
+        });
+        grouped.set(key, current);
+    }
+
+    return grouped;
+}
+
+function attachClientLinkMetadata(clientData, linkedRouters = []) {
+    return {
+        ...clientData,
+        linkedRouterCount: linkedRouters.length,
+        linkedRouters
+    };
+}
+
+async function applyClientPeerConfig(client) {
+    const keepalive = validateKeepalive(client.persistentKeepalive);
+    const linkedRouters = await getClientLinkedRouters(client._id);
+    const allowedIps = buildClientPeerAllowedIps(client, linkedRouters);
+    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'allowed-ips', allowedIps, 'persistent-keepalive', String(keepalive)]));
+    await syncWireGuardPeerRoutesFromDatabase(getDbInitialized()).catch(() => undefined);
+}
+
+function registerClientEndpoint(app, method, legacyPath, adminPath, ...handlers) {
+    app[method](legacyPath, ...handlers);
+    app[method](adminPath, ...handlers);
+}
 
 // Register all client management routes
 function registerClientRoutes(app, getDbInitialized) {
     // Get all clients from database with filtering, pagination, and search
-    app.get("/api/clients", async (req, res) => {
+    registerClientEndpoint(app, 'get', "/api/clients", "/api/admin/vpn-clients", requireAdmin, async (req, res) => {
         try {
             const dbInitialized = getDbInitialized();
             if (!dbInitialized) {
@@ -64,7 +127,11 @@ function registerClientRoutes(app, getDbInitialized) {
                 Client.countDocuments(query)
             ]);
 
-            const safeClients = clients.map(c => c.toSafeJSON());
+            const linkedRoutersByClientId = await getClientLinkedRouterSummaries(clients.map((client) => client._id));
+            const safeClients = clients.map((client) => attachClientLinkMetadata(
+                client.toSafeJSON(),
+                linkedRoutersByClientId.get(String(client._id)) || []
+            ));
 
             res.json({
                 success: true,
@@ -87,7 +154,7 @@ function registerClientRoutes(app, getDbInitialized) {
     });
 
     // Get client details by name (admin - includes private key)
-    app.get("/api/clients/:name", async (req, res) => {
+    registerClientEndpoint(app, 'get', "/api/clients/:name", "/api/admin/vpn-clients/:name", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const { includePrivateKey = 'false' } = req.query;
@@ -102,13 +169,14 @@ function registerClientRoutes(app, getDbInitialized) {
             }
 
             // Return full details if requested, otherwise safe version
+            const linkedRouters = (await getClientLinkedRouterSummaries([client._id])).get(String(client._id)) || [];
             const clientData = includePrivateKey === 'true'
                 ? client.toObject()
                 : client.toSafeJSON();
 
             res.json({
                 success: true,
-                data: clientData
+                data: attachClientLinkMetadata(clientData, linkedRouters)
             });
         } catch (error) {
             log('error', 'get_client_error', { error: error.message });
@@ -122,7 +190,7 @@ function registerClientRoutes(app, getDbInitialized) {
     });
 
     // Get client WireGuard config file (.conf)
-    app.get("/api/clients/:name/config", async (req, res) => {
+    registerClientEndpoint(app, 'get', "/api/clients/:name/config", "/api/admin/vpn-clients/:name/config", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
@@ -174,7 +242,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Auto-Configure MikroTik (Single URL) - Enhanced version
-    app.get("/api/clients/:name/autoconfig", async (req, res) => {
+    registerClientEndpoint(app, 'get', "/api/clients/:name/autoconfig", "/api/admin/vpn-clients/:name/autoconfig", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             // Try to find client by exact name match first
@@ -229,7 +297,7 @@ PersistentKeepalive = ${keepalive}`;
             }
 
             const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
-            const allowed = "10.0.0.0/24";
+            const allowed = (client.allowedIPs || "10.0.0.0/24").toString().trim();
             // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
             const dns = (client.dns || "8.8.8.8,1.1.1.1").replace(/,\s+/g, ',').trim();
             const keepalive = validateKeepalive(client.persistentKeepalive);
@@ -389,7 +457,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Get client MikroTik script
-    app.get("/api/clients/:name/mikrotik", async (req, res) => {
+    registerClientEndpoint(app, 'get', "/api/clients/:name/mikrotik", "/api/admin/vpn-clients/:name/mikrotik", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const { iface, subnet } = req.query;
@@ -431,7 +499,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Ping remote server endpoint
-    app.post("/api/clients/:name/ping", async (req, res) => {
+    registerClientEndpoint(app, 'post', "/api/clients/:name/ping", "/api/admin/vpn-clients/:name/ping", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const { target, count = 3 } = req.body;
@@ -505,7 +573,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Create new client (admin)
-    app.post("/api/clients", async (req, res) => {
+    registerClientEndpoint(app, 'post', "/api/clients", "/api/admin/vpn-clients", requireAdmin, async (req, res) => {
         try {
             const {
                 name,
@@ -571,8 +639,7 @@ PersistentKeepalive = ${keepalive}`;
             // Add to WireGuard if enabled
             if (enabled) {
                 try {
-                    const keepalive = validateKeepalive(persistentKeepalive);
-                    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', allocatedIp, 'persistent-keepalive', String(keepalive)]));
+                    await applyClientPeerConfig(client);
                     log('info', 'peer_added', { client: clientName });
                 } catch (error) {
                     log('warn', 'peer_add_failed', { client: clientName, error: error.message });
@@ -614,10 +681,11 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Full update client (admin)
-    app.put("/api/clients/:name", async (req, res) => {
+    registerClientEndpoint(app, 'put', "/api/clients/:name", "/api/admin/vpn-clients/:name", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const {
+                name: nextName,
                 notes,
                 interfaceName,
                 enabled,
@@ -655,8 +723,28 @@ PersistentKeepalive = ${keepalive}`;
                 });
             }
 
+            const normalizedNextName = nextName === undefined ? undefined : String(nextName).toLowerCase().trim();
+            if (normalizedNextName !== undefined && !normalizedNextName) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Name cannot be empty",
+                    error: "VALIDATION_ERROR"
+                });
+            }
+            if (normalizedNextName && normalizedNextName !== client.name) {
+                const duplicate = await Client.findOne({ name: normalizedNextName });
+                if (duplicate) {
+                    return res.status(409).json({
+                        success: false,
+                        message: `Client "${normalizedNextName}" already exists`,
+                        error: "CLIENT_EXISTS"
+                    });
+                }
+            }
+
             // Update fields
             const updateData = {};
+            if (normalizedNextName !== undefined) updateData.name = normalizedNextName;
             if (notes !== undefined) updateData.notes = notes;
             if (interfaceName !== undefined) updateData.interfaceName = interfaceName;
             if (typeof enabled === 'boolean') updateData.enabled = enabled;
@@ -666,23 +754,30 @@ PersistentKeepalive = ${keepalive}`;
             if (dns !== undefined) updateData.dns = dns;
             if (persistentKeepalive !== undefined) updateData.persistentKeepalive = validateKeepalive(persistentKeepalive);
 
+            const wasEnabled = client.enabled;
+            const livePeerConfigChanged = (
+                (ip !== undefined && ip !== client.ip) ||
+                (allowedIPs !== undefined && allowedIPs !== client.allowedIPs) ||
+                (persistentKeepalive !== undefined && validateKeepalive(persistentKeepalive) !== validateKeepalive(client.persistentKeepalive))
+            );
+            const enabledChanged = typeof enabled === 'boolean' && enabled !== wasEnabled;
+
             const updatedClient = await Client.findOneAndUpdate(
                 { name: name.toLowerCase() },
                 updateData,
                 { new: true }
             );
 
-            // Update WireGuard if enabled status changed or IP changed
-            if (typeof enabled === 'boolean' || ip !== undefined) {
-                if (enabled !== false && updatedClient.enabled) {
+            // Apply live WireGuard changes whenever the active peer configuration changes.
+            if (enabledChanged || livePeerConfigChanged) {
+                if (updatedClient.enabled) {
                     try {
-                        const keepalive = validateKeepalive(updatedClient.persistentKeepalive);
-                        await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', updatedClient.publicKey, 'allowed-ips', updatedClient.ip, 'persistent-keepalive', String(keepalive)]));
+                        await applyClientPeerConfig(updatedClient);
                         log('info', 'peer_updated', { client: name });
                     } catch (error) {
                         log('warn', 'peer_update_failed', { client: name, error: error.message });
                     }
-                } else if (enabled === false) {
+                } else if (wasEnabled && !updatedClient.enabled) {
                     try {
                         await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', updatedClient.publicKey, 'remove']));
                         log('info', 'peer_disabled', { client: name });
@@ -708,7 +803,10 @@ PersistentKeepalive = ${keepalive}`;
 
             res.json({
                 success: true,
-                message: "Client updated successfully"
+                message: normalizedNextName && normalizedNextName !== client.name
+                    ? `Client renamed to "${normalizedNextName}" and updated successfully`
+                    : "Client updated successfully",
+                data: attachClientLinkMetadata(updatedClient.toSafeJSON(), (await getClientLinkedRouterSummaries([updatedClient._id])).get(String(updatedClient._id)) || [])
             });
         } catch (error) {
             log('error', 'update_client_error', { error: error.message });
@@ -722,7 +820,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Regenerate client keys (admin)
-    app.post("/api/clients/:name/regenerate", async (req, res) => {
+    registerClientEndpoint(app, 'post', "/api/clients/:name/regenerate", "/api/admin/vpn-clients/:name/regenerate", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
@@ -752,8 +850,7 @@ PersistentKeepalive = ${keepalive}`;
             // Add new peer to WireGuard if enabled
             if (client.enabled) {
                 try {
-                    const keepalive = validateKeepalive(client.persistentKeepalive);
-                    await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', publicKey, 'allowed-ips', client.ip, 'persistent-keepalive', String(keepalive)]));
+                    await applyClientPeerConfig(client);
                     log('info', 'peer_regenerated', { client: name });
                 } catch (error) {
                     log('warn', 'peer_regenerate_add_failed', { client: name, error: error.message });
@@ -779,7 +876,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Enable client
-    app.post("/api/clients/:name/enable", async (req, res) => {
+    registerClientEndpoint(app, 'post', "/api/clients/:name/enable", "/api/admin/vpn-clients/:name/enable", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOneAndUpdate(
@@ -797,8 +894,7 @@ PersistentKeepalive = ${keepalive}`;
 
             // Add to WireGuard
             try {
-                const keepalive = validateKeepalive(client.persistentKeepalive);
-                await wgLock.run(() => runWgCommand(['set', 'wg0', 'peer', client.publicKey, 'allowed-ips', client.ip, 'persistent-keepalive', String(keepalive)]));
+                await applyClientPeerConfig(client);
                 log('info', 'peer_enabled', { client: name });
             } catch (error) {
                 log('warn', 'peer_enable_failed', { client: name, error: error.message });
@@ -819,7 +915,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Disable client
-    app.post("/api/clients/:name/disable", async (req, res) => {
+    registerClientEndpoint(app, 'post', "/api/clients/:name/disable", "/api/admin/vpn-clients/:name/disable", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOneAndUpdate(
@@ -873,7 +969,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Delete client
-    app.delete("/api/clients/:name", async (req, res) => {
+    registerClientEndpoint(app, 'delete', "/api/clients/:name", "/api/admin/vpn-clients/:name", requireAdmin, async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
@@ -883,6 +979,16 @@ PersistentKeepalive = ${keepalive}`;
                     success: false,
                     message: `Client "${name}" not found`,
                     error: "CLIENT_NOT_FOUND"
+                });
+            }
+
+            const linkedRouters = (await getClientLinkedRouterSummaries([client._id])).get(String(client._id)) || [];
+            if (linkedRouters.length) {
+                return res.status(409).json({
+                    success: false,
+                    message: `Client "${name}" is still assigned to ${linkedRouters.length} router(s). Unlink or remove those routers before deleting this client.`,
+                    error: "CLIENT_LINKED_TO_ROUTER",
+                    linkedRouters
                 });
             }
 
@@ -913,7 +1019,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Bulk delete clients
-    app.post("/api/clients/bulk-delete", async (req, res) => {
+    registerClientEndpoint(app, 'post', "/api/clients/bulk-delete", "/api/admin/vpn-clients/bulk-delete", requireAdmin, async (req, res) => {
         try {
             const { names } = req.body;
 
@@ -933,6 +1039,23 @@ PersistentKeepalive = ${keepalive}`;
                     success: false,
                     message: "No clients found to delete",
                     error: "CLIENT_NOT_FOUND"
+                });
+            }
+
+            const linkedRoutersByClientId = await getClientLinkedRouterSummaries(clients.map((client) => client._id));
+            const blockedClients = clients
+                .map((client) => ({
+                    name: client.name,
+                    linkedRouters: linkedRoutersByClientId.get(String(client._id)) || []
+                }))
+                .filter((client) => client.linkedRouters.length > 0);
+
+            if (blockedClients.length) {
+                return res.status(409).json({
+                    success: false,
+                    message: `${blockedClients.length} selected client(s) are still assigned to routers. Unlink those routers before bulk delete.`,
+                    error: "CLIENT_LINKED_TO_ROUTER",
+                    blockedClients
                 });
             }
 

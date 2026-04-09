@@ -1,6 +1,8 @@
 const { execFile } = require("child_process");
+const { promisify } = require("util");
 const fs = require("fs");
 const Client = require("../models/Client");
+const MikrotikRouter = require("../models/MikrotikRouter");
 const {
     wgLock,
     log,
@@ -11,6 +13,9 @@ const {
     validateKeepalive,
     runWgCommand
 } = require("../wg-core");
+const { buildClientPeerAllowedIps, getAdditionalServerPeerRoutes } = require("./wireguard-peer-routes");
+
+const execFileAsync = promisify(execFile);
 
 // Generate WireGuard keys (uses execFile, no shell needed)
 async function generateKeys() {
@@ -100,6 +105,16 @@ async function loadClientsFromDatabase(dbInitialized) {
     
     try {
         const clients = await Client.find({ enabled: true });
+        const linkedRouters = await MikrotikRouter.find({
+            wireguardClientId: { $exists: true, $ne: null }
+        }).select('wireguardClientId managementEndpoints discoveryInfo.localAddress remoteBootstrap.preferredManagementSubnet').lean();
+        const routersByClientId = linkedRouters.reduce((map, router) => {
+            const key = String(router.wireguardClientId || '');
+            if (!key) return map;
+            if (!map.has(key)) map.set(key, []);
+            map.get(key).push(router);
+            return map;
+        }, new Map());
         log('info', 'syncconf_start', { clientCount: clients.length });
         
         // Build wg config with only [Peer] sections (no [Interface])
@@ -113,9 +128,10 @@ async function loadClientsFromDatabase(dbInitialized) {
                 continue;
             }
             const keepalive = validateKeepalive(client.persistentKeepalive);
+            const allowedIps = buildClientPeerAllowedIps(client, routersByClientId.get(String(client._id)) || []);
             conf += `[Peer]\n`;
             conf += `PublicKey = ${client.publicKey}\n`;
-            conf += `AllowedIPs = ${client.ip}\n`;
+            conf += `AllowedIPs = ${allowedIps}\n`;
             conf += `PersistentKeepalive = ${keepalive}\n\n`;
         }
         if (skipped > 0) {
@@ -129,10 +145,56 @@ async function loadClientsFromDatabase(dbInitialized) {
         // addconf only adds/updates peers without touching the interface config.
         await wgLock.run(() => runWgCommand(['addconf', 'wg0', tmpFile]));
         fs.unlinkSync(tmpFile);
-        
+        await syncWireGuardPeerRoutesFromDatabase(dbInitialized);
+
         log('info', 'peers_loaded', { synced: clients.length - skipped, total: clients.length });
     } catch (error) {
         log('error', 'load_clients_failed', { error: error.message });
+    }
+}
+
+async function syncWireGuardPeerRoutesFromDatabase(dbInitialized, interfaceName = 'wg0') {
+    if (!dbInitialized) {
+        return;
+    }
+
+    const clients = await Client.find({ enabled: true }).select('_id ip').lean();
+    const linkedRouters = await MikrotikRouter.find({
+        wireguardClientId: { $exists: true, $ne: null }
+    }).select('wireguardClientId managementEndpoints discoveryInfo.localAddress remoteBootstrap.preferredManagementSubnet').lean();
+
+    const routersByClientId = linkedRouters.reduce((map, router) => {
+        const key = String(router.wireguardClientId || '');
+        if (!key) return map;
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(router);
+        return map;
+    }, new Map());
+
+    const desiredRoutes = new Set();
+    for (const client of clients) {
+        for (const route of getAdditionalServerPeerRoutes(client, routersByClientId.get(String(client._id)) || [])) {
+            desiredRoutes.add(route);
+        }
+    }
+
+    const current = await execFileAsync('ip', ['route', 'show', 'dev', interfaceName]).catch(() => ({ stdout: '' }));
+    const currentRoutes = String(current.stdout || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => line.split(/\s+/)[0])
+        .filter((route) => route !== '10.0.0.0/24');
+
+    for (const route of desiredRoutes) {
+        await execFileAsync('ip', ['route', 'replace', route, 'dev', interfaceName]).catch((error) => {
+            log('warn', 'wireguard_route_replace_failed', { route, interfaceName, error: error.message });
+        });
+    }
+
+    for (const route of currentRoutes) {
+        if (desiredRoutes.has(route)) continue;
+        await execFileAsync('ip', ['route', 'del', route, 'dev', interfaceName]).catch(() => undefined);
     }
 }
 // Ensure a client exists (create if missing) and return its record
@@ -190,6 +252,7 @@ module.exports = {
     getUsedIPs,
     getNextAvailableIP,
     loadClientsFromDatabase,
+    syncWireGuardPeerRoutesFromDatabase,
     ensureClientRecord,
     getTimeAgo
 };

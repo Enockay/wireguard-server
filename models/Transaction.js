@@ -40,7 +40,7 @@ const transactionSchema = new mongoose.Schema({
     },
     paymentMethod: {
         type: String,
-        enum: ['paypal', 'paystack', 'balance', 'manual', 'mpesa', 'airtel_money', 'bank_transfer', 'cash'],
+        enum: ['paypal', 'paystack', 'balance', 'manual', 'mpesa', 'airtel_money', 'bank_transfer', 'cash', 'account_credit'],
         default: 'balance'
     },
     paymentGatewayId: {

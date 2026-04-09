@@ -5,6 +5,7 @@ const { authenticateToken } = require('./auth');
 const { initiateStk, queryStk, formatPhoneNumber } = require('../services/mpesa-service');
 const { handlePaymentConfirmed } = require('../services/billing-enforcement-service');
 const { log } = require('../wg-core');
+const { verifyJsonWebhookSignature } = require('../utils/runtime-security');
 
 function createTransactionId(prefix = 'MPESA') {
     return `${prefix}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
@@ -72,6 +73,17 @@ function registerPaymentRoutes(app) {
 
     app.post('/api/payments/mpesa/callback', async (req, res) => {
         try {
+            const verification = verifyJsonWebhookSignature(req, process.env.MPESA_CALLBACK_SECRET, [
+                'x-mpesa-signature',
+                'x-webhook-signature'
+            ]);
+            if (!verification.ok) {
+                if (verification.code === 'missing_secret') {
+                    return res.status(503).json({ ResultCode: 1, ResultDesc: 'M-Pesa callback is not configured' });
+                }
+                return res.status(401).json({ ResultCode: 1, ResultDesc: 'Invalid callback signature' });
+            }
+
             const callback = req.body?.Body?.stkCallback || {};
             const checkoutRequestId = callback.CheckoutRequestID;
             const resultCode = Number(callback.ResultCode);

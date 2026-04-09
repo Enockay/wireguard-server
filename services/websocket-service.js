@@ -6,8 +6,8 @@ const { stripCidrSuffix } = require('./routeros-command-service');
 const { getResolvedCredential } = require('./router-credential-service');
 const { startApiConsoleSession, startSshSession } = require('./terminal-service');
 const { resolveManagementEndpoints } = require('./router-execution-service');
+const { getJwtSecret } = require('../utils/runtime-security');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const AUTH_COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'mikrotik_admin_session';
 const connections = new Map();
 let webSocketServer = null;
@@ -121,7 +121,12 @@ function createWebSocketServer(httpServer) {
 
         let decoded;
         try {
-            decoded = jwt.verify(token, JWT_SECRET);
+            const jwtSecret = getJwtSecret();
+            if (!jwtSecret) {
+                ws.close(1011, 'Authentication service is not configured');
+                return;
+            }
+            decoded = jwt.verify(token, jwtSecret);
         } catch (error) {
             ws.close(4001, 'Invalid token');
             return;

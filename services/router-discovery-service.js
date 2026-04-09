@@ -549,7 +549,7 @@ async function importDiscoveryCandidate({ sessionId, candidateId, userId, name, 
     }
     created.router.endpointBinding = {
         ...(created.router.endpointBinding || {}),
-        expectedIdentity: metadata.identity || candidate.hostname || created.router.name,
+        expectedIdentity: metadata.identity || candidate.hostname || null,
         expectedSerial: metadata.serialNumber || null,
         state: importMode === 'management_only' ? 'local_only' : 'tunnel_ready',
         verifiedEndpointId: null,

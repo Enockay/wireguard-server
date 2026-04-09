@@ -11,6 +11,13 @@ function resolveRouterManagementHost(router) {
     const endpoints = Array.isArray(router?.managementEndpoints) ? router.managementEndpoints : [];
     const prefersRemoteManagement = router?.connectionMode !== 'management_only' && router?.status === 'active';
     const healthRank = { healthy: 0, degraded: 1, unknown: 2, stale: 3, unreachable: 4 };
+    const vpnHost = stripCidrSuffix(router?.vpnIp);
+    const localHost = stripCidrSuffix(router?.discoveryInfo?.localAddress);
+
+    if (prefersRemoteManagement) {
+        return vpnHost || '';
+    }
+
     const preferred = [...endpoints]
         .filter((endpoint) => endpoint.enabled !== false && endpoint.health !== 'unreachable')
         .sort((a, b) => {
@@ -24,9 +31,6 @@ function resolveRouterManagementHost(router) {
             return (a?.priority || 999) - (b?.priority || 999);
         })[0];
     if (preferred?.host) return preferred.host;
-
-    const vpnHost = stripCidrSuffix(router?.vpnIp);
-    const localHost = stripCidrSuffix(router?.discoveryInfo?.localAddress);
 
     if (router?.status !== 'active' && localHost) {
         return localHost;

@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const ServicePlan = require('../models/ServicePlan');
 const Voucher = require('../models/Voucher');
+const PlatformConfig = require('../models/PlatformConfig');
 const { requireAdmin } = require('../middleware/admin-auth');
 const { recordAdminAction } = require('../services/admin-audit-service');
 
@@ -130,18 +131,83 @@ function buildPlanPayload(body = {}, createdBy = '') {
     return payload;
 }
 
-function registerAdminServicePlanRoutes(app) {
-    app.get('/api/admin/settings/platform', requireAdmin, async (_req, res) => {
-        const pkg = require('../package.json');
-        return res.json({
-            success: true,
-            config: {
+async function loadPlatformConfig() {
+    const config = await PlatformConfig.findOneAndUpdate(
+        { key: 'primary' },
+        {
+            $setOnInsert: {
                 routerMonthlyPrice: Number(process.env.ROUTER_MONTHLY_PRICE || '10.00'),
                 trialDays: Number(process.env.TRIAL_DAYS || '7'),
                 serverRegion: process.env.SERVER_REGION || 'primary',
-                appVersion: pkg.version || '1.0.0'
+                supportEmail: process.env.SUPPORT_EMAIL || '',
+                billingGraceDays: Number(process.env.BILLING_GRACE_DAYS || '3'),
+                updatedBy: 'system'
             }
-        });
+        },
+        { new: true, upsert: true }
+    );
+    return config;
+}
+
+function serializePlatformConfig(config) {
+    const pkg = require('../package.json');
+    return {
+        routerMonthlyPrice: Number(config?.routerMonthlyPrice || 0),
+        trialDays: Number(config?.trialDays || 0),
+        serverRegion: config?.serverRegion || 'primary',
+        supportEmail: config?.supportEmail || '',
+        billingGraceDays: Number(config?.billingGraceDays || 0),
+        appVersion: pkg.version || '1.0.0',
+        updatedAt: config?.updatedAt || null,
+        updatedBy: config?.updatedBy || 'system'
+    };
+}
+
+function registerAdminServicePlanRoutes(app) {
+    app.get('/api/admin/settings/platform', requireAdmin, async (_req, res) => {
+        try {
+            const config = await loadPlatformConfig();
+            return res.json({ success: true, config: serializePlatformConfig(config) });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load platform configuration', details: error.message });
+        }
+    });
+
+    app.put('/api/admin/settings/platform', requireAdmin, async (req, res) => {
+        try {
+            const config = await loadPlatformConfig();
+            if (req.body?.routerMonthlyPrice !== undefined) {
+                config.routerMonthlyPrice = toPositiveNumber(req.body.routerMonthlyPrice, config.routerMonthlyPrice);
+            }
+            if (req.body?.trialDays !== undefined) {
+                config.trialDays = Math.max(1, Math.floor(toPositiveNumber(req.body.trialDays, config.trialDays)));
+            }
+            if (req.body?.serverRegion !== undefined) {
+                const serverRegion = String(req.body.serverRegion || '').trim();
+                if (!serverRegion) {
+                    return res.status(400).json({ success: false, error: 'serverRegion cannot be empty' });
+                }
+                config.serverRegion = serverRegion;
+            }
+            if (req.body?.supportEmail !== undefined) {
+                config.supportEmail = String(req.body.supportEmail || '').trim().toLowerCase();
+            }
+            if (req.body?.billingGraceDays !== undefined) {
+                config.billingGraceDays = Math.max(0, Math.floor(toPositiveNumber(req.body.billingGraceDays, config.billingGraceDays)));
+            }
+            config.updatedBy = req.adminUser.email || req.adminUser.name || 'system';
+            await config.save();
+            await audit(req, 'admin_update_platform_config', normalizeReason(req.body?.reason), {
+                fields: Object.keys(req.body || {}).filter((field) => field !== 'reason')
+            });
+            return res.json({
+                success: true,
+                message: 'Platform configuration updated',
+                config: serializePlatformConfig(config)
+            });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to update platform configuration', details: error.message });
+        }
     });
 
     app.get('/api/admin/service-plans', requireAdmin, async (req, res) => {

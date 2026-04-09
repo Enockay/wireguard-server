@@ -5,7 +5,7 @@
   "main": "wireguard-api.js",
   "scripts": {
     "start": "node wireguard-api.js",
-    "dev": "node wireguard-api.js",
+    "dev": "node --watch wireguard-api.js",
     "discovery-agent": "node tools/router-discovery-agent.js",
     "discover-downstream-mikrotiks": "node tools/downstream-mikrotik-discovery.js",
     "generate:gap-analysis": "node tools/generate-gap-analysis.js",

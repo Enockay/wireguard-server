@@ -411,21 +411,81 @@ test('hotspot voucher routes list and revoke vouchers', async () => {
     });
 });
 
-test('admin management exposes reseller stub route', async () => {
+test('admin management exposes reseller listing route', async () => {
     const ctx = createRouteTestContext();
+    const resellerDoc = {
+        _id: 'reseller-1',
+        name: 'East Africa Channel',
+        code: 'EAST-AF',
+        companyName: 'East Africa Channel Ltd',
+        contactName: 'Amina',
+        contactEmail: 'amina@example.com',
+        contactPhone: '+254700000000',
+        status: 'active',
+        territory: 'Kenya',
+        commissionRate: 12,
+        priceOverridePercent: 5,
+        notes: 'Priority channel',
+        payoutBalance: 1500,
+        totalPaidOut: 300,
+        lastPayoutAt: null,
+        lastPayoutReference: '',
+        assignedUserIds: [],
+        assignedRouterIds: [],
+        assignedPlanIds: [],
+        createdBy: 'admin@test.local',
+        createdAt: '2026-03-01T00:00:00.000Z',
+        updatedAt: '2026-03-05T00:00:00.000Z'
+    };
 
     await withRouteApp({
         routeModulePath: 'routes/admin-management.js',
         mocks: {
             'middleware/admin-auth.js': ctx.adminAuth,
             'services/admin-audit-service.js': ctx.auditService,
+            'models/Reseller.js': {
+                find() {
+                    return {
+                        sort: async () => [resellerDoc]
+                    };
+                }
+            },
+            'models/MikrotikRouter.js': {
+                find() {
+                    return {
+                        select() {
+                            return { lean: async () => [] };
+                        }
+                    };
+                }
+            },
+            'models/ServicePlan.js': {
+                find() {
+                    return {
+                        select() {
+                            return { lean: async () => [] };
+                        }
+                    };
+                }
+            },
+            'models/AdminNotificationState.js': {},
+            'models/SupportTicket.js': {},
+            'models/VpnServer.js': {},
+            'models/MonitoringIncident.js': {},
             'models/User.js': {
-                async find() { return []; }
+                find() {
+                    return {
+                        select() {
+                            return { lean: async () => [] };
+                        }
+                    };
+                }
             }
         }
     }, async ({ request }) => {
         const result = await request('GET', '/api/admin/resellers');
-        assert.equal(result.response.status, 501);
-        assert.equal(result.json.error, 'Not implemented');
+        assert.equal(result.response.status, 200);
+        assert.equal(result.json.items[0].name, 'East Africa Channel');
+        assert.equal(result.json.items[0].status, 'active');
     });
 });

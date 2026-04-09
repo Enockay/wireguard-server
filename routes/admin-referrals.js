@@ -1,4 +1,7 @@
+const crypto = require('crypto');
 const Referral = require('../models/Referral');
+const Transaction = require('../models/Transaction');
+const User = require('../models/User');
 const { requireAdminPermission } = require('../middleware/admin-auth');
 const { recordAdminAction } = require('../services/admin-audit-service');
 const { log } = require('../wg-core');
@@ -8,6 +11,10 @@ const ADMIN_REFERRAL_PERMISSIONS = {
     MANAGE: 'admin.referrals.manage',
     CONFIGURE: 'admin.referrals.configure'
 };
+
+function generateTransactionId(prefix = 'REF-') {
+    return `${prefix}${Date.now()}-${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
+}
 
 function normalizeText(value) {
     const normalized = value == null ? '' : String(value).trim();
@@ -320,6 +327,41 @@ function registerAdminReferralRoutes(app) {
         try {
             const referral = await loadReferralOrFail(req.params.id);
             const now = new Date();
+            const payoutMethod = normalizeText(req.body?.payoutMethod) || referral.payoutMethod || 'account_credit';
+            const shouldCreditAccount = payoutMethod === 'account_credit' && !referral.rewardGiven;
+            let creditTransaction = null;
+
+            if (shouldCreditAccount) {
+                const referrerId = referral.referrerId?._id || referral.referrerId;
+                const user = await User.findOne({ _id: referrerId, role: { $ne: 'admin' } });
+                if (!user) {
+                    return res.status(404).json({ success: false, error: 'Referrer account not found for account credit payout' });
+                }
+
+                user.balance = Number(user.balance || 0) + Number(referral.rewardAmount || 0);
+                await user.save();
+
+                creditTransaction = await Transaction.create({
+                    userId: user._id,
+                    type: 'payment',
+                    status: 'completed',
+                    settledAt: now,
+                    transactionId: generateTransactionId(),
+                    amount: Number(referral.rewardAmount || 0),
+                    currency: referral.rewardCurrency || user.currency || 'USD',
+                    description: `Referral reward credited for referral ${referral.referralCode}`,
+                    paymentMethod: 'account_credit',
+                    paymentGatewayId: null,
+                    metadata: {
+                        source: 'referral_reward',
+                        referralId: String(referral._id),
+                        referralCode: referral.referralCode,
+                        recordedBy: req.adminUser.email,
+                        recordedAt: now
+                    }
+                });
+            }
+
             referral.reviewStatus = 'paid';
             referral.reviewedAt = referral.reviewedAt || now;
             referral.reviewedBy = referral.reviewedBy || req.adminUser._id;
@@ -329,8 +371,8 @@ function registerAdminReferralRoutes(app) {
             referral.payoutStatus = 'paid';
             referral.paidAt = now;
             referral.paidBy = req.adminUser._id;
-            referral.payoutReference = normalizeText(req.body?.payoutReference);
-            referral.payoutMethod = normalizeText(req.body?.payoutMethod) || referral.payoutMethod || 'account_credit';
+            referral.payoutReference = normalizeText(req.body?.payoutReference) || creditTransaction?.transactionId || referral.payoutReference;
+            referral.payoutMethod = payoutMethod;
             referral.payoutNote = normalizeText(req.body?.note);
             await referral.save();
 
@@ -344,11 +386,25 @@ function registerAdminReferralRoutes(app) {
                     referralId: String(referral._id),
                     payoutReference: referral.payoutReference,
                     rewardAmount: referral.rewardAmount,
-                    payoutMethod: referral.payoutMethod
+                    payoutMethod: referral.payoutMethod,
+                    creditTransactionId: creditTransaction ? creditTransaction.transactionId : null
                 }
             });
 
-            res.json({ success: true, message: 'Referral reward marked as paid', item: normalizeReferral(referral) });
+            res.json({
+                success: true,
+                message: referral.payoutMethod === 'account_credit'
+                    ? 'Referral reward marked as paid and credited to account balance'
+                    : 'Referral reward marked as paid',
+                item: normalizeReferral(referral),
+                transaction: creditTransaction ? {
+                    id: String(creditTransaction._id),
+                    transactionId: creditTransaction.transactionId,
+                    amount: creditTransaction.amount,
+                    currency: creditTransaction.currency,
+                    status: creditTransaction.status
+                } : null
+            });
         } catch (error) {
             const statusCode = error.statusCode || 500;
             log('error', 'admin_referral_mark_paid_error', { referralId: req.params.id, error: error.message });

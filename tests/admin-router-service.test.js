@@ -218,6 +218,71 @@ test('createRouterAdmin fails clearly after repeated VPN IP conflicts', async ()
     });
 });
 
+test('getEndpointMismatchCooldownState ignores legacy name-derived expected identities for management-only routers', async () => {
+    const mocks = {
+        'models/MikrotikRouter.js': {},
+        'models/User.js': {},
+        'models/Client.js': {},
+        'models/Subscription.js': {},
+        'models/ServicePlan.js': {},
+        'models/Transaction.js': {},
+        'models/AdminAuditLog.js': {},
+        'models/RouterDiscoverySession.js': {},
+        'models/RouterBackup.js': {},
+        'utils/port-allocator.js': {},
+        'utils/route-helpers.js': {},
+        'services/tcp-proxy-service.js': { getProxyStatus() { return null; } },
+        'wg-core.js': {
+            wgLock: { async run(fn) { return fn(); } },
+            runWgCommand() { return ''; },
+            KEEPALIVE_TIME: 25,
+            validateKeepalive(value) { return value; },
+            getServerEndpoint() { return 'vpn.test.local:51820'; },
+            async getServerPublicKey() { return 'server-public-key'; },
+            log() {}
+        },
+        'services/billing-service.js': {},
+        'services/email-service.js': {},
+        'services/router-execution-service.js': {},
+        'services/downstream-mikrotik-discovery-service.js': {}
+    };
+
+    await withMockedModules(mocks, async () => {
+        delete require.cache[serviceModulePath];
+        const { getEndpointMismatchCooldownState } = require(serviceModulePath);
+
+        const legacyLabelMismatch = getEndpointMismatchCooldownState({
+            name: 'enockMikrotik',
+            connectionMode: 'management_only',
+            endpointBinding: {
+                state: 'mismatch',
+                expectedIdentity: 'enockMikrotik',
+                mismatchReason: 'Endpoint identity mismatch: expected enockMikrotik but endpoint reported ChukaMikrotik'
+            },
+            discoveryInfo: {}
+        });
+
+        assert.equal(legacyLabelMismatch.active, false);
+
+        const explicitHostnameMismatch = getEndpointMismatchCooldownState({
+            name: 'enockMikrotik',
+            connectionMode: 'management_only',
+            endpointBinding: {
+                state: 'mismatch',
+                expectedIdentity: 'ChukaMikrotik',
+                mismatchReason: 'Endpoint identity mismatch'
+            },
+            discoveryInfo: {
+                hostname: 'ChukaMikrotik'
+            }
+        });
+
+        assert.equal(explicitHostnameMismatch.active, true);
+
+        delete require.cache[serviceModulePath];
+    });
+});
+
 test('createRouterAdmin keeps the router when billing balance is insufficient and marks subscription past due', async () => {
     const createdSubscriptions = [];
     const createdRouters = [];

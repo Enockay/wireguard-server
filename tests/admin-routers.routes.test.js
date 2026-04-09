@@ -48,8 +48,33 @@ function createRouterRouteMocks(overrides = {}) {
         async createManagementOnlyRouterAdmin() {
             return { router, owner: targetUser, artifacts: null };
         },
+        async observeRouterRuntimePeer() {
+            return {
+                sourceRouter: router,
+                runtimePeer: { id: 'peer-1', interface: 'wg-1', publicKey: 'pub-1' },
+                observedPeer: {
+                    id: 'observed-peer-1',
+                    assetLabel: 'Branch WG service',
+                    publicKey: 'pub-1',
+                    classification: 'wireguard_service',
+                    confidenceScore: 48,
+                    promotionEligible: false,
+                    promotionReadinessReason: 'Only peers classified as MikroTik routers can be promoted.',
+                    evidence: []
+                }
+            };
+        },
+        async promoteObservedRuntimePeerToRouter() {
+            return {
+                sourceRouter: router,
+                observedPeer: { id: 'observed-peer-1', publicKey: 'pub-1' },
+                createdRouter: router,
+                trackedDevices: [{ routerId: router._id, routerName: router.name }]
+            };
+        },
         async disableRouter() { return { router }; },
         async reactivateRouter() { return { router }; },
+        async unlinkRouterClient() { return { router, unlinked: true, detachedClientId: 'client-1' }; },
         async reprovisionRouter() { return { router }; },
         async generateRouterSetupArtifacts() { return { generatedAt: '2026-03-14T00:00:00.000Z' }; },
         async resetRouterPeer() { return { generatedAt: '2026-03-14T00:00:00.000Z' }; },
@@ -233,6 +258,107 @@ test('admin router read endpoints return expected payloads and 404 when not foun
     });
 });
 
+test('admin router unlink-client endpoint returns the expected payload', async () => {
+    const { mocks, router } = createRouterRouteMocks();
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const res = await request('POST', `/api/admin/routers/${router._id}/unlink-client`, {
+            body: { reason: 'Detach from raw client inventory' }
+        });
+
+        assert.equal(res.response.status, 200);
+        assert.equal(res.json.success, true);
+        assert.equal(res.json.data.routerId, router._id);
+        assert.equal(res.json.data.detachedClientId, 'client-1');
+        assert.equal(res.json.data.unlinked, true);
+    });
+});
+
+test('admin router observed-peer endpoints return expected payloads and conflicts', async () => {
+    const { mocks, router } = createRouterRouteMocks();
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const observed = await request('POST', `/api/admin/routers/${router._id}/wireguard/runtime-peers/peer-1/observe`, {
+            body: { classification: 'wireguard_service', assetLabel: 'Branch VPN', reason: 'Track the service' }
+        });
+
+        assert.equal(observed.response.status, 201);
+        assert.equal(observed.json.success, true);
+        assert.equal(observed.json.data.id, 'observed-peer-1');
+        assert.equal(observed.json.data.classification, 'wireguard_service');
+
+        const promoted = await request('POST', `/api/admin/routers/${router._id}/wireguard/observed-peers/observed-peer-1/promote-router`, {
+            body: { name: 'Branch Router' }
+        });
+
+        assert.equal(promoted.response.status, 201);
+        assert.equal(promoted.json.success, true);
+        assert.equal(promoted.json.data.id, router._id);
+    });
+
+    const conflict = createRouterRouteMocks({
+        service: {
+            async promoteObservedRuntimePeerToRouter() {
+                const error = new Error('Only observed peers classified as MikroTik routers can be promoted');
+                error.code = 'observed_peer_not_promotable';
+                throw error;
+            }
+        }
+    });
+
+    await withRouteApp({ routeModulePath, mocks: conflict.mocks }, async ({ request }) => {
+        const res = await request('POST', '/api/admin/routers/507f1f77bcf86cd799439041/wireguard/observed-peers/observed-peer-1/promote-router', {
+            body: { name: 'Branch Router' }
+        });
+
+        assert.equal(res.response.status, 409);
+        assert.equal(res.json.code, 'observed_peer_not_promotable');
+    });
+});
+
+test('set-access keeps remote-managed routers on WireGuard and marks local endpoints stale', async () => {
+    const router = createDoc({
+        _id: '507f1f77bcf86cd799439041',
+        name: 'RTR-1',
+        connectionMode: 'wireguard',
+        vpnIp: '10.0.0.23/32',
+        apiPort: 8728,
+        sshPort: 22,
+        discoveryInfo: { localAddress: '192.168.100.8', hostname: 'old-host' },
+        managementEndpoints: createSubdocCollection([
+            {
+                id: 'manual-primary',
+                kind: 'local_api',
+                host: '192.168.100.8',
+                port: 8728,
+                transport: 'api',
+                enabled: true,
+                health: 'healthy'
+            }
+        ]),
+        adminNotes: [],
+        internalFlags: createSubdocCollection([])
+    });
+
+    const { mocks } = createRouterRouteMocks({ router });
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const res = await request('POST', `/api/admin/routers/${router._id}/set-access`, {
+            body: {
+                managementHost: '192.168.200.10',
+                hostname: 'enockmikrotik',
+                apiPort: 8728,
+                sshPort: 22
+            }
+        });
+
+        assert.equal(res.response.status, 200);
+        assert.equal(res.json.data.managementHost, '10.0.0.23/32');
+        assert.equal(router.managementEndpoints[0].enabled, false);
+        assert.equal(router.managementEndpoints[0].health, 'stale');
+        assert.equal(router.managementEndpoints[0].failureType, 'stale_endpoint');
+        assert.equal(router.discoveryInfo.localAddress, '192.168.200.10');
+        assert.equal(router.endpointBinding.state, 'tunnel_ready');
+    });
+});
+
 test('admin router notes and flags validate and create audit entries', async () => {
     const flag = createFlagSubdoc({ _id: 'router-flag', flag: 'manual_review', severity: 'medium', description: 'desc' });
     const router = createDoc({
@@ -325,6 +451,58 @@ test('admin router api credential and connection routes update router state and 
     });
 });
 
+test('admin router test-connection returns endpoint mismatch conflict when RouterOS identity drifts', async () => {
+    const router = createDoc({
+        _id: '507f1f77bcf86cd799439062',
+        name: 'RTR-MISMATCH',
+        serverNode: 'wireguard',
+        apiUsername: 'admin',
+        apiPassword: '',
+        apiPort: 8728,
+        userId: { _id: '507f1f77bcf86cd799439099' },
+        adminNotes: [],
+        internalFlags: createSubdocCollection([])
+    });
+
+    const { mocks } = createRouterRouteMocks({
+        router,
+        mocks: undefined,
+        service: undefined
+    });
+
+    mocks['services/routeros-command-service.js'] = {
+        async getSystemResource() {
+            const error = new Error('Endpoint identity mismatch: expected enockMikrotik but endpoint reported ChukaMikrotik');
+            error.failureType = 'stale_endpoint';
+            throw error;
+        },
+        async getInterfaces() {
+            const error = new Error('Endpoint identity mismatch: expected enockMikrotik but endpoint reported ChukaMikrotik');
+            error.failureType = 'stale_endpoint';
+            throw error;
+        },
+        async pingTest() {
+            return { sent: 4, received: 4, packetLoss: 0, avgRtt: 2 };
+        },
+        async rebootRouter() {
+            return { message: 'Reboot command sent' };
+        },
+        resolveRouterManagementHost() {
+            return '10.0.0.10';
+        },
+        async executeCommand() {
+            return [];
+        }
+    };
+
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const tested = await request('POST', `/api/admin/routers/${router._id}/test-connection`, { body: { reason: 'verify live API' } });
+        assert.equal(tested.response.status, 409);
+        assert.equal(tested.json.code, 'endpoint_mismatch');
+        assert.match(tested.json.details, /ChukaMikrotik/);
+    });
+});
+
 test('admin router create route supports customer email, management-only setup, and connection testing', async () => {
     const router = createDoc({
         _id: '507f1f77bcf86cd799439081',
@@ -383,6 +561,47 @@ test('admin router create route supports customer email, management-only setup, 
         assert.equal(router.safetyPolicy.allowNetworkCoreWrites, true);
         assert.ok(router.adminNotes.some((entry) => entry.body.includes('Manual router onboarding details')));
         assert.ok(ctx.auditCalls.some((call) => call.action === 'admin_create_router'));
+    });
+});
+
+test('admin router set-access splits host and port from management host input', async () => {
+    const router = createDoc({
+        _id: '507f1f77bcf86cd799439082',
+        name: 'RTR-MGMT-SET',
+        connectionMode: 'management_only',
+        managementMode: 'management_only',
+        status: 'active',
+        apiUsername: 'admin',
+        apiPassword: '',
+        apiPort: 8728,
+        managementEndpoints: [],
+        discoveryInfo: {},
+        credentialState: {},
+        capabilities: {},
+        ports: {},
+        endpointHistory: [],
+        adminNotes: [],
+        internalFlags: createSubdocCollection([])
+    });
+    const { mocks } = createRouterRouteMocks({ router });
+
+    await withRouteApp({ routeModulePath, mocks }, async ({ request }) => {
+        const response = await request('POST', `/api/admin/routers/${router._id}/set-access`, {
+            body: {
+                managementHost: '192.168.100.8:8728',
+                hostname: 'enockMikrotik',
+                reason: 'save remote management host'
+            }
+        });
+
+        assert.equal(response.response.status, 200);
+        assert.equal(router.managementEndpoints[0].host, '192.168.100.8');
+        assert.equal(router.managementEndpoints[0].port, 8728);
+        assert.equal(router.managementEndpoints[1].host, '192.168.100.8');
+        assert.equal(router.managementEndpoints[1].port, 22);
+        assert.equal(router.discoveryInfo.localAddress, '192.168.100.8');
+        assert.equal(response.json.data.managementHost, '192.168.100.8');
+        assert.equal(response.json.data.apiPort, 8728);
     });
 });
 

@@ -57,7 +57,7 @@ const subscriptionSchema = new mongoose.Schema({
     },
     paymentMethod: {
         type: String,
-        enum: ['manual', 'stripe', 'paypal', 'other'],
+        enum: ['manual', 'balance', 'mpesa', 'stripe', 'paypal', 'paystack', 'airtel_money', 'bank_transfer', 'cash', 'other'],
         default: 'manual'
     },
     servicePlanId: {

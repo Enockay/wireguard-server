@@ -39,7 +39,8 @@ const {
     getWorkloadByTeam,
     getTeamTickets,
     getAssigneeTickets,
-    listSupportAgents
+    listSupportAgents,
+    listSupportContextOptions
 } = require('../services/admin-support-service');
 
 function normalizeReason(value) {
@@ -575,6 +576,15 @@ function registerAdminSupportRoutes(app) {
             return res.json({ success: true, items });
         } catch (error) {
             return res.status(500).json({ success: false, error: 'Failed to load support agents', details: error.message });
+        }
+    });
+
+    app.get('/api/admin/support/context-options', requireAdminPermission(ADMIN_SUPPORT_PERMISSIONS.VIEW_DETAILS), async (req, res) => {
+        try {
+            const options = await listSupportContextOptions(req.query || {});
+            return res.json({ success: true, options });
+        } catch (error) {
+            return res.status(500).json({ success: false, error: 'Failed to load support context options', details: error.message });
         }
     });
 

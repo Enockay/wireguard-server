@@ -46,7 +46,7 @@ function registerAdminRoutes(app, getDbInitialized) {
     }
 
     // Get admin statistics
-    app.get("/api/admin/stats", async (req, res) => {
+    app.get("/api/admin/stats", requireAdmin, async (req, res) => {
         try {
             const dbInitialized = getDbInitialized();
             if (!dbInitialized) {
