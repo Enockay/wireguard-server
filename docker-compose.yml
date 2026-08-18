@@ -63,6 +63,7 @@ services:
       start_period: 40s
     networks:
       - wireguard-net
+      - coolify-resource-net
 
   wireguard-api:
     build:
@@ -94,3 +95,11 @@ services:
 networks:
   wireguard-net:
     driver: bridge
+  # Coolify auto-creates a network named after the resource UUID and attaches
+  # its Traefik proxy (coolify-proxy) to it so it can route to this app's
+  # containers. Our custom wireguard-net above isn't enough on its own -
+  # without also joining this network, Traefik has a route configured but no
+  # path to the container, which surfaces as a 502 Bad Gateway.
+  coolify-resource-net:
+    external: true
+    name: ${COOLIFY_RESOURCE_UUID}
