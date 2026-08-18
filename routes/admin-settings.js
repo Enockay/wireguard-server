@@ -10,6 +10,8 @@ function serializeSettings(settings) {
         routerMonthlyPrice: settings.routerMonthlyPrice,
         trialDays: settings.trialDays,
         serverEndpoint: settings.serverEndpoint || '',
+        proxyPortRangeStart: settings.proxyPortRangeStart,
+        proxyPortRangeEnd: settings.proxyPortRangeEnd,
         emailSenderName: settings.emailSenderName || '',
         emailSenderEmail: settings.emailSenderEmail || '',
         emailReplyToEmail: settings.emailReplyToEmail || '',
@@ -40,6 +42,8 @@ function registerAdminSettingsRoutes(app, getDbInitialized) {
                 routerMonthlyPrice,
                 trialDays,
                 serverEndpoint,
+                proxyPortRangeStart,
+                proxyPortRangeEnd,
                 emailSenderName,
                 emailSenderEmail,
                 emailReplyToEmail,
@@ -59,6 +63,25 @@ function registerAdminSettingsRoutes(app, getDbInitialized) {
             if (serverEndpoint !== undefined && serverEndpoint !== '' && !/^[^\s:]+:\d{1,5}$/.test(serverEndpoint)) {
                 return res.status(400).json({ success: false, error: "serverEndpoint must be in host:port format" });
             }
+            // Proxy port range: kept to 4-digit ports (1024-9999), and split
+            // into three equal thirds (winbox/ssh/api) by port-allocator.js -
+            // both bounds must be provided together so that split is always
+            // well-defined, and must actually leave room to allocate from.
+            const rangeStartProvided = proxyPortRangeStart !== undefined;
+            const rangeEndProvided = proxyPortRangeEnd !== undefined;
+            if (rangeStartProvided !== rangeEndProvided) {
+                return res.status(400).json({ success: false, error: "proxyPortRangeStart and proxyPortRangeEnd must be set together" });
+            }
+            if (rangeStartProvided) {
+                const start = Number(proxyPortRangeStart);
+                const end = Number(proxyPortRangeEnd);
+                if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1024 || end > 9999) {
+                    return res.status(400).json({ success: false, error: "proxy port range must use 4-digit ports between 1024 and 9999" });
+                }
+                if (end - start + 1 < 30) {
+                    return res.status(400).json({ success: false, error: "proxy port range must span at least 30 ports (10 per winbox/ssh/api)" });
+                }
+            }
             if (emailSenderEmail !== undefined && emailSenderEmail !== '' && !EMAIL_RE.test(emailSenderEmail)) {
                 return res.status(400).json({ success: false, error: "emailSenderEmail must be a valid email address" });
             }
@@ -76,6 +99,10 @@ function registerAdminSettingsRoutes(app, getDbInitialized) {
             if (routerMonthlyPrice !== undefined) settings.routerMonthlyPrice = Number(routerMonthlyPrice);
             if (trialDays !== undefined) settings.trialDays = Number(trialDays);
             if (serverEndpoint !== undefined) settings.serverEndpoint = serverEndpoint;
+            if (rangeStartProvided) {
+                settings.proxyPortRangeStart = Number(proxyPortRangeStart);
+                settings.proxyPortRangeEnd = Number(proxyPortRangeEnd);
+            }
             if (emailSenderName !== undefined) settings.emailSenderName = emailSenderName;
             if (emailSenderEmail !== undefined) settings.emailSenderEmail = emailSenderEmail;
             if (emailReplyToEmail !== undefined) settings.emailReplyToEmail = emailReplyToEmail;

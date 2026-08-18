@@ -7,8 +7,17 @@ const { authenticateToken } = require('./auth');
 const { log } = require('../wg-core');
 const { sendRouterCreatedEmail, sendRouterOnlineEmail } = require('../services/email-service');
 const { createSubscription, getUserBillingSummary } = require('../services/billing-service');
-const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive } = require('../wg-core');
+const { wgLock, runWgCommand, KEEPALIVE_TIME, validateKeepalive, getServerEndpoint } = require('../wg-core');
 const { startRouterProxy } = require('../services/tcp-proxy-service');
+
+// Public Winbox/SSH/API proxy URLs use the host part of the same
+// admin-configurable serverEndpoint used for WireGuard's own endpoint (see
+// wg-core.js getServerEndpoint), not a hardcoded domain - the two must agree
+// or generated router URLs point at a different host than the WireGuard
+// tunnel they're supposed to ride over.
+function getPublicHost() {
+    return getServerEndpoint().split(':')[0];
+}
 
 function registerMikrotikRouterRoutes(app, getDbInitialized) {
     // Create new MikroTik router (requires auth)
@@ -142,9 +151,9 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                         ports: router.ports,
                         status: router.status,
                         publicUrl: {
-                            winbox: `vpn.blackie-networks.com:${router.ports.winbox}`,
-                            ssh: `vpn.blackie-networks.com:${router.ports.ssh}`,
-                            api: `vpn.blackie-networks.com:${router.ports.api}`
+                            winbox: `${getPublicHost()}:${router.ports.winbox}`,
+                            ssh: `${getPublicHost()}:${router.ports.ssh}`,
+                            api: `${getPublicHost()}:${router.ports.api}`
                         },
                         wireguardConfig: {
                             privateKey: wireguardClient.privateKey,
@@ -195,11 +204,11 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                         ports: r.ports,
                         status: r.status,
                         publicUrl: {
-                            winbox: `vpn.blackie-networks.com:${r.ports.winbox}`,
-                            ssh: `vpn.blackie-networks.com:${r.ports.ssh}`,
-                            api: `vpn.blackie-networks.com:${r.ports.api}`
+                            winbox: `${getPublicHost()}:${r.ports.winbox}`,
+                            ssh: `${getPublicHost()}:${r.ports.ssh}`,
+                            api: `${getPublicHost()}:${r.ports.api}`
                         },
-                        address: 'vpn.blackie-networks.com',
+                        address: getPublicHost(),
                         expirationDate: subscription?.currentPeriodEnd || subscription?.nextBillingDate || null,
                         subscriptionStatus: subscription?.status || 'trial',
                         lastSeen: r.lastSeen,
@@ -250,10 +259,11 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                     ports: router.ports,
                     status: router.status,
                     publicUrl: {
-                        winbox: `vpn.blackie-networks.com:${router.ports.winbox}`,
-                        ssh: `vpn.blackie-networks.com:${router.ports.ssh}`,
-                        api: `vpn.blackie-networks.com:${router.ports.api}`
+                        winbox: `${getPublicHost()}:${router.ports.winbox}`,
+                        ssh: `${getPublicHost()}:${router.ports.ssh}`,
+                        api: `${getPublicHost()}:${router.ports.api}`
                     },
+                    address: getPublicHost(),
                     wireguardConfig: router.wireguardClientId ? {
                         privateKey: router.wireguardClientId.privateKey,
                         publicKey: router.wireguardClientId.publicKey,

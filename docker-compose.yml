@@ -27,21 +27,26 @@ services:
       # dashboard) - this host mapping just keeps direct IP:5020 access working.
       # Moved off 5000 - already bound by another app on this shared host.
       - "${API_PORT:-5020}:5020/tcp"
-      # Per-router Winbox/SSH/API proxy ports (see utils/port-allocator.js -
-      # PORT_RANGES: winbox 20000-20099, ssh 20100-20199, api 20200-20299).
-      # These are raw TCP (not HTTP), so they can't be routed by Coolify's
-      # Traefik proxy via the domain/hostname - each router needs its own real
-      # listening port. Publishing the whole range up front means
-      # tcp-proxy-service.js can dynamically start/stop listeners on any port
-      # in it, per router, without ever needing a docker-compose/Coolify
-      # redeploy. Kept small and moved into the 20000s (rather than the
-      # commonly-used 1000-9999 block) to avoid colliding with other apps'
-      # ports on this shared host.
+      # Per-router Winbox/SSH/API proxy ports. The active range is now
+      # admin-configurable (Settings.proxyPortRangeStart/End, default
+      # 6100-7999, split into three equal thirds by
+      # utils/port-allocator.js:getPortRanges) rather than hardcoded - but
+      # that setting only controls which ports *new* routers get allocated
+      # from. Docker still has to actually publish whatever ports are in use,
+      # so this list must be kept in sync by hand whenever the admin changes
+      # the range, and old ranges must stay published until every router
+      # provisioned under them is migrated off. These are raw TCP (not
+      # HTTP), so they can't be routed by Coolify's Traefik proxy via the
+      # domain/hostname - each router needs its own real listening port.
+      - "6100-7999:6100-7999/tcp"
+      # Previous range (20000-20299), still in use by routers provisioned
+      # before the move above (e.g. "Mikrotikproxy").
+      # TODO: reprovision/migrate them into 6100-7999 and drop this line.
       - "20000-20299:20000-20299/tcp"
-      # Existing router "ChukaMikrotik" was already provisioned under the old
-      # 1000-9999 range before the move above - published individually here
-      # (rather than reopening the whole old range) so it stays reachable.
-      # TODO: reprovision/migrate it into the 20000-20299 range and drop these.
+      # Router "ChukaMikrotik" was provisioned even earlier, under the
+      # original 1000-9999 range - published individually (rather than
+      # reopening the whole old range) so it stays reachable.
+      # TODO: reprovision/migrate it and drop these three.
       - "1000:1000/tcp"
       - "3334:3334/tcp"
       - "6667:6667/tcp"

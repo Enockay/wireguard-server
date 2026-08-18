@@ -19,6 +19,23 @@ const settingsSchema = new mongoose.Schema({
         type: String,
         trim: true
     },
+    // Public TCP port range for per-router Winbox/SSH/API proxying (see
+    // utils/port-allocator.js). Split into three equal sub-ranges at
+    // allocation time. Must also be published in docker-compose.yml's
+    // `ports:` section on the wireguard service to actually be reachable -
+    // changing this here alone does not move the Docker port publish.
+    proxyPortRangeStart: {
+        type: Number,
+        default: 6100,
+        min: 1,
+        max: 65535
+    },
+    proxyPortRangeEnd: {
+        type: Number,
+        default: 7999,
+        min: 1,
+        max: 65535
+    },
     emailSenderName: {
         type: String,
         trim: true

@@ -10,6 +10,8 @@ async function refreshConfigCache() {
     const settings = await Settings.getSingleton();
     cache = {
         serverEndpoint: settings.serverEndpoint,
+        proxyPortRangeStart: settings.proxyPortRangeStart,
+        proxyPortRangeEnd: settings.proxyPortRangeEnd,
         emailSenderName: settings.emailSenderName,
         emailSenderEmail: settings.emailSenderEmail,
         emailReplyToEmail: settings.emailReplyToEmail,
