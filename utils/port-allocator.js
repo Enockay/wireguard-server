@@ -1,11 +1,13 @@
 const MikrotikRouter = require('../models/MikrotikRouter');
 const { log } = require('../wg-core');
 
-// Port ranges - All 4-digit ports (1000-9999)
+// Port ranges - shrunk and moved into 20000-20299 to avoid colliding with
+// other apps' ports on the shared host (the 1000-9999 block previously used
+// here overlapped ports already claimed by unrelated Coolify-deployed apps).
 const PORT_RANGES = {
-    winbox: { start: 1000, end: 3333 },   // 1000-3333 for Winbox
-    ssh: { start: 3334, end: 6666 },      // 3334-6666 for SSH
-    api: { start: 6667, end: 9999 }       // 6667-9999 for API
+    winbox: { start: 20000, end: 20099 }, // 20000-20099 for Winbox
+    ssh: { start: 20100, end: 20199 },    // 20100-20199 for SSH
+    api: { start: 20200, end: 20299 }     // 20200-20299 for API
 };
 
 /**
