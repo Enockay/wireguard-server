@@ -81,7 +81,7 @@ while true; do
                 echo "✅ WireGuard interface restarted successfully"
                 # Signal API to reload all peers from database
                 sleep 2
-                curl -s -X POST http://localhost:5000/reload || echo "API reload failed"
+                curl -s -X POST http://localhost:5020/reload || echo "API reload failed"
             else
                 echo "❌ Failed to restart WireGuard interface - will retry later"
             fi

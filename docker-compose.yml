@@ -24,8 +24,9 @@ services:
       # API port (exposed through WireGuard container's network).
       # HTTP(S) traffic to vpn.blackie-networks.com is handled separately by
       # Coolify's Traefik proxy (set the domain on this service in the Coolify
-      # dashboard) - this host mapping just keeps direct IP:5000 access working.
-      - "${API_PORT:-5000}:5000/tcp"
+      # dashboard) - this host mapping just keeps direct IP:5020 access working.
+      # Moved off 5000 - already bound by another app on this shared host.
+      - "${API_PORT:-5020}:5020/tcp"
       # Per-router Winbox/SSH/API proxy ports (see utils/port-allocator.js -
       # PORT_RANGES: winbox 20000-20099, ssh 20100-20199, api 20200-20299).
       # These are raw TCP (not HTTP), so they can't be routed by Coolify's
@@ -46,7 +47,7 @@ services:
       # Tell Coolify to use this container
       - "coolify.managed=true"
       - "coolify.name=wireguard-vpn"
-      - "coolify.http.port=5000"
+      - "coolify.http.port=5020"
     healthcheck:
       test: ["CMD-SHELL", "wg show wg0 > /dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -75,9 +76,9 @@ services:
       # Node environment
       - NODE_ENV=${NODE_ENV:-production}
       # API port (internal, shared with WireGuard container)
-      - PORT=5000
+      - PORT=5020
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5020/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
       interval: 30s
       timeout: 10s
       retries: 3

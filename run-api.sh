@@ -15,5 +15,5 @@ else
 fi
 
 # Start the Express API
-echo "Starting API server on port 5000..."
+echo "Starting API server on port ${PORT:-5020}..."
 exec node /app/wireguard-api.js

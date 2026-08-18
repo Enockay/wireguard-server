@@ -41,7 +41,7 @@ COPY services /app/services/
 COPY utils /app/utils/
 
 # Expose API port (will be accessible through WireGuard container's network)
-EXPOSE 5000/tcp
+EXPOSE 5020/tcp
 
 # Set entrypoint to API startup script
 COPY run-api.sh /run-api.sh
