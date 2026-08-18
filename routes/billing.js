@@ -2,11 +2,87 @@ const Subscription = require('../models/Subscription');
 const MikrotikRouter = require('../models/MikrotikRouter');
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
+const Settings = require('../models/Settings');
 const { log } = require('../wg-core');
 const { authenticateToken } = require('./auth');
 const { getUserBillingSummary } = require('../services/billing-service');
+const paystackService = require('../services/paystack-service');
+
+function getFrontendUrl() {
+    return process.env.FRONTEND_URL || process.env.SERVICE_URL_WIREGUARD || process.env.SERVICE_FQDN_WIREGUARD || 'https://vpn.blackie-networks.com';
+}
+
+/**
+ * Applies a PayStack payment to the user's balance, idempotently. Called from
+ * both the webhook (server-to-server, primary path) and the user-facing verify
+ * endpoint (fallback for when the browser gets back before the webhook lands).
+ * Whichever fires first wins - the other is a no-op since status is already
+ * 'completed' by then.
+ */
+async function applyPaystackPayment(reference) {
+    const transaction = await Transaction.findOne({ transactionId: reference });
+    if (!transaction) {
+        throw new Error('Transaction not found');
+    }
+    if (transaction.status === 'completed') {
+        return { alreadyProcessed: true, transaction };
+    }
+
+    const verified = await paystackService.verifyTransaction(reference);
+
+    if (verified.status !== 'success') {
+        transaction.status = verified.status === 'abandoned' ? 'pending' : 'failed';
+        await transaction.save();
+        return { success: false, transaction, paystackStatus: verified.status };
+    }
+
+    // Defense in depth: don't trust the webhook/verify payload amount blindly -
+    // confirm it matches what we asked the customer to pay.
+    const verifiedAmountUsd = verified.amount / 100;
+    if (Math.abs(verifiedAmountUsd - transaction.amount) > 0.01) {
+        log('error', 'paystack_amount_mismatch', {
+            reference, expected: transaction.amount, received: verifiedAmountUsd
+        });
+        transaction.status = 'failed';
+        await transaction.save();
+        return { success: false, transaction, error: 'Amount mismatch' };
+    }
+
+    const user = await User.findById(transaction.userId);
+    if (!user) {
+        throw new Error('Transaction has no associated user');
+    }
+
+    user.balance = (user.balance || 0) + transaction.amount;
+    await user.save();
+
+    transaction.status = 'completed';
+    transaction.paymentGatewayId = String(verified.id || verified.reference);
+    await transaction.save();
+
+    log('info', 'paystack_payment_applied', { reference, userId: user._id, amount: transaction.amount });
+
+    return { success: true, transaction, newBalance: user.balance };
+}
 
 function registerBillingRoutes(app) {
+    // Current plan pricing/trial length - unauthenticated (same numbers already
+    // shown on the public marketing site) so the dashboard's Pricing page can
+    // display the real admin-configured value instead of a hardcoded one.
+    app.get('/api/settings/pricing', async (req, res) => {
+        try {
+            const settings = await Settings.getSingleton();
+            res.json({
+                success: true,
+                routerMonthlyPrice: settings.routerMonthlyPrice,
+                trialDays: settings.trialDays
+            });
+        } catch (error) {
+            log('error', 'get_pricing_settings_error', { error: error.message });
+            res.status(500).json({ success: false, error: 'Failed to get pricing' });
+        }
+    });
+
     // Get billing summary
     app.get('/api/billing/summary', authenticateToken, async (req, res) => {
         try {
@@ -158,24 +234,45 @@ function registerBillingRoutes(app) {
                 });
             }
 
+            if (paymentMethod === 'paypal') {
+                return res.status(501).json({
+                    success: false,
+                    error: 'PayPal is not available yet. Please use PayStack.'
+                });
+            }
+
+            if (!paystackService.isConfigured()) {
+                return res.status(503).json({
+                    success: false,
+                    error: 'Payments are not configured yet. Please contact support.'
+                });
+            }
+
+            const user = await User.findById(userId);
+            if (!user) {
+                return res.status(404).json({ success: false, error: 'User not found' });
+            }
+
             // Create pending transaction
             const transaction = new Transaction({
                 userId,
                 type: 'payment',
                 transactionId: `PAY-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                 amount,
-                description: `Balance added via ${paymentMethod === 'paystack' ? 'PayStack' : 'PayPal'}.`,
+                description: 'Balance added via PayStack',
                 status: 'pending',
                 paymentMethod
             });
 
             await transaction.save();
 
-            // Generate payment link based on method
-            // In production, you would integrate with PayPal/Paystack APIs here
-            const paymentLink = paymentMethod === 'paystack' 
-                ? `/api/billing/paystack/initiate?transactionId=${transaction.transactionId}`
-                : `/api/billing/paypal/initiate?transactionId=${transaction.transactionId}`;
+            const paystackData = await paystackService.initializeTransaction({
+                email: user.email,
+                amountUsd: amount,
+                reference: transaction.transactionId,
+                callbackUrl: `${getFrontendUrl()}/billing/callback`,
+                metadata: { userId: String(userId), transactionId: transaction.transactionId }
+            });
 
             res.json({
                 success: true,
@@ -184,7 +281,7 @@ function registerBillingRoutes(app) {
                     id: transaction._id,
                     transactionId: transaction.transactionId,
                     amount: transaction.amount,
-                    paymentLink
+                    paymentLink: paystackData.authorization_url
                 }
             });
         } catch (error) {
@@ -197,56 +294,60 @@ function registerBillingRoutes(app) {
         }
     });
 
-    // Complete payment (webhook callback)
-    app.post('/api/billing/payment-callback', async (req, res) => {
+    // PayStack webhook (server-to-server, not user-authenticated - verified via signature)
+    app.post('/api/billing/paystack/webhook', async (req, res) => {
         try {
-            const { transactionId, status, paymentGatewayId, paymentMethod } = req.body;
+            const signature = req.headers['x-paystack-signature'];
+            const valid = paystackService.verifyWebhookSignature(req.rawBody, signature);
 
-            const transaction = await Transaction.findOne({ transactionId });
+            if (!valid) {
+                log('warn', 'paystack_webhook_invalid_signature');
+                return res.status(401).json({ success: false, error: 'Invalid signature' });
+            }
+
+            const { event, data } = req.body;
+
+            if (event === 'charge.success' && data?.reference) {
+                await applyPaystackPayment(data.reference);
+            }
+
+            // PayStack just needs a 200 to stop retrying
+            res.status(200).json({ received: true });
+        } catch (error) {
+            log('error', 'paystack_webhook_error', { error: error.message });
+            // Still 200 - a 4xx/5xx here just makes PayStack retry a webhook
+            // whose underlying cause (e.g. bad data) won't fix itself on retry.
+            res.status(200).json({ received: true, error: error.message });
+        }
+    });
+
+    // User-facing fallback: verify + apply a payment when the browser lands
+    // back on the callback page, in case the webhook hasn't arrived yet.
+    app.get('/api/billing/verify/:reference', authenticateToken, async (req, res) => {
+        try {
+            const { reference } = req.params;
+            const transaction = await Transaction.findOne({ transactionId: reference });
 
             if (!transaction) {
-                return res.status(404).json({
-                    success: false,
-                    error: 'Transaction not found'
-                });
+                return res.status(404).json({ success: false, error: 'Transaction not found' });
+            }
+            if (String(transaction.userId) !== req.user.userId) {
+                return res.status(403).json({ success: false, error: 'Not your transaction' });
             }
 
-            if (transaction.status !== 'pending') {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Transaction already processed'
-                });
-            }
-
-            if (status === 'completed') {
-                // Add balance to user
-                const user = await User.findById(transaction.userId);
-                user.balance = (user.balance || 0) + transaction.amount;
-                await user.save();
-
-                transaction.status = 'completed';
-                transaction.paymentGatewayId = paymentGatewayId;
-                await transaction.save();
-
-                log('info', 'balance_added', { 
-                    userId: user._id, 
-                    amount: transaction.amount,
-                    transactionId: transaction.transactionId
-                });
-            } else {
-                transaction.status = 'failed';
-                await transaction.save();
-            }
+            const result = await applyPaystackPayment(reference);
 
             res.json({
                 success: true,
-                message: 'Payment processed'
+                status: result.transaction.status,
+                amount: result.transaction.amount,
+                newBalance: result.newBalance
             });
         } catch (error) {
-            log('error', 'payment_callback_error', { error: error.message });
+            log('error', 'verify_payment_error', { error: error.message });
             res.status(500).json({
                 success: false,
-                error: 'Failed to process payment',
+                error: 'Failed to verify payment',
                 details: error.message
             });
         }

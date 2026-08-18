@@ -106,7 +106,7 @@ function registerSupportRoutes(app) {
 
             const ticket = await SupportTicket.findOne({ _id: id, userId })
                 .populate('userId', 'name email')
-                .populate('messages.userId', 'name email');
+                .populate('messages.userId', 'name email role');
 
             if (!ticket) {
                 return res.status(404).json({
@@ -126,8 +126,9 @@ function registerSupportRoutes(app) {
                     status: ticket.status,
                     messages: ticket.messages.map(msg => ({
                         id: msg._id,
-                        userId: msg.userId._id,
-                        userName: msg.userId.name,
+                        userId: msg.userId?._id,
+                        userName: msg.userId?.name || 'Deleted user',
+                        isAdmin: msg.userId?.role === 'admin',
                         message: msg.message,
                         attachments: msg.attachments,
                         createdAt: msg.createdAt

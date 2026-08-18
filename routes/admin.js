@@ -8,13 +8,14 @@ const {
     loadClientsFromDatabase,
     getTimeAgo
 } = require("../utils/route-helpers");
+const { authenticateToken, requireAdmin } = require("./auth");
 
 // Register all admin/system routes
 function registerAdminRoutes(app, getDbInitialized) {
     const wgEnabled = !["0", "false", "no", "off"].includes(String(process.env.WG_ENABLED || "true").toLowerCase());
 
     // Get admin statistics
-    app.get("/api/admin/stats", async (req, res) => {
+    app.get("/api/admin/stats", authenticateToken, requireAdmin, async (req, res) => {
         try {
             const dbInitialized = getDbInitialized();
             if (!dbInitialized) {
@@ -208,7 +209,7 @@ function registerAdminRoutes(app, getDbInitialized) {
     });
 
     // Manual reload from database
-    app.post("/reload", async (req, res) => {
+    app.post("/reload", authenticateToken, requireAdmin, async (req, res) => {
         try {
             await loadClientsFromDatabase(getDbInitialized());
             res.json({
@@ -226,7 +227,7 @@ function registerAdminRoutes(app, getDbInitialized) {
     });
 
     // Get TCP proxy status (admin)
-    app.get("/api/admin/proxy/status", async (req, res) => {
+    app.get("/api/admin/proxy/status", authenticateToken, requireAdmin, async (req, res) => {
         try {
             const { getAllActiveProxies, getProxyStatus } = require('../services/tcp-proxy-service');
             const MikrotikRouter = require('../models/MikrotikRouter');
@@ -267,7 +268,7 @@ function registerAdminRoutes(app, getDbInitialized) {
     });
 
     // Test proxy connectivity (admin)
-    app.post("/api/admin/proxy/test", async (req, res) => {
+    app.post("/api/admin/proxy/test", authenticateToken, requireAdmin, async (req, res) => {
         try {
             const { routerId, portType } = req.body;
             

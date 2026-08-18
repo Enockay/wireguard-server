@@ -411,7 +411,9 @@ function registerAuthRoutes(app) {
     });
 }
 
-// Middleware to verify JWT token
+// Middleware to verify JWT token. Looks the user up in the DB (rather than
+// trusting the JWT payload alone) so role changes and deactivation take
+// effect immediately, not just after the token expires.
 function authenticateToken(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
@@ -423,16 +425,58 @@ function authenticateToken(req, res, next) {
         });
     }
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
+    jwt.verify(token, JWT_SECRET, async (err, payload) => {
         if (err) {
             return res.status(403).json({
                 success: false,
                 error: 'Invalid or expired token'
             });
         }
-        req.user = user;
-        next();
+
+        try {
+            const user = await User.findById(payload.userId);
+            if (!user) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'User not found'
+                });
+            }
+
+            if (!user.isActive) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Account is deactivated'
+                });
+            }
+
+            req.user = {
+                userId: user._id.toString(),
+                email: user.email,
+                role: user.role,
+                isActive: user.isActive,
+                name: user.name
+            };
+            next();
+        } catch (error) {
+            log('error', 'authenticate_token_error', { error: error.message });
+            res.status(500).json({
+                success: false,
+                error: 'Failed to authenticate token',
+                details: error.message
+            });
+        }
     });
 }
 
-module.exports = { registerAuthRoutes, authenticateToken };
+// Middleware to restrict a route to admins. Must run after authenticateToken.
+function requireAdmin(req, res, next) {
+    if (!req.user || req.user.role !== 'admin') {
+        return res.status(403).json({
+            success: false,
+            error: 'Admin access required'
+        });
+    }
+    next();
+}
+
+module.exports = { registerAuthRoutes, authenticateToken, requireAdmin };

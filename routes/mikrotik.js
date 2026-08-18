@@ -6,18 +6,20 @@ const {
     validateKeepalive,
     runWgCommand,
     getServerPublicKey,
-    getServerEndpoint
+    getServerEndpoint,
+    resolveInterfaceName
 } = require("../wg-core");
 const {
     generateKeys,
     getNextAvailableIP,
     ensureClientRecord
 } = require("../utils/route-helpers");
+const { authenticateToken, requireAdmin } = require("./auth");
 
 // Register all MikroTik-related routes
 function registerMikrotikRoutes(app, getDbInitialized) {
     // Generate a MikroTik RouterOS script that auto-configures WireGuard and tests connectivity
-    app.post("/generate-mikrotik", async (req, res) => {
+    app.post("/generate-mikrotik", authenticateToken, requireAdmin, async (req, res) => {
         try {
             const { name, notes, interfaceName, allowedSubnet } = req.body || {};
 
@@ -151,6 +153,10 @@ function registerMikrotikRoutes(app, getDbInitialized) {
     // Compact MikroTik script via short URL: GET /mt/:name
     // - Finds or creates client, then returns a minified RouterOS script
     // - Script auto-picks an available listen-port starting at 51810
+    // Left unauthenticated: meant to be pasted into a MikroTik /tool fetch
+    // one-liner, which cannot send an Authorization header. TODO: this also
+    // auto-creates a client record for any name, and leaks its private key -
+    // consider a signed/short-lived token instead of the raw name.
     app.get("/mt/:name", async (req, res) => {
         try {
             const { name } = req.params;
@@ -164,7 +170,7 @@ function registerMikrotikRoutes(app, getDbInitialized) {
             const serverPublicKey = (await getServerPublicKey()).trim();
             const serverEndpoint = client.endpoint || getServerEndpoint();
 
-            const ifaceName = (client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+            const ifaceName = resolveInterfaceName(client);
             const allowed = (subnet || "10.0.0.0/24").toString();
             const addr = client.ip; // /32
             const pKey = client.privateKey;
@@ -185,6 +191,7 @@ function registerMikrotikRoutes(app, getDbInitialized) {
     });
 
     // MikroTik Auto-Configure (Direct URL)
+    // Left unauthenticated for the same reason as /mt/:name above.
     app.get("/:name/configure", async (req, res) => {
         try {
             const { name } = req.params;
@@ -200,7 +207,7 @@ function registerMikrotikRoutes(app, getDbInitialized) {
             const serverHost = serverEndpointParts[0];
             const serverPort = serverEndpointParts[1] || '51820';
             
-            const ifaceName = (client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
+            const ifaceName = resolveInterfaceName(client);
             const allowed = client.allowedIPs || "10.0.0.0/24";
             const keepalive = validateKeepalive(client.persistentKeepalive);
             

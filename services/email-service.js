@@ -2,11 +2,22 @@ const https = require('https');
 const { log } = require('../wg-core');
 
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
-const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || 'noreply@blackie-networks.com';
-const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || 'Blackie Networks';
-const BREVO_REPLY_TO_EMAIL = process.env.BREVO_REPLY_TO_EMAIL || 'support@blackie-networks.com';
 const BASE_URL = process.env.SERVICE_URL_WIREGUARD || process.env.SERVICE_FQDN_WIREGUARD || 'https://vpn.blackie-networks.com';
 const FRONTEND_URL = process.env.FRONTEND_URL || process.env.SERVICE_URL_WIREGUARD || process.env.SERVICE_FQDN_WIREGUARD || 'https://vpn.blackie-networks.com';
+
+// Admin-editable via Settings (config-cache.js); env vars are just the seed/fallback.
+function getSenderEmail() {
+    const { getConfig } = require('../config-cache');
+    return getConfig('emailSenderEmail') || process.env.BREVO_SENDER_EMAIL || 'noreply@blackie-networks.com';
+}
+function getSenderName() {
+    const { getConfig } = require('../config-cache');
+    return getConfig('emailSenderName') || process.env.BREVO_SENDER_NAME || 'Blackie Networks';
+}
+function getReplyToEmail() {
+    const { getConfig } = require('../config-cache');
+    return getConfig('emailReplyToEmail') || process.env.BREVO_REPLY_TO_EMAIL || 'support@blackie-networks.com';
+}
 
 /**
  * Send email using Brevo API
@@ -59,12 +70,12 @@ function sendEmail({ to, subject, htmlContent, textContent }) {
 
         const emailData = {
             sender: {
-                name: String(BREVO_SENDER_NAME || 'Blackie Networks'),
-                email: String(BREVO_SENDER_EMAIL)
+                name: String(getSenderName()),
+                email: String(getSenderEmail())
             },
             to: [{ email: String(to).trim() }],
             replyTo: {
-                email: String(BREVO_REPLY_TO_EMAIL)
+                email: String(getReplyToEmail())
             },
             subject: String(subject).trim(),
             htmlContent: finalHtmlContent,
@@ -447,6 +458,86 @@ If you have any questions, please don't hesitate to reach out to our support tea
 }
 
 /**
+ * Send invoice/receipt email for a completed billing charge (first paid
+ * router, trial-to-paid conversion, or monthly renewal). Not sent for $0
+ * trial-start transactions - sendRouterCreatedEmail already covers that.
+ */
+async function sendInvoiceEmail(user, transaction) {
+    const invoiceDate = new Date(transaction.createdAt || Date.now()).toLocaleString();
+    const amount = Number(transaction.amount || 0).toFixed(2);
+
+    const htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                .header { background-color: #2196F3; color: white; padding: 20px; text-align: center; }
+                .content { padding: 20px; background-color: #f9f9f9; }
+                .info-box { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #2196F3; }
+                .amount { font-size: 28px; font-weight: bold; color: #2196F3; }
+                .footer { text-align: center; padding: 20px; color: #666; font-size: 12px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Invoice from Blackie Networks</h1>
+                </div>
+                <div class="content">
+                    <h2>Payment Receipt</h2>
+                    <p>Hello ${user.name},</p>
+                    <p>This confirms a payment of <strong>$${amount}</strong> was charged to your Blackie Networks wallet balance.</p>
+
+                    <div class="info-box">
+                        <h3>Invoice Details:</h3>
+                        <p><strong>Invoice #:</strong> ${transaction.transactionId}</p>
+                        <p><strong>Description:</strong> ${transaction.description}</p>
+                        <p><strong>Date:</strong> ${invoiceDate}</p>
+                        <p class="amount">$${amount}</p>
+                    </div>
+
+                    <p>You can view your full billing history and download past invoices anytime from the Billing page in your dashboard.</p>
+                    <p>If you have any questions about this charge, please contact support.</p>
+                </div>
+                <div class="footer">
+                    <p>&copy; ${new Date().getFullYear()} Blackie Networks. All rights reserved.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+    `;
+
+    const textContent = `
+Invoice from Blackie Networks
+
+Hello ${user.name},
+
+This confirms a payment of $${amount} was charged to your Blackie Networks wallet balance.
+
+Invoice Details:
+- Invoice #: ${transaction.transactionId}
+- Description: ${transaction.description}
+- Date: ${invoiceDate}
+- Amount: $${amount}
+
+You can view your full billing history and download past invoices anytime from the Billing page in your dashboard.
+
+If you have any questions about this charge, please contact support.
+
+© ${new Date().getFullYear()} Blackie Networks. All rights reserved.
+    `;
+
+    return sendEmail({
+        to: user.email,
+        subject: `Invoice ${transaction.transactionId} - Blackie Networks`,
+        htmlContent,
+        textContent
+    });
+}
+
+/**
  * Send password reset email
  */
 async function sendPasswordResetEmail(user, token) {
@@ -526,5 +617,6 @@ module.exports = {
     sendPasswordResetEmail,
     sendRouterCreatedEmail,
     sendRouterOnlineEmail,
-    sendRouterDeletedEmail
+    sendRouterDeletedEmail,
+    sendInvoiceEmail
 };
