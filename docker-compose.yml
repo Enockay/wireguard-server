@@ -38,6 +38,13 @@ services:
       # commonly-used 1000-9999 block) to avoid colliding with other apps'
       # ports on this shared host.
       - "20000-20299:20000-20299/tcp"
+      # Existing router "ChukaMikrotik" was already provisioned under the old
+      # 1000-9999 range before the move above - published individually here
+      # (rather than reopening the whole old range) so it stays reachable.
+      # TODO: reprovision/migrate it into the 20000-20299 range and drop these.
+      - "1000:1000/tcp"
+      - "3334:3334/tcp"
+      - "6667:6667/tcp"
     env_file:
       - .env  # Loads WIREGUARD_PRIVATE_KEY
     environment:
