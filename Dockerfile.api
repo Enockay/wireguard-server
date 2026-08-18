@@ -27,6 +27,7 @@ RUN npm install --no-audit --no-fund --production
 COPY wireguard-api.js /app/
 COPY db.js /app/
 COPY wg-core.js /app/
+COPY config-cache.js /app/
 
 # Copy models directory
 COPY models /app/models/
