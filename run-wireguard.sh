@@ -28,12 +28,30 @@ sed -i "s@{{WIREGUARD_PRIVATE_KEY}}@$WIREGUARD_PRIVATE_KEY@" /etc/wireguard/wg0.
 
 echo "WireGuard private key has been set from environment variable"
 
-# Start WireGuard interface
+# Start WireGuard interface.
+# Retry with backoff: on first boot the host may apply --privileged /
+# NET_ADMIN+SYS_MODULE capabilities or mount /lib/modules a beat after the
+# entrypoint starts, so a single failed attempt here isn't necessarily fatal.
 echo "Starting WireGuard interface..."
-if wg-quick up wg0 2>&1; then
-    echo "✅ WireGuard interface started successfully"
-else
-    echo "⚠️  WARNING: Failed to start WireGuard interface"
+wg_up_attempts=5
+wg_up_delay=5
+wg_up_ok=0
+for attempt in $(seq 1 "$wg_up_attempts"); do
+    if wg-quick up wg0 2>&1; then
+        echo "✅ WireGuard interface started successfully (attempt $attempt/$wg_up_attempts)"
+        wg_up_ok=1
+        break
+    fi
+    echo "⚠️  Attempt $attempt/$wg_up_attempts to start WireGuard interface failed"
+    wg-quick down wg0 2>/dev/null || true
+    if [ "$attempt" -lt "$wg_up_attempts" ]; then
+        echo "Retrying in ${wg_up_delay}s..."
+        sleep "$wg_up_delay"
+    fi
+done
+
+if [ "$wg_up_ok" -ne 1 ]; then
+    echo "❌ WARNING: Failed to start WireGuard interface after $wg_up_attempts attempts"
     echo "This may require:"
     echo "  1. Running container with --privileged flag"
     echo "  2. Or wireguard kernel module loaded on host (modprobe wireguard)"
