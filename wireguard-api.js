@@ -5,7 +5,6 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const fs = require("fs");
-const path = require("path");
 const db = require("./db");
 const Client = require("./models/Client");
 const {
@@ -27,16 +26,8 @@ const registerClientRoutes = require("./routes/clients");
 const registerMikrotikRoutes = require("./routes/mikrotik");
 const registerLegacyRoutes = require("./routes/legacy");
 const registerAdminRoutes = require("./routes/admin");
-const registerAdminRouterRoutes = require("./routes/admin-routers");
-const registerAdminUserRoutes = require("./routes/admin-users");
-const registerAdminSupportRoutes = require("./routes/admin-support");
-const registerAdminAnalyticsRoutes = require("./routes/admin-analytics");
-const registerAdminTransactionRoutes = require("./routes/admin-transactions");
-const registerAdminReferralRoutes = require("./routes/admin-referrals");
-const registerAdminSettingsRoutes = require("./routes/admin-settings");
 const { registerAuthRoutes } = require("./routes/auth");
 const { registerMikrotikRouterRoutes, updateRouterStatus } = require("./routes/mikrotik-routers");
-const registerDeviceRoutes = require("./routes/devices");
 const { processAllDueSubscriptions } = require("./services/billing-service");
 const registerProfileRoutes = require("./routes/profile");
 const registerBillingRoutes = require("./routes/billing");
@@ -53,7 +44,6 @@ const app = express();
 // Enable CORS for all routes with explicit allowed origins
 const allowedOrigins = [
     "https://admin.blackie-networks.com",
-    "https://www.admin.blackie-networks.com",
     "https://app.blackie-networks.com",
     "https://mikrotik.blackie-networks.com",
     "https://blackie-softwareadmin-enockays-projects.vercel.app",
@@ -82,14 +72,7 @@ app.use(cors({
     maxAge: 86400 // 24 hours
 }));
 
-// Serve static downloadable docs (Getting Started, MikroTik guide, API reference PDFs)
-app.use('/docs', express.static(path.join(__dirname, 'public', 'docs')));
-
-// Capture the raw request body alongside the parsed one - needed to verify
-// the PayStack webhook signature, which is computed over the exact bytes sent.
-app.use(bodyParser.json({
-    verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+app.use(bodyParser.json());
 
 // Initialize MongoDB connection
 let dbInitialized = false;
@@ -100,15 +83,7 @@ registerClientRoutes(app, () => dbInitialized);
 registerMikrotikRoutes(app, () => dbInitialized);
 registerLegacyRoutes(app, () => dbInitialized);
 registerAdminRoutes(app, () => dbInitialized);
-registerAdminRouterRoutes(app, () => dbInitialized); // Admin: global router view
-registerAdminUserRoutes(app, () => dbInitialized); // Admin: user CRUD
-registerAdminSupportRoutes(app, () => dbInitialized); // Admin: support ticket management
-registerAdminAnalyticsRoutes(app, () => dbInitialized); // Admin: income/usage analytics
-registerAdminTransactionRoutes(app, () => dbInitialized); // Admin: transaction ledger
-registerAdminReferralRoutes(app, () => dbInitialized); // Admin: referral tracking
-registerAdminSettingsRoutes(app, () => dbInitialized); // Admin: editable config (pricing, trial length)
 registerMikrotikRouterRoutes(app, () => dbInitialized); // User router management (requires auth)
-registerDeviceRoutes(app, () => dbInitialized); // User personal-device tunnel peers (requires auth)
 registerProfileRoutes(app); // User profile management (requires auth)
 registerBillingRoutes(app); // Billing and transactions (requires auth)
 registerReferralRoutes(app); // Referral system (requires auth)
@@ -118,10 +93,6 @@ registerSupportRoutes(app); // Support tickets (requires auth)
         await db.connect();
         dbInitialized = true;
         log('info', 'db_initialized');
-
-        const { refreshConfigCache } = require('./config-cache');
-        await refreshConfigCache();
-        log('info', 'config_cache_loaded');
 
         if (WG_ENABLED) {
             // Phase 3.4: Wait for the WireGuard interface before loading peers

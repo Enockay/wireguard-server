@@ -104,13 +104,12 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
  * Retrieves uptime, resources, and other system information
  */
 async function getRouterboardInfoSSH(vpnIp, username = null, password = null) {
-    // Use admin-configured Settings (falls back to env var)
-    const { getConfig } = require('../config-cache');
+    // Use system user credentials from environment variables
     if (!username) {
-        username = getConfig('mikrotikSystemUsername') || process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
+        username = process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
     }
     if (!password) {
-        password = getConfig('mikrotikSystemPassword') || process.env.MIKROTIK_SYSTEM_PASSWORD || '';
+        password = process.env.MIKROTIK_SYSTEM_PASSWORD || '';
     }
     try {
         // Get system resource information

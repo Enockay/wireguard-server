@@ -19,21 +19,14 @@ services:
     volumes:
       - /lib/modules:/lib/modules
     ports:
-      # WireGuard VPN port (UDP) - direct, never goes through Coolify's proxy
+      # WireGuard VPN port (UDP)
       - "51820:51820/udp"
-      # API port (exposed through WireGuard container's network).
-      # HTTP(S) traffic to vpn.blackie-networks.com is handled separately by
-      # Coolify's Traefik proxy (set the domain on this service in the Coolify
-      # dashboard) - this host mapping just keeps direct IP:5000 access working.
+      # API port (exposed through WireGuard container's network)
       - "${API_PORT:-5000}:5000/tcp"
-      # Per-router Winbox/SSH/API proxy ports (see utils/port-allocator.js -
-      # PORT_RANGES: winbox 1000-3333, ssh 3334-6666, api 6667-9999). These are
-      # raw TCP (not HTTP), so they can't be routed by Coolify's Traefik proxy
-      # via the domain/hostname - each router needs its own real listening
-      # port. Publishing the whole range up front means tcp-proxy-service.js
-      # can dynamically start/stop listeners on any port in it, per router,
-      # without ever needing a docker-compose/Coolify redeploy.
-      - "1000-9999:1000-9999/tcp"
+      # Note: TCP Proxy ports (3000-9999, 10000-19999, 20000-29999) are handled
+      # by the TCP proxy service running in wireguard-api container.
+      # Coolify will need to expose these ports individually or via port management.
+      # The proxy service listens on all allocated ports inside the container.
     env_file:
       - .env  # Loads WIREGUARD_PRIVATE_KEY
     environment:

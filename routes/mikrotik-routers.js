@@ -48,28 +48,14 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
             const { privateKey, publicKey } = await generateKeys();
             const allocatedIp = await getNextAvailableIP(getDbInitialized());
 
-            // Keep the client name short and readable: a long router name plus a
-            // full 24-char user id used to blow past RouterOS's 32-char interface
-            // name limit once it fed into the "wg-client-<name>" interface fallback,
-            // which made /interface/wireguard/add silently fail on the router.
-            const nameSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'router';
-            const userSuffix = userId.toString().slice(-8);
-            const clientName = `router-${nameSlug}-${userSuffix}`;
-            // Interface name is only ever seen by RouterOS itself, so derive it from
-            // the already-unique VPN IP octet instead - guaranteed short and unique.
-            const ipOctet = allocatedIp.split('.')[3].split('/')[0];
-            const interfaceName = `wg-r${ipOctet}`;
-
             const wireguardClient = new Client({
-                name: clientName,
+                name: `router-${name.toLowerCase()}-${userId}`,
                 ip: allocatedIp,
                 publicKey,
                 privateKey,
                 enabled: true,
                 notes: `MikroTik router: ${name}`,
-                createdBy: userId.toString(),
-                deviceType: 'router',
-                interfaceName
+                createdBy: userId.toString()
             });
 
             await wireguardClient.save();
@@ -239,9 +225,6 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                 });
             }
 
-            const Subscription = require('../models/Subscription');
-            const subscription = await Subscription.findOne({ routerId: router._id });
-
             res.json({
                 success: true,
                 router: {
@@ -263,11 +246,7 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                     routerboardInfo: router.routerboardInfo || null,
                     lastSeen: router.lastSeen,
                     firstConnectedAt: router.firstConnectedAt,
-                    createdAt: router.createdAt,
-                    subscriptionStatus: subscription?.status || 'trial',
-                    pricePerMonth: subscription?.pricePerMonth,
-                    trialEndsAt: subscription?.trialEndsAt,
-                    expirationDate: subscription?.currentPeriodEnd || subscription?.nextBillingDate || null
+                    createdAt: router.createdAt
                 }
             });
         } catch (error) {
@@ -275,62 +254,6 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
             res.status(500).json({
                 success: false,
                 error: 'Failed to get router',
-                details: error.message
-            });
-        }
-    });
-
-    // Renew a past-due (or trial-expired) router: charges the plan price from
-    // the customer's wallet balance right now instead of waiting for the
-    // daily billing job, and reconnects the router immediately on success.
-    app.post('/api/routers/:id/renew', authenticateToken, async (req, res) => {
-        try {
-            const { id } = req.params;
-            const userId = req.user.userId;
-
-            const router = await MikrotikRouter.findOne({ _id: id, userId });
-            if (!router) {
-                return res.status(404).json({ success: false, error: 'Router not found' });
-            }
-
-            const Subscription = require('../models/Subscription');
-            const subscription = await Subscription.findOne({ routerId: router._id, userId });
-            if (!subscription) {
-                return res.status(404).json({ success: false, error: 'Subscription not found' });
-            }
-
-            if (!['past_due', 'trial', 'expired'].includes(subscription.status)) {
-                return res.status(400).json({
-                    success: false,
-                    error: `Router is already ${subscription.status} - nothing to renew`
-                });
-            }
-
-            const { processBilling } = require('../services/billing-service');
-            const result = await processBilling(subscription._id);
-
-            if (!result.processed) {
-                return res.status(402).json({
-                    success: false,
-                    error: result.reason || 'Payment could not be processed',
-                    required: result.required,
-                    available: result.available
-                });
-            }
-
-            log('info', 'router_renewed', { userId, routerId: router._id, amount: result.amount });
-
-            res.json({
-                success: true,
-                message: 'Router renewed successfully',
-                amount: result.amount,
-                nextBillingDate: result.nextBillingDate
-            });
-        } catch (error) {
-            log('error', 'renew_router_error', { error: error.message });
-            res.status(500).json({
-                success: false,
-                error: 'Failed to renew router',
                 details: error.message
             });
         }

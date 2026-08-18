@@ -6,22 +6,20 @@ const {
     validateKeepalive,
     runWgCommand,
     getServerPublicKey,
-    getServerEndpoint,
-    resolveInterfaceName
+    getServerEndpoint
 } = require("../wg-core");
 const {
     generateKeys,
     getNextAvailableIP
 } = require("../utils/route-helpers");
 const { getTimeAgo } = require("../utils/route-helpers");
-const { authenticateToken, requireAdmin } = require("./auth");
 const dotenv = require('dotenv');
 dotenv.config();
 
 // Register all client management routes
 function registerClientRoutes(app, getDbInitialized) {
     // Get all clients from database with filtering, pagination, and search
-    app.get("/api/clients", authenticateToken, requireAdmin, async (req, res) => {
+    app.get("/api/clients", async (req, res) => {
         try {
             const dbInitialized = getDbInitialized();
             if (!dbInitialized) {
@@ -89,7 +87,7 @@ function registerClientRoutes(app, getDbInitialized) {
     });
 
     // Get client details by name (admin - includes private key)
-    app.get("/api/clients/:name", authenticateToken, requireAdmin, async (req, res) => {
+    app.get("/api/clients/:name", async (req, res) => {
         try {
             const { name } = req.params;
             const { includePrivateKey = 'false' } = req.query;
@@ -123,8 +121,8 @@ function registerClientRoutes(app, getDbInitialized) {
         }
     });
 
-    // Get client WireGuard config file (.conf) - owner or admin only, contains the private key
-    app.get("/api/clients/:name/config", authenticateToken, async (req, res) => {
+    // Get client WireGuard config file (.conf)
+    app.get("/api/clients/:name/config", async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
@@ -134,13 +132,6 @@ function registerClientRoutes(app, getDbInitialized) {
                     success: false,
                     message: `Client "${name}" not found`,
                     error: "CLIENT_NOT_FOUND"
-                });
-            }
-
-            if (req.user.role !== 'admin' && client.createdBy !== req.user.userId) {
-                return res.status(403).json({
-                    success: false,
-                    error: "You do not have access to this client's config"
                 });
             }
 
@@ -183,11 +174,6 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Auto-Configure MikroTik (Single URL) - Enhanced version
-    // Left unauthenticated: fetched directly by RouterOS `/tool fetch` (which
-    // cannot send an Authorization header) and via window.open() from the
-    // customer dashboard. TODO: leaks this client's WireGuard private key to
-    // anyone who guesses/enumerates the client name - consider a short-lived
-    // signed token in the URL instead of the raw client name.
     app.get("/api/clients/:name/autoconfig", async (req, res) => {
         try {
             const { name } = req.params;
@@ -242,7 +228,7 @@ PersistentKeepalive = ${keepalive}`;
                 });
             }
 
-            const ifaceName = resolveInterfaceName(client);
+            const ifaceName = (client.interfaceName || `wg-client-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
             const allowed = "10.0.0.0/24";
             // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
             const dns = (client.dns || "8.8.8.8,1.1.1.1").replace(/,\s+/g, ',').trim();
@@ -250,10 +236,9 @@ PersistentKeepalive = ${keepalive}`;
             const serverWgIp = "10.0.0.1";
 
             // System user credentials for SSH monitoring
-            // Use admin-configured Settings (falls back to env var), or generate a secure password
-            const { getConfig } = require("../config-cache");
-            const systemUsername = getConfig('mikrotikSystemUsername') || process.env.MIKROTIK_SYSTEM_USERNAME;
-            let systemPassword = getConfig('mikrotikSystemPassword') || process.env.MIKROTIK_SYSTEM_PASSWORD;
+            // Use environment variable or generate a secure password (same for all routers)
+            const systemUsername = process.env.MIKROTIK_SYSTEM_USERNAME;
+            let systemPassword = process.env.MIKROTIK_SYSTEM_PASSWORD;
 
             // If password not set, generate one and log it (admin should set it in env)
             if (!systemPassword) {
@@ -404,8 +389,6 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Get client MikroTik script
-    // Left unauthenticated for the same reason as /autoconfig above - meant to
-    // be pasted straight into a MikroTik /tool fetch one-liner.
     app.get("/api/clients/:name/mikrotik", async (req, res) => {
         try {
             const { name } = req.params;
@@ -448,7 +431,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Ping remote server endpoint
-    app.post("/api/clients/:name/ping", authenticateToken, async (req, res) => {
+    app.post("/api/clients/:name/ping", async (req, res) => {
         try {
             const { name } = req.params;
             const { target, count = 3 } = req.body;
@@ -460,13 +443,6 @@ PersistentKeepalive = ${keepalive}`;
                     success: false,
                     message: `Client "${name}" not found`,
                     error: "CLIENT_NOT_FOUND"
-                });
-            }
-
-            if (req.user.role !== 'admin' && client.createdBy !== req.user.userId) {
-                return res.status(403).json({
-                    success: false,
-                    error: "You do not have access to this client"
                 });
             }
 
@@ -529,7 +505,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Create new client (admin)
-    app.post("/api/clients", authenticateToken, requireAdmin, async (req, res) => {
+    app.post("/api/clients", async (req, res) => {
         try {
             const {
                 name,
@@ -638,7 +614,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Full update client (admin)
-    app.put("/api/clients/:name", authenticateToken, requireAdmin, async (req, res) => {
+    app.put("/api/clients/:name", async (req, res) => {
         try {
             const { name } = req.params;
             const {
@@ -746,7 +722,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Regenerate client keys (admin)
-    app.post("/api/clients/:name/regenerate", authenticateToken, requireAdmin, async (req, res) => {
+    app.post("/api/clients/:name/regenerate", async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
@@ -803,7 +779,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Enable client
-    app.post("/api/clients/:name/enable", authenticateToken, requireAdmin, async (req, res) => {
+    app.post("/api/clients/:name/enable", async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOneAndUpdate(
@@ -843,7 +819,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Disable client
-    app.post("/api/clients/:name/disable", authenticateToken, requireAdmin, async (req, res) => {
+    app.post("/api/clients/:name/disable", async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOneAndUpdate(
@@ -897,7 +873,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Delete client
-    app.delete("/api/clients/:name", authenticateToken, requireAdmin, async (req, res) => {
+    app.delete("/api/clients/:name", async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
@@ -937,7 +913,7 @@ PersistentKeepalive = ${keepalive}`;
     });
 
     // Bulk delete clients
-    app.post("/api/clients/bulk-delete", authenticateToken, requireAdmin, async (req, res) => {
+    app.post("/api/clients/bulk-delete", async (req, res) => {
         try {
             const { names } = req.body;
 

@@ -147,26 +147,7 @@ async function getServerPublicKey() {
 }
 
 function getServerEndpoint() {
-    const { getConfig } = require('./config-cache');
-    return getConfig('serverEndpoint') || process.env.SERVER_ENDPOINT || "YOUR_SERVER_IP:51820";
-}
-
-// RouterOS rejects interface names over 32 chars, so a long client name (e.g.
-// a long router name plus a full user id) fed straight into "wg-client-<name>"
-// makes /interface/wireguard/add fail on the router with no visible error to
-// the customer. Prefer the client's stored interfaceName; otherwise derive a
-// short, RouterOS-safe one from its (unique) VPN IP octet.
-const MIKROTIK_INTERFACE_NAME_MAX = 32;
-function resolveInterfaceName(client) {
-    if (client.interfaceName) {
-        return client.interfaceName.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, MIKROTIK_INTERFACE_NAME_MAX);
-    }
-    const octet = stripCidr(client.ip || '').split('.')[3];
-    if (octet) {
-        return `wg-r${octet}`;
-    }
-    // Last resort: sanitize and hard-truncate the client name.
-    return `wg-${client.name || 'client'}`.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, MIKROTIK_INTERFACE_NAME_MAX);
+    return process.env.SERVER_ENDPOINT || "YOUR_SERVER_IP:51820";
 }
 
 module.exports = {
@@ -191,7 +172,6 @@ module.exports = {
     runWgCommand,
     waitForWireGuard,
     getServerPublicKey,
-    getServerEndpoint,
-    resolveInterfaceName
+    getServerEndpoint
 };
 

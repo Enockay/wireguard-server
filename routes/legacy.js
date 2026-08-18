@@ -14,12 +14,11 @@ const {
     getNextAvailableIP,
     loadClientsFromDatabase
 } = require("../utils/route-helpers");
-const { authenticateToken, requireAdmin } = require("./auth");
 
 // Register all legacy routes for backward compatibility
 function registerLegacyRoutes(app, getDbInitialized) {
     // Generate a new client configuration (legacy)
-    app.post("/generate-client", authenticateToken, requireAdmin, async (req, res) => {
+    app.post("/generate-client", async (req, res) => {
         try {
             const { name, notes } = req.body;
             
@@ -109,7 +108,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
     });
 
     // Get all connected peers (legacy)
-    app.get("/list-peers", authenticateToken, requireAdmin, async (req, res) => {
+    app.get("/list-peers", async (req, res) => {
         try {
             const wgStatus = await wgLock.run(() => runWgCommand(['show']));
             res.json({ 
@@ -127,7 +126,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
     });
 
     // Add peer manually (legacy)
-    app.post("/add-peer", authenticateToken, requireAdmin, async (req, res) => {
+    app.post("/add-peer", async (req, res) => {
         try {
             const { publicKey, allowedIPs, persistentKeepalive } = req.body;
             
@@ -156,7 +155,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
     });
 
     // Legacy endpoint for backward compatibility - List clients
-    app.get("/clients", authenticateToken, requireAdmin, async (req, res) => {
+    app.get("/clients", async (req, res) => {
         try {
             const dbInitialized = getDbInitialized();
             if (!dbInitialized) {
@@ -185,7 +184,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
     });
 
     // Legacy endpoint for backward compatibility - Get client config
-    app.get("/clients/:name", authenticateToken, requireAdmin, async (req, res) => {
+    app.get("/clients/:name", async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });
@@ -226,7 +225,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
     });
 
     // Update client (enable/disable, notes) - Legacy
-    app.patch("/clients/:name", authenticateToken, requireAdmin, async (req, res) => {
+    app.patch("/clients/:name", async (req, res) => {
         try {
             const { name } = req.params;
             const { enabled, notes } = req.body;
@@ -300,7 +299,7 @@ PersistentKeepalive = ${KEEPALIVE_TIME}`;
     });
 
     // Delete client (legacy)
-    app.delete("/clients/:name", authenticateToken, requireAdmin, async (req, res) => {
+    app.delete("/clients/:name", async (req, res) => {
         try {
             const { name } = req.params;
             const client = await Client.findOne({ name: name.toLowerCase() });

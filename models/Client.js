@@ -40,14 +40,6 @@ const clientSchema = new mongoose.Schema({
         type: String,
         default: 'system'
     },
-    // Distinguishes a plain personal-device peer (laptop/phone/desktop) from
-    // the WireGuard client that backs a MikrotikRouter record, so the two can
-    // be listed separately in the customer UI ("My Devices" vs "Routers").
-    deviceType: {
-        type: String,
-        enum: ['router', 'laptop', 'phone', 'desktop', 'other'],
-        default: 'other'
-    },
     notes: {
         type: String,
         trim: true
