@@ -459,6 +459,8 @@ async function updateRouterStatus(routerId, isOnline, routerboardInfo = null) {
                     model: routerboardInfo.model || null,
                     serialNumber: routerboardInfo.serialNumber || null,
                     firmware: routerboardInfo.firmware || null,
+                    rxBytes: routerboardInfo.rxBytes || null,
+                    txBytes: routerboardInfo.txBytes || null,
                     lastChecked: now
                 };
             }

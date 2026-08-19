@@ -75,6 +75,12 @@ const mikrotikRouterSchema = new mongoose.Schema({
         model: String,
         serialNumber: String,
         firmware: String,
+        // Cumulative counters from the WireGuard tunnel interface (as
+        // strings - RouterOS counters can exceed Number precision over a
+        // long uptime). Reset to 0 by the router if its interface is
+        // recreated, so these are "since last reset", not lifetime totals.
+        rxBytes: String,
+        txBytes: String,
         lastChecked: Date
     }
 }, {

@@ -18,7 +18,8 @@ const {
     isValidCidr,
     runWgCommand,
     waitForWireGuard,
-    validateKeepalive
+    validateKeepalive,
+    resolveInterfaceName
 } = require("./wg-core");
 const { loadClientsFromDatabase } = require("./utils/route-helpers");
 
@@ -433,7 +434,8 @@ function startRouterStatusMonitoring() {
                         username: systemUsername,
                         password: systemPassword,
                         method: 'ssh', // Try SSH first, falls back to API port check
-                        timeout: 5000
+                        timeout: 5000,
+                        ifaceName: resolveInterfaceName(router.wireguardClientId)
                     });
 
                     const isActive = activeCheck.isActive;

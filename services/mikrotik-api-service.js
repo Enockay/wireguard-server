@@ -100,10 +100,31 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
 }
 
 /**
+ * Get cumulative RX/TX byte counters for a single interface (typically the
+ * WireGuard tunnel interface) via a RouterOS scripting one-liner rather than
+ * `/interface print`, whose tabular output can wrap across lines at narrow
+ * terminal widths and isn't worth writing a table parser for just this.
+ */
+async function getInterfaceTrafficSSH(vpnIp, ifaceName, username, password) {
+    if (!ifaceName) return null;
+    // Single quotes throughout - this command string gets embedded inside a
+    // double-quoted shell argument in executeRouterOSCommand, so it must not
+    // contain any unescaped double quotes itself.
+    const command = `:put ([/interface get [find name='${ifaceName}'] rx-byte] . ',' . [/interface get [find name='${ifaceName}'] tx-byte])`;
+    const result = await executeRouterOSCommand(vpnIp, command, username, password);
+    if (!result.success || !result.output) return null;
+
+    const [rxByte, txByte] = result.output.trim().split(',');
+    if (!/^\d+$/.test(rxByte) || !/^\d+$/.test(txByte)) return null;
+
+    return { rxBytes: rxByte, txBytes: txByte };
+}
+
+/**
  * Get routerboard information using SSH
  * Retrieves uptime, resources, and other system information
  */
-async function getRouterboardInfoSSH(vpnIp, username = null, password = null) {
+async function getRouterboardInfoSSH(vpnIp, username = null, password = null, ifaceName = null) {
     // Use admin-configured Settings (falls back to env var)
     const { getConfig } = require('../config-cache');
     if (!username) {
@@ -136,6 +157,10 @@ async function getRouterboardInfoSSH(vpnIp, username = null, password = null) {
         const resourceInfo = parseRouterOSOutput(resourceResult.output);
         const routerboardInfo = routerboardResult.success ? parseRouterOSOutput(routerboardResult.output) : {};
 
+        // Traffic through the WireGuard tunnel interface itself - best-effort,
+        // failure here shouldn't fail the whole status check.
+        const traffic = await getInterfaceTrafficSSH(vpnIp, ifaceName, username, password).catch(() => null);
+
         return {
             success: true,
             vpnIp,
@@ -150,6 +175,8 @@ async function getRouterboardInfoSSH(vpnIp, username = null, password = null) {
             model: routerboardInfo.model || null,
             serialNumber: routerboardInfo['serial-number'] || routerboardInfo.serialNumber || null,
             firmware: routerboardInfo['current-firmware'] || routerboardInfo.currentFirmware || null,
+            rxBytes: traffic?.rxBytes || null,
+            txBytes: traffic?.txBytes || null,
             resources: resourceInfo,
             routerboard: routerboardInfo,
             timestamp: new Date()
@@ -259,7 +286,8 @@ async function getRouterboardInfo(vpnIp, options = {}) {
         username = 'admin',
         password = '',
         timeout = 5000,
-        method = 'ssh' // 'ssh', 'api_port'
+        method = 'ssh', // 'ssh', 'api_port'
+        ifaceName = null
     } = options;
 
     try {
@@ -267,7 +295,7 @@ async function getRouterboardInfo(vpnIp, options = {}) {
 
         // Method 1: Use SSH to get detailed info (preferred)
         if (method === 'ssh' || !method) {
-            const result = await getRouterboardInfoSSH(vpnIp, username, password);
+            const result = await getRouterboardInfoSSH(vpnIp, username, password, ifaceName);
             return result;
         }
 
@@ -318,6 +346,7 @@ module.exports = {
     getRouterboardInfo,
     checkRouterActive,
     getRouterboardInfoSSH,
+    getInterfaceTrafficSSH,
     executeRouterOSCommand,
     checkAPIPortOpen
 };
