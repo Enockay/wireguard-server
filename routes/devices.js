@@ -32,6 +32,8 @@ function serializeDevice(client) {
         enabled: client.enabled,
         online: isOnline(client),
         lastHandshake: client.lastHandshake,
+        transferRx: client.transferRx || 0,
+        transferTx: client.transferTx || 0,
         createdAt: client.createdAt
     };
 }
