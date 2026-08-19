@@ -27,9 +27,15 @@ const settingsSchema = new mongoose.Schema({
     // deployment that shares client routers with it, since two deployments
     // reusing the same subnet cause routers holding tunnels to both to
     // misroute replies to whichever one's route wins.
+    // Deliberately no schema `default` here (same reason as serverEndpoint
+    // above) - getVpnSubnetPrefix() in wg-core.js falls back to the
+    // VPN_SUBNET_PREFIX env var, then a hardcoded default. A schema default
+    // would get persisted into the DB the first time the Settings singleton
+    // is created, permanently shadowing the env var for every deployment
+    // (this bit a real deploy: the env var was correctly set but ignored
+    // because the DB already had "10.0.0" baked in).
     vpnSubnetPrefix: {
         type: String,
-        default: '10.0.0',
         trim: true
     },
     // Public TCP port range for per-router Winbox/SSH/API proxying (see
