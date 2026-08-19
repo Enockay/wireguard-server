@@ -3,11 +3,11 @@ const { log } = require('../wg-core');
 const { getConfig } = require('../config-cache');
 
 const DEFAULT_RANGE_START = 6100;
-const DEFAULT_RANGE_END = 7999;
+const DEFAULT_RANGE_END = 6899;
 const PORT_TYPES = ['winbox', 'ssh', 'api'];
 
 // The admin-configurable overall range (Settings.proxyPortRangeStart/End,
-// default 6100-7999) is split into three equal thirds, one per port type.
+// default 6100-6899) is split into three equal thirds, one per port type.
 // Recomputed on every call rather than cached at module load, since the
 // admin can change the range at runtime via PATCH /api/admin/settings and
 // refreshConfigCache() takes effect immediately - a stale cached split here

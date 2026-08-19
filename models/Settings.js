@@ -45,7 +45,7 @@ const settingsSchema = new mongoose.Schema({
     },
     proxyPortRangeEnd: {
         type: Number,
-        default: 7999,
+        default: 6899,
         min: 1,
         max: 65535
     },

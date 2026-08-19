@@ -29,7 +29,7 @@ services:
       - "${API_PORT:-5020}:5020/tcp"
       # Per-router Winbox/SSH/API proxy ports. The active range is now
       # admin-configurable (Settings.proxyPortRangeStart/End, default
-      # 6100-7999, split into three equal thirds by
+      # 6100-6899 - 800 ports, split into three equal thirds by
       # utils/port-allocator.js:getPortRanges) rather than hardcoded - but
       # that setting only controls which ports *new* routers get allocated
       # from. Docker still has to actually publish whatever ports are in use,
@@ -38,18 +38,17 @@ services:
       # provisioned under them is migrated off. These are raw TCP (not
       # HTTP), so they can't be routed by Coolify's Traefik proxy via the
       # domain/hostname - each router needs its own real listening port.
-      - "6100-7999:6100-7999/tcp"
-      # Previous range (20000-20299), still in use by routers provisioned
-      # before the move above (e.g. "Mikrotikproxy").
-      # TODO: reprovision/migrate them into 6100-7999 and drop this line.
-      - "20000-20299:20000-20299/tcp"
-      # Router "ChukaMikrotik" was provisioned even earlier, under the
-      # original 1000-9999 range - published individually (rather than
-      # reopening the whole old range) so it stays reachable.
-      # TODO: reprovision/migrate it and drop these three.
-      - "1000:1000/tcp"
-      - "3334:3334/tcp"
-      - "6667:6667/tcp"
+      # Deliberately capped at 800 ports (not the previous 1900) - each
+      # published port costs a docker-proxy process per IP family, and a
+      # large range measurably slows every container start/stop (~4400
+      # docker-proxy processes observed with the old 6100-7999 + 20000-20299
+      # ranges combined).
+      - "6100-6899:6100-6899/tcp"
+      # 20000-20299 (legacy range) and the individually-published legacy
+      # single ports for "ChukaMikrotik" have been dropped as of the move to
+      # the new 172.20.0.0/24 environment - old routers provisioned under
+      # them (e.g. "Mikrotikproxy") are being re-provisioned fresh instead
+      # of migrated, per that cutover.
     env_file:
       - .env  # Loads WIREGUARD_PRIVATE_KEY
     environment:
