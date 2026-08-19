@@ -7,6 +7,8 @@ const {
     runWgCommand,
     getServerPublicKey,
     getServerEndpoint,
+    getServerWgIp,
+    getVpnSubnetCidr,
     resolveInterfaceName
 } = require("../wg-core");
 const {
@@ -73,7 +75,7 @@ function registerMikrotikRoutes(app, getDbInitialized) {
             const serverPublicKey = (await getServerPublicKey()).trim();
             const serverEndpoint = getServerEndpoint(); // expected format: host:port
             const iface = (interfaceName || `wireguard-${clientName}`).replace(/[^a-zA-Z0-9_-]/g, '-');
-            const allowed = allowedSubnet || "10.0.0.0/24";
+            const allowed = allowedSubnet || getVpnSubnetCidr();
 
             // RouterOS script (safe to paste as one-shot)
             const serverEndpointParts = serverEndpoint.split(':');
@@ -89,7 +91,7 @@ function registerMikrotikRoutes(app, getDbInitialized) {
 `:local SERVER_PORT "${serverPort}"\r\n` +
 `:local ALLOWED_SUBNET "${allowed}"\r\n` +
 `:local KEEPALIVE 25\r\n` +
-`:local SERVER_WG_IP "10.0.0.1"\r\n` +
+`:local SERVER_WG_IP "${getServerWgIp()}"\r\n` +
 `` +
 `# 1) Create interface if missing\r\n` +
 `:if ([/interface wireguard print count-only where name=$IFACE] = 0) do={\r\n` +
@@ -108,7 +110,14 @@ function registerMikrotikRoutes(app, getDbInitialized) {
 `} else={\r\n` +
 `  :put "IP address $CLIENT_IP already assigned";\r\n` +
 `}\r\n` +
-`# 4) Add or update peer (server)\r\n` +
+`# 4) Remove any stale peer on this interface for a different server key\r\n` +
+`:foreach p in=[/interface wireguard peers find where interface=$IFACE] do={\r\n` +
+`  :if ([/interface wireguard peers get $p public-key] != $SERVER_PUBKEY) do={\r\n` +
+`    /interface wireguard peers remove $p;\r\n` +
+`    :put "Removed stale peer on $IFACE";\r\n` +
+`  }\r\n` +
+`}\r\n` +
+`# 5) Add or update peer (server)\r\n` +
 `:local PEER_ID [/interface wireguard peers find where interface=$IFACE public-key=$SERVER_PUBKEY];\r\n` +
 `:if ([:len $PEER_ID] = 0) do={\r\n` +
 `  /interface wireguard peers add interface=$IFACE public-key=$SERVER_PUBKEY endpoint-address=$SERVER_HOST endpoint-port=$SERVER_PORT allowed-address=$ALLOWED_SUBNET persistent-keepalive=$KEEPALIVE;\r\n` +
@@ -117,24 +126,24 @@ function registerMikrotikRoutes(app, getDbInitialized) {
 `  /interface wireguard peers set $PEER_ID endpoint-address=$SERVER_HOST endpoint-port=$SERVER_PORT allowed-address=$ALLOWED_SUBNET persistent-keepalive=$KEEPALIVE;\r\n` +
 `  :put "Updated peer (server) on $IFACE";\r\n` +
 `}\r\n` +
-`# 5) Ensure route to allowed subnet via WG (only if not exists)\r\n` +
+`# 6) Ensure route to allowed subnet via WG (only if not exists)\r\n` +
 `:if ([/ip route print count-only where dst-address=$ALLOWED_SUBNET gateway=$IFACE] = 0) do={\r\n` +
 `  /ip route add dst-address=$ALLOWED_SUBNET gateway=$IFACE disabled=no;\r\n` +
 `  :put "Added route to $ALLOWED_SUBNET via $IFACE";\r\n` +
 `} else={\r\n` +
 `  :put "Route to $ALLOWED_SUBNET via $IFACE already exists";\r\n` +
 `}\r\n` +
-`# 6) Enable interface if disabled\r\n` +
+`# 7) Enable interface if disabled\r\n` +
 `/interface wireguard enable [find where name=$IFACE];\r\n` +
 `:put "Enabled interface $IFACE";\r\n` +
-`# 7) Test connectivity to server WG IP\r\n` +
+`# 8) Test connectivity to server WG IP\r\n` +
 `:delay 2;\r\n` +
 `:local success 0;\r\n` +
 `:do {\r\n` +
 `  /ping $SERVER_WG_IP count=3;\r\n` +
 `  :set success 1;\r\n` +
 `} on-error={ :set success 0; };\r\n` +
-`# 8) Report\r\n` +
+`# 9) Report\r\n` +
 `:if ($success = 1) do={ :put \"✅ WG setup OK for ${clientName}. Ping to $SERVER_WG_IP succeeded.\" } else={ :put \"⚠️ WG setup completed but ping to $SERVER_WG_IP failed. Check firewall/connectivity.\" };\r\n`;
 
             res.setHeader('Content-Type', 'text/plain');
@@ -171,15 +180,16 @@ function registerMikrotikRoutes(app, getDbInitialized) {
             const serverEndpoint = client.endpoint || getServerEndpoint();
 
             const ifaceName = resolveInterfaceName(client);
-            const allowed = (subnet || "10.0.0.0/24").toString();
+            const allowed = (subnet || getVpnSubnetCidr()).toString();
             const addr = client.ip; // /32
             const pKey = client.privateKey;
+            const serverWgIp = getServerWgIp();
 
             // Minified RouterOS script (no comments) - improved with interface enable
             const serverEndpointParts = serverEndpoint.split(':');
             const serverHost = serverEndpointParts[0];
             const serverPort = serverEndpointParts[1] || '51820';
-            const s = `:local IFACE "${ifaceName}";:local PRIV "${pKey}";:local IP "${addr}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${name} $IFACE $IP $LP"} else={:put "FAIL ${name}"}`;
+            const s = `:local IFACE "${ifaceName}";:local PRIV "${pKey}";:local IP "${addr}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:foreach p in=[/interface wireguard peers find where interface=$IFACE] do={:if ([/interface wireguard peers get $p public-key]!=$SPK) do={/interface wireguard peers remove $p}};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=25};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping ${serverWgIp} count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${name} $IFACE $IP $LP"} else={:put "FAIL ${name}"}`;
 
             res.setHeader('Content-Type', 'text/plain');
             res.setHeader('Cache-Control', 'no-store');
@@ -208,12 +218,13 @@ function registerMikrotikRoutes(app, getDbInitialized) {
             const serverPort = serverEndpointParts[1] || '51820';
             
             const ifaceName = resolveInterfaceName(client);
-            const allowed = client.allowedIPs || "10.0.0.0/24";
+            const allowed = client.allowedIPs || getVpnSubnetCidr();
             const keepalive = validateKeepalive(client.persistentKeepalive);
-            
+            const serverWgIp = getServerWgIp();
+
             // Generate minified MikroTik script (single line, no comments) - same format as working script
             // This format works when fetched via /tool/fetch and imported
-            const autoconfigScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
+            const autoconfigScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:foreach p in=[/interface wireguard peers find where interface=$IFACE] do={:if ([/interface wireguard peers get $p public-key]!=$SPK) do={/interface wireguard peers remove $p}};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping ${serverWgIp} count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
             
             res.setHeader('Content-Type', 'text/plain');
             res.setHeader('Content-Disposition', `attachment; filename="${client.name}-autoconfig.rsc"`);

@@ -19,6 +19,19 @@ const settingsSchema = new mongoose.Schema({
         type: String,
         trim: true
     },
+    // First 3 octets of this deployment's VPN subnet (e.g. "10.0.0" for
+    // 10.0.0.0/24). Must match the wireguard container's WG_SERVER_ADDRESS
+    // env var (docker-compose.yml) - changing this here alone does not move
+    // the server's own wg0 interface address. A separate deployment (e.g. a
+    // test environment) should use a distinct prefix from any other
+    // deployment that shares client routers with it, since two deployments
+    // reusing the same subnet cause routers holding tunnels to both to
+    // misroute replies to whichever one's route wins.
+    vpnSubnetPrefix: {
+        type: String,
+        default: '10.0.0',
+        trim: true
+    },
     // Public TCP port range for per-router Winbox/SSH/API proxying (see
     // utils/port-allocator.js). Split into three equal sub-ranges at
     // allocation time. Must also be published in docker-compose.yml's

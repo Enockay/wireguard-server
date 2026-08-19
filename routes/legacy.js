@@ -7,7 +7,8 @@ const {
     runWgCommand,
     runCommand,
     getServerPublicKey,
-    getServerEndpoint
+    getServerEndpoint,
+    getVpnSubnetCidr
 } = require("../wg-core");
 const {
     generateKeys,
@@ -76,7 +77,7 @@ Address = ${allowedIPs}
 [Peer]
 PublicKey = ${serverPublicKey}
 Endpoint = ${serverEndpoint}
-AllowedIPs = 10.0.0.0/24
+AllowedIPs = ${getVpnSubnetCidr()}
 PersistentKeepalive = ${KEEPALIVE_TIME}`;
             
             log('info', 'config_generated', { client: clientName });
@@ -209,7 +210,7 @@ Address = ${client.ip}
 [Peer]
 PublicKey = ${serverPublicKey}
 Endpoint = ${serverEndpoint}
-AllowedIPs = 10.0.0.0/24
+AllowedIPs = ${getVpnSubnetCidr()}
 PersistentKeepalive = ${KEEPALIVE_TIME}`;
             
             res.setHeader('Content-Type', 'text/plain');

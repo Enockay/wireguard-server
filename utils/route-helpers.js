@@ -9,7 +9,8 @@ const {
     isValidWgKey,
     isValidCidr,
     validateKeepalive,
-    runWgCommand
+    runWgCommand,
+    getVpnSubnetPrefix
 } = require("../wg-core");
 
 // Generate WireGuard keys (uses execFile, no shell needed)
@@ -54,7 +55,9 @@ async function getUsedIPs() {
         });
         return ips;
     } catch (error) {
-        return ["10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32", "10.0.0.4/32", "10.0.0.5/32"]; // Return preconfigured
+        const prefix = getVpnSubnetPrefix();
+        // Return preconfigured
+        return [1, 2, 3, 4, 5].map(i => `${prefix}.${i}/32`);
     }
 }
 
@@ -63,22 +66,24 @@ async function getNextAvailableIP(dbInitialized) {
     if (!dbInitialized) {
         // Fallback to old method if database not ready
         const usedIPs = await getUsedIPs();
+        const prefix = getVpnSubnetPrefix();
         for (let i = STARTING_CLIENT_IP; i < 255; i++) {
-            const candidateIP = `10.0.0.${i}/32`;
+            const candidateIP = `${prefix}.${i}/32`;
             if (!usedIPs.includes(candidateIP)) {
                 return candidateIP;
             }
         }
         throw new Error("No available IP addresses in the VPN network");
     }
-    
+
     try {
         // Get used IPs from database
         const clients = await Client.find({}, 'ip');
         const usedIPs = clients.map(c => c.ip);
-        
+        const prefix = getVpnSubnetPrefix();
+
         for (let i = STARTING_CLIENT_IP; i < 255; i++) {
-            const candidateIP = `10.0.0.${i}/32`;
+            const candidateIP = `${prefix}.${i}/32`;
             if (!usedIPs.includes(candidateIP)) {
                 return candidateIP;
             }

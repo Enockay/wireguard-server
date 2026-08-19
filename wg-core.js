@@ -151,6 +151,27 @@ function getServerEndpoint() {
     return getConfig('serverEndpoint') || process.env.SERVER_ENDPOINT || "YOUR_SERVER_IP:51820";
 }
 
+// First 3 octets of this deployment's VPN subnet (e.g. "10.0.0" for a
+// 10.0.0.0/24 network). Must stay in sync with the wireguard service's
+// WG_SERVER_ADDRESS (docker-compose.yml) so the server's own wg0 address
+// and the addresses handed out to clients agree. Separate deployments
+// (e.g. a test environment alongside production) should use a distinct
+// prefix - reusing the same subnet across deployments that share a client
+// router causes that router's routing table to only be able to reach one
+// of them, with replies to the other silently vanishing.
+function getVpnSubnetPrefix() {
+    const { getConfig } = require('./config-cache');
+    return getConfig('vpnSubnetPrefix') || process.env.VPN_SUBNET_PREFIX || "10.0.0";
+}
+
+function getServerWgIp() {
+    return `${getVpnSubnetPrefix()}.1`;
+}
+
+function getVpnSubnetCidr() {
+    return `${getVpnSubnetPrefix()}.0/24`;
+}
+
 // RouterOS rejects interface names over 32 chars, so a long client name (e.g.
 // a long router name plus a full user id) fed straight into "wg-client-<name>"
 // makes /interface/wireguard/add fail on the router with no visible error to
@@ -192,6 +213,9 @@ module.exports = {
     waitForWireGuard,
     getServerPublicKey,
     getServerEndpoint,
+    getVpnSubnetPrefix,
+    getServerWgIp,
+    getVpnSubnetCidr,
     resolveInterfaceName
 };
 

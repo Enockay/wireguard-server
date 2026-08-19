@@ -6,7 +6,8 @@ const {
     validateKeepalive,
     runWgCommand,
     getServerPublicKey,
-    getServerEndpoint
+    getServerEndpoint,
+    getVpnSubnetCidr
 } = require("../wg-core");
 const { generateKeys, getNextAvailableIP } = require("../utils/route-helpers");
 const { authenticateToken } = require("./auth");
@@ -114,7 +115,7 @@ function registerDeviceRoutes(app, getDbInitialized) {
             const serverPublicKey = (await getServerPublicKey()).trim();
             const serverEndpoint = client.endpoint || getServerEndpoint();
             const dns = client.dns || "";
-            const allowedIPs = client.allowedIPs || "10.0.0.0/24";
+            const allowedIPs = client.allowedIPs || getVpnSubnetCidr();
             const keepalive = validateKeepalive(client.persistentKeepalive);
 
             let config = `[Interface]\nPrivateKey = ${client.privateKey}\nAddress = ${client.ip}`;

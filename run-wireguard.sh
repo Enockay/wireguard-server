@@ -22,11 +22,20 @@ else
     echo "Warning: Could not write to /etc/sysctl.d/forward.conf"
 fi
 
-# Replace placeholder in the template with the secret from environment variable
-# Use @ as delimiter to avoid conflicts with / or special characters in the key
+# Replace placeholders in the template with values from environment variables.
+# Use @ as delimiter to avoid conflicts with / or special characters in the key.
 sed -i "s@{{WIREGUARD_PRIVATE_KEY}}@$WIREGUARD_PRIVATE_KEY@" /etc/wireguard/wg0.conf
 
+# VPN subnet for this deployment (lets a separate deployment - e.g. a test
+# environment - run its own non-overlapping VPN network instead of colliding
+# with another deployment's 10.0.0.0/24, and reusing the same peer's public
+# key across two deployments with overlapping subnets, both of which cause
+# silent routing/reply failures on client routers that hold tunnels to both).
+WG_SERVER_ADDRESS="${WG_SERVER_ADDRESS:-10.0.0.1/24}"
+sed -i "s@{{WG_SERVER_ADDRESS}}@$WG_SERVER_ADDRESS@" /etc/wireguard/wg0.conf
+
 echo "WireGuard private key has been set from environment variable"
+echo "WireGuard interface address set to $WG_SERVER_ADDRESS"
 
 # Start WireGuard interface.
 # Retry with backoff: on first boot the host may apply --privileged /

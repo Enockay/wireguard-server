@@ -7,6 +7,8 @@ const {
     runWgCommand,
     getServerPublicKey,
     getServerEndpoint,
+    getServerWgIp,
+    getVpnSubnetCidr,
     resolveInterfaceName
 } = require("../wg-core");
 const {
@@ -243,11 +245,11 @@ PersistentKeepalive = ${keepalive}`;
             }
 
             const ifaceName = resolveInterfaceName(client);
-            const allowed = "10.0.0.0/24";
+            const allowed = getVpnSubnetCidr();
             // Clean DNS: remove spaces after commas (MikroTik doesn't like "8.8.8.8, 1.1.1.1")
             const dns = (client.dns || "8.8.8.8,1.1.1.1").replace(/,\s+/g, ',').trim();
             const keepalive = validateKeepalive(client.persistentKeepalive);
-            const serverWgIp = "10.0.0.1";
+            const serverWgIp = getServerWgIp();
 
             // System user credentials for SSH monitoring
             // Use admin-configured Settings (falls back to env var), or generate a secure password
@@ -357,7 +359,7 @@ PersistentKeepalive = ${keepalive}`;
 
 # Create system user for SSH monitoring (if not exists)
 :if ([/user/print count-only where name=$SYSUSER] = 0) do={
-    /user/add name=$SYSUSER password=$SYSPASS group=read address=10.0.0.0/24
+    /user/add name=$SYSUSER password=$SYSPASS group=read address=$ALLOWED
     :put "System user $SYSUSER created for monitoring"
 } else={
     /user/set $SYSUSER password=$SYSPASS
@@ -368,8 +370,8 @@ PersistentKeepalive = ${keepalive}`;
 /ip/service/enable ssh
 
 # Ensure SSH is allowed from VPN network (only if rule doesn't exist)
-:if ([/ip/firewall/filter/print count-only where chain=input protocol=tcp dst-port=22 src-address=10.0.0.0/24 comment~"Allow SSH from VPN network"] = 0) do={
-    /ip/firewall/filter/add chain=input protocol=tcp dst-port=22 src-address=10.0.0.0/24 action=accept place-before=0 comment="Allow SSH from VPN network" disabled=no
+:if ([/ip/firewall/filter/print count-only where chain=input protocol=tcp dst-port=22 src-address=$ALLOWED comment~"Allow SSH from VPN network"] = 0) do={
+    /ip/firewall/filter/add chain=input protocol=tcp dst-port=22 src-address=$ALLOWED action=accept place-before=0 comment="Allow SSH from VPN network" disabled=no
 }
 
 # Test connectivity
@@ -429,9 +431,10 @@ PersistentKeepalive = ${keepalive}`;
             const ifaceName = (iface || client.interfaceName || `wireguard-${client.name}`).replace(/[^a-zA-Z0-9_-]/g, '-');
             const allowed = (subnet || client.allowedIPs || "0.0.0.0/0").toString();
             const keepalive = validateKeepalive(client.persistentKeepalive);
+            const serverWgIp = getServerWgIp();
 
             // Generate MikroTik script
-            const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping 10.0.0.1 count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
+            const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:foreach p in=[/interface wireguard peers find where interface=$IFACE] do={:if ([/interface wireguard peers get $p public-key]!=$SPK) do={/interface wireguard peers remove $p}};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping ${serverWgIp} count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
 
             res.setHeader('Content-Type', 'text/plain');
             res.setHeader('Content-Disposition', `attachment; filename="${client.name}.rsc"`);
@@ -663,10 +666,12 @@ PersistentKeepalive = ${keepalive}`;
             }
 
             // Validate IP format if provided
-            if (ip && !/^10\.0\.0\.\d{1,3}\/32$/.test(ip)) {
+            const { getVpnSubnetPrefix } = require("../wg-core");
+            const vpnPrefix = getVpnSubnetPrefix();
+            if (ip && !new RegExp(`^${vpnPrefix.replace(/\./g, '\\.')}\\.\\d{1,3}\\/32$`).test(ip)) {
                 return res.status(400).json({
                     success: false,
-                    message: "Invalid IP format. Must be in format 10.0.0.X/32",
+                    message: `Invalid IP format. Must be in format ${vpnPrefix}.X/32`,
                     error: "INVALID_IP"
                 });
             }

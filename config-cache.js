@@ -10,6 +10,7 @@ async function refreshConfigCache() {
     const settings = await Settings.getSingleton();
     cache = {
         serverEndpoint: settings.serverEndpoint,
+        vpnSubnetPrefix: settings.vpnSubnetPrefix,
         proxyPortRangeStart: settings.proxyPortRangeStart,
         proxyPortRangeEnd: settings.proxyPortRangeEnd,
         emailSenderName: settings.emailSenderName,

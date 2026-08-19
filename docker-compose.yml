@@ -54,6 +54,11 @@ services:
       - .env  # Loads WIREGUARD_PRIVATE_KEY
     environment:
       - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      # This deployment's VPN interface address/subnet. Must be unique across
+      # deployments that might ever share a client router - reusing another
+      # deployment's subnet (or its WIREGUARD_PRIVATE_KEY) causes routers
+      # holding tunnels to both to silently misroute or fail to reply.
+      - WG_SERVER_ADDRESS=${WG_SERVER_ADDRESS:-10.0.0.1/24}
       - TZ=${TZ:-UTC}
     labels:
       # Tell Coolify to use this container
@@ -90,6 +95,11 @@ services:
       - NODE_ENV=${NODE_ENV:-production}
       # API port (internal, shared with WireGuard container)
       - PORT=5020
+      # First 3 octets of this deployment's VPN subnet (e.g. "10.0.0" for
+      # 10.0.0.0/24). Must match the wireguard service's WG_SERVER_ADDRESS
+      # above. Overridable per-deployment via Settings.vpnSubnetPrefix in the
+      # admin panel too - see models/Settings.js.
+      - VPN_SUBNET_PREFIX=${VPN_SUBNET_PREFIX:-10.0.0}
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:5020/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
       interval: 30s

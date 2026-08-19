@@ -15,9 +15,14 @@ const clientSchema = new mongoose.Schema({
         unique: true,
         validate: {
             validator: function(v) {
-                return /^10\.0\.0\.\d{1,3}\/32$/.test(v);
+                const { getVpnSubnetPrefix } = require('../wg-core');
+                const prefix = getVpnSubnetPrefix().replace(/\./g, '\\.');
+                return new RegExp(`^${prefix}\\.\\d{1,3}\\/32$`).test(v);
             },
-            message: 'IP must be in format 10.0.0.X/32'
+            message: function(props) {
+                const { getVpnSubnetPrefix } = require('../wg-core');
+                return `IP must be in format ${getVpnSubnetPrefix()}.X/32`;
+            }
         }
     },
     publicKey: {
@@ -62,7 +67,10 @@ const clientSchema = new mongoose.Schema({
     },
     allowedIPs: {
         type: String,
-        default: '10.0.0.0/24',
+        default: function() {
+            const { getVpnSubnetCidr } = require('../wg-core');
+            return getVpnSubnetCidr();
+        },
         trim: true
     },
     dns: {
