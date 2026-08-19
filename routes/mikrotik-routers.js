@@ -201,6 +201,7 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
                     return {
                         id: r._id,
                         name: r.name,
+                        vpnIp: r.vpnIp,
                         ports: r.ports,
                         status: r.status,
                         publicUrl: {

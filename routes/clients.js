@@ -1,4 +1,6 @@
 const Client = require("../models/Client");
+const MikrotikRouter = require("../models/MikrotikRouter");
+const { updateRouterStatus } = require("./mikrotik-routers");
 const {
     wgLock,
     log,
@@ -501,8 +503,24 @@ PersistentKeepalive = ${keepalive}`;
 
             // Ping the router's VPN IP
             const { runCommand } = require("../wg-core");
+            // A manual ping here is a real, direct connectivity check - reuse
+            // the same status update path the periodic background monitor
+            // uses (routes/mikrotik-routers.js) so a successful/failed ping
+            // is reflected immediately instead of waiting up to 5 minutes
+            // for the next monitoring cycle.
+            const updateLinkedRouterStatus = async (isOnline) => {
+                try {
+                    const router = await MikrotikRouter.findOne({ wireguardClientId: client._id });
+                    if (router) {
+                        await updateRouterStatus(router._id, isOnline);
+                    }
+                } catch (e) {
+                    log('warn', 'ping_router_status_update_failed', { client: client.name, error: e?.message || String(e) });
+                }
+            };
             try {
                 const pingResult = await runCommand(`ping -c ${count} -W 2 ${routerIp}`);
+                await updateLinkedRouterStatus(true);
                 res.json({
                     success: true,
                     message: `Ping to ${routerIp} successful`,
@@ -511,6 +529,7 @@ PersistentKeepalive = ${keepalive}`;
                     result: pingResult
                 });
             } catch (error) {
+                await updateLinkedRouterStatus(false);
                 res.status(500).json({
                     success: false,
                     message: `Ping to ${routerIp} failed`,
