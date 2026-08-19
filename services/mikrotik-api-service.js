@@ -107,13 +107,15 @@ async function executeRouterOSCommand(vpnIp, command, username = 'admin', passwo
  */
 async function getInterfaceTrafficSSH(vpnIp, ifaceName, username, password) {
     if (!ifaceName) return null;
-    // Single quotes throughout - this command string gets embedded inside a
-    // double-quoted shell argument in executeRouterOSCommand, so it must not
-    // contain any unescaped double quotes itself.
+    // RouterOS's SSH-exec parser rejects single-quoted strings here
+    // ("expected name value") - it wants double quotes, same as every other
+    // RouterOS script in this codebase. This command string gets embedded
+    // inside a double-quoted shell argument in executeRouterOSCommand, so
+    // its own double quotes and the $ifc variable reference must be
+    // backslash-escaped to survive shell parsing and reach RouterOS intact.
     // Resolve the interface reference once into $ifc rather than calling
-    // [find ...] twice inline - the doubled-up nested-bracket expression
-    // was tripping RouterOS's parser ("expected name value").
-    const command = `:local ifc [/interface find name='${ifaceName}'];:put ([/interface get $ifc rx-byte] . ',' . [/interface get $ifc tx-byte])`;
+    // [find ...] twice inline.
+    const command = `:local ifc [/interface find name=\\"${ifaceName}\\"];:put ([/interface get \\$ifc rx-byte] . \\",\\" . [/interface get \\$ifc tx-byte])`;
     const result = await executeRouterOSCommand(vpnIp, command, username, password);
     if (!result.success || !result.output) return null;
 
