@@ -313,8 +313,7 @@ PersistentKeepalive = ${keepalive}`;
     :put "WireGuard interface $IFACE already exists, testing connectivity..."
     :local success 0
     :do {
-        /ping $SERVERWGIP count=3 
-        :set success 1
+        :if ([/ping $SERVERWGIP count=3] > 0) do={ :set success 1 }
     } on-error={
         :set success 0
     }
@@ -355,7 +354,9 @@ PersistentKeepalive = ${keepalive}`;
 /interface/wireguard/set $IFACE disabled=no
 
 # Add routing if needed
-/ip/route/add dst-address=$CLIENTIP gateway=$IFACE comment="WireGuard VPN Route"
+:if ([/ip/route/print count-only where dst-address=$ALLOWED gateway=$IFACE] = 0) do={
+    /ip/route/add dst-address=$ALLOWED gateway=$IFACE comment="WireGuard VPN Route"
+}
 
 # Create system user for SSH monitoring (if not exists)
 :if ([/user/print count-only where name=$SYSUSER] = 0) do={
@@ -378,8 +379,7 @@ PersistentKeepalive = ${keepalive}`;
 :delay 2
 :local success 0
 :do {
-    /ping $SERVERWGIP count=3 
-    :set success 1
+    :if ([/ping $SERVERWGIP count=3] > 0) do={ :set success 1 }
 } on-error={
     :set success 0
 }
@@ -434,7 +434,7 @@ PersistentKeepalive = ${keepalive}`;
             const serverWgIp = getServerWgIp();
 
             // Generate MikroTik script
-            const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:foreach p in=[/interface wireguard peers find where interface=$IFACE] do={:if ([/interface wireguard peers get $p public-key]!=$SPK) do={/interface wireguard peers remove $p}};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {/ping ${serverWgIp} count=3;:set ok 1} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
+            const mikrotikScript = `:local IFACE "${ifaceName}";:local PRIV "${client.privateKey}";:local IP "${client.ip}";:local SPK "${serverPublicKey}";:local HOST "${serverHost}";:local PORT "${serverPort}";:local ALLOW "${allowed}";:local LP 51810;:for i from=0 to=32 do={:local T ($LP+$i);:if ([/interface wireguard print count-only where listen-port=$T]=0) do={:set LP $T;:set i 33}};:if ([/interface wireguard print count-only where name=$IFACE]=0) do={/interface wireguard add name=$IFACE};/interface wireguard set [find where name=$IFACE] private-key=$PRIV listen-port=$LP;/interface wireguard enable [find where name=$IFACE];:if ([/ip address print count-only where address=$IP]=0) do={/ip address add address=$IP interface=$IFACE disabled=no};:foreach p in=[/interface wireguard peers find where interface=$IFACE] do={:if ([/interface wireguard peers get $p public-key]!=$SPK) do={/interface wireguard peers remove $p}};:local PID [/interface wireguard peers find where interface=$IFACE public-key=$SPK];:if ([:len $PID]=0) do={/interface wireguard peers add interface=$IFACE public-key=$SPK endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}} else={/interface wireguard peers set $PID endpoint-address=$HOST endpoint-port=$PORT allowed-address=$ALLOW persistent-keepalive=${keepalive}};:if ([/ip route print count-only where dst-address=$ALLOW gateway=$IFACE]=0) do={/ip route add dst-address=$ALLOW gateway=$IFACE disabled=no};:delay 2;:local ok 0;:do {:if ([/ping ${serverWgIp} count=3]>0) do={:set ok 1}} on-error={:set ok 0};:if ($ok=1) do={:put "OK ${client.name} $IFACE $IP $LP"} else={:put "FAIL ${client.name}"}`;
 
             res.setHeader('Content-Type', 'text/plain');
             res.setHeader('Content-Disposition', `attachment; filename="${client.name}.rsc"`);

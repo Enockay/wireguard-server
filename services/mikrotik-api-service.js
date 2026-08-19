@@ -110,7 +110,10 @@ async function getInterfaceTrafficSSH(vpnIp, ifaceName, username, password) {
     // Single quotes throughout - this command string gets embedded inside a
     // double-quoted shell argument in executeRouterOSCommand, so it must not
     // contain any unescaped double quotes itself.
-    const command = `:put ([/interface get [find name='${ifaceName}'] rx-byte] . ',' . [/interface get [find name='${ifaceName}'] tx-byte])`;
+    // Resolve the interface reference once into $ifc rather than calling
+    // [find ...] twice inline - the doubled-up nested-bracket expression
+    // was tripping RouterOS's parser ("expected name value").
+    const command = `:local ifc [/interface find name='${ifaceName}'];:put ([/interface get $ifc rx-byte] . ',' . [/interface get $ifc tx-byte])`;
     const result = await executeRouterOSCommand(vpnIp, command, username, password);
     if (!result.success || !result.output) return null;
 
