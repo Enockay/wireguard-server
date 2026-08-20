@@ -47,10 +47,13 @@ function registerAdminRoutes(app, getDbInitialized) {
                 // Parse peer details and match with clients
                 for (const peerLine of peers) {
                     const parts = peerLine.split('\t');
-                    if (parts.length >= 7) {
+                    // Peer-line columns: public-key, preshared-key, endpoint,
+                    // allowed-ips, latest-handshake, transfer-rx, transfer-tx,
+                    // persistent-keepalive.
+                    if (parts.length >= 8) {
                         const publicKey = parts[0].trim();
-                        const endpoint = parts[1];
-                        const lastHandshake = parts[3];
+                        const endpoint = parts[2];
+                        const lastHandshake = parts[4];
                         
                         // Find matching client (only enabled ones)
                         const client = await Client.findOne({ publicKey: publicKey.trim(), enabled: true });

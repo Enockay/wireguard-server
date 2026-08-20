@@ -173,16 +173,22 @@ async function updateClientStatistics() {
         const wgDump = await wgLock.run(() => runWgCommand(['show', 'wg0', 'dump']));
         const lines = wgDump.trim().split('\n').filter(l => l.trim());
 
-        // Build a map of publicKey -> stats from wg dump
+        // Build a map of publicKey -> stats from wg dump. Peer-line columns
+        // (tab-separated): public-key, preshared-key, endpoint, allowed-ips,
+        // latest-handshake, transfer-rx, transfer-tx, persistent-keepalive -
+        // these were previously off by one, which silently dropped every
+        // handshake timestamp (parsed "allowed-ips" as a date, always failed
+        // the sanity check) while mislabeling the raw handshake unix
+        // timestamp as "transferRx".
         const peerStats = new Map();
         for (const line of lines) {
             const parts = line.split('\t');
-            if (parts.length < 7) continue;
+            if (parts.length < 8) continue;
             peerStats.set(parts[0].trim(), {
-                endpoint: parts[1],
-                lastHandshake: parts[3],
-                transferRx: parts[4],
-                transferTx: parts[5]
+                endpoint: parts[2],
+                lastHandshake: parts[4],
+                transferRx: parts[5],
+                transferTx: parts[6]
             });
         }
 
