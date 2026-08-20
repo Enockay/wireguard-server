@@ -155,7 +155,12 @@ async function getRouterboardInfoSSH(vpnIp, username = null, password = null, if
             command += `;:put \\"${DELIM}\\";:local ifc [/interface find name=\\"${ifaceName}\\"];:put ([/interface get \\$ifc rx-byte] . \\",\\" . [/interface get \\$ifc tx-byte])`;
         }
 
-        const result = await executeRouterOSCommand(vpnIp, command, username, password);
+        // Doing SSH-connect + two full print commands + an interface lookup
+        // in one session runs past the default 5s timeout (each was its own
+        // quick call before consolidating them) - confirmed by running this
+        // exact command by hand: RouterOS answers correctly in full, but
+        // Node's exec() was killing the process before it got the chance.
+        const result = await executeRouterOSCommand(vpnIp, command, username, password, 18000);
 
         if (!result.success) {
             // If SSH fails due to missing command or auth, fall back to API port check
