@@ -113,15 +113,19 @@ function registerAuthRoutes(app) {
     });
 
     // Verify email
+    // This link is clicked directly from the verification email (a real
+    // browser navigation, not an AJAX call from the frontend), so it must
+    // redirect to a frontend page rather than return raw JSON - otherwise
+    // the visitor just lands on a bare API response.
     app.get('/api/auth/verify-email', async (req, res) => {
+        // Same fallback chain as routes/billing.js's getFrontendUrl() - kept
+        // inline here since that one isn't exported from billing.js.
+        const frontendUrl = process.env.FRONTEND_URL || process.env.SERVICE_URL_WIREGUARD || process.env.SERVICE_FQDN_WIREGUARD || 'https://vpn.blackie-networks.com';
         try {
             const { token } = req.query;
 
             if (!token) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Verification token is required'
-                });
+                return res.redirect(`${frontendUrl}/login?verification_error=missing_token`);
             }
 
             const user = await User.findOne({
@@ -130,10 +134,7 @@ function registerAuthRoutes(app) {
             });
 
             if (!user) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Invalid or expired verification token'
-                });
+                return res.redirect(`${frontendUrl}/login?verification_error=invalid_token`);
             }
 
             user.emailVerified = true;
@@ -141,17 +142,10 @@ function registerAuthRoutes(app) {
             user.emailVerificationExpires = undefined;
             await user.save();
 
-            res.json({
-                success: true,
-                message: 'Email verified successfully'
-            });
+            res.redirect(`${frontendUrl}/login?verified=1`);
         } catch (error) {
             log('error', 'verify_email_error', { error: error.message });
-            res.status(500).json({
-                success: false,
-                error: 'Failed to verify email',
-                details: error.message
-            });
+            res.redirect(`${frontendUrl}/login?verification_error=server_error`);
         }
     });
 
