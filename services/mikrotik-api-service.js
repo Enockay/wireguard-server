@@ -139,32 +139,46 @@ async function getRouterboardInfoSSH(vpnIp, username = null, password = null, if
         password = getConfig('mikrotikSystemPassword') || process.env.MIKROTIK_SYSTEM_PASSWORD || '';
     }
     try {
-        // Get system resource information
-        const resourceCommand = '/system resource print';
-        const resourceResult = await executeRouterOSCommand(vpnIp, resourceCommand, username, password);
-        
-        if (!resourceResult.success) {
+        // Fetch resource info, routerboard info, and (if we have an
+        // interface name) traffic counters all in ONE SSH session instead of
+        // three separate `ssh` invocations - each of those was its own
+        // login/logout on the router, which is what was showing up as
+        // several rapid-fire "admin23 logged in/out" pairs per check in
+        // RouterOS's system log for what's conceptually a single check.
+        // RouterOS runs semicolon-separated statements as one script, so all
+        // three commands can share a single connection; a delimiter between
+        // each command's :put output lets us split the combined stdout back
+        // apart for parsing exactly as before.
+        const DELIM = '###RBI_SPLIT###';
+        let command = `/system resource print;:put \\"${DELIM}\\";/system routerboard print`;
+        if (ifaceName) {
+            command += `;:put \\"${DELIM}\\";:local ifc [/interface find name=\\"${ifaceName}\\"];:put ([/interface get \\$ifc rx-byte] . \\",\\" . [/interface get \\$ifc tx-byte])`;
+        }
+
+        const result = await executeRouterOSCommand(vpnIp, command, username, password);
+
+        if (!result.success) {
             // If SSH fails due to missing command or auth, fall back to API port check
-            if (resourceResult.code === 'ENOENT' || resourceResult.isAuthError) {
-                log('info', 'ssh_fallback_to_api_port', { vpnIp, reason: resourceResult.code === 'ENOENT' ? 'ssh_not_found' : 'auth_failed' });
+            if (result.code === 'ENOENT' || result.isAuthError) {
+                log('info', 'ssh_fallback_to_api_port', { vpnIp, reason: result.code === 'ENOENT' ? 'ssh_not_found' : 'auth_failed' });
                 return await checkAPIPortOpen(vpnIp);
             }
             // For other errors, still try API port check as fallback
-            log('warn', 'ssh_command_failed_fallback', { vpnIp, error: resourceResult.error });
+            log('warn', 'ssh_command_failed_fallback', { vpnIp, error: result.error });
             return await checkAPIPortOpen(vpnIp);
         }
 
-        // Get routerboard information
-        const routerboardCommand = '/system routerboard print';
-        const routerboardResult = await executeRouterOSCommand(vpnIp, routerboardCommand, username, password);
+        const sections = result.output.split(DELIM);
+        const resourceInfo = parseRouterOSOutput(sections[0] || '');
+        const routerboardInfo = sections[1] ? parseRouterOSOutput(sections[1]) : {};
 
-        // Parse resource output (RouterOS format)
-        const resourceInfo = parseRouterOSOutput(resourceResult.output);
-        const routerboardInfo = routerboardResult.success ? parseRouterOSOutput(routerboardResult.output) : {};
-
-        // Traffic through the WireGuard tunnel interface itself - best-effort,
-        // failure here shouldn't fail the whole status check.
-        const traffic = await getInterfaceTrafficSSH(vpnIp, ifaceName, username, password).catch(() => null);
+        let traffic = null;
+        if (ifaceName && sections[2]) {
+            const [rxByte, txByte] = sections[2].trim().split(',');
+            if (/^\d+$/.test(rxByte) && /^\d+$/.test(txByte)) {
+                traffic = { rxBytes: rxByte, txBytes: txByte };
+            }
+        }
 
         return {
             success: true,

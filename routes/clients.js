@@ -310,6 +310,19 @@ PersistentKeepalive = ${keepalive}`;
 :local SYSUSER "${escapeMikrotikValue(systemUsername)}"
 :local SYSPASS "${escapeMikrotikValue(systemPassword)}"
 
+# Find a free local WireGuard listen port, starting at 51810 - this router
+# may already have other WireGuard interfaces (e.g. a tunnel to a different
+# server) bound to 51820 or nearby ports, and RouterOS refuses to bind two
+# interfaces to the same listen port ("listen port X already used").
+:local LP 51810
+:for i from=0 to=32 do={
+    :local T ($LP + $i)
+    :if ([/interface/wireguard/print count-only where listen-port=$T] = 0) do={
+        :set LP $T
+        :set i 33
+    }
+}
+
 # If interface already exists, test connectivity first
 :if ([/interface/wireguard/print count-only where name=$IFACE] > 0) do={
     :put "WireGuard interface $IFACE already exists, testing connectivity..."
@@ -341,7 +354,7 @@ PersistentKeepalive = ${keepalive}`;
 }
 
 # Create WireGuard interface
-/interface/wireguard/add name=$IFACE listen-port=51820 mtu=1420 private-key="$CLIENTPRIVKEY"
+/interface/wireguard/add name=$IFACE listen-port=$LP mtu=1420 private-key="$CLIENTPRIVKEY"
 
 # Add peer configuration (server)
 /interface/wireguard/peers/add interface=$IFACE public-key="$SERVERPUBKEY" endpoint-address=$SERVERHOST endpoint-port=$SERVERPORT allowed-address=$ALLOWED persistent-keepalive=$KEEPALIVE

@@ -253,6 +253,18 @@ function registerBillingRoutes(app) {
                 return res.status(404).json({ success: false, error: 'User not found' });
             }
 
+            // Each submission used to create a brand-new pending transaction
+            // with no cleanup, so retrying (or hitting back after landing on
+            // PayStack) piled up abandoned 'pending' rows that never resolve.
+            // Superseding any of this user's still-open attempts for the same
+            // method here keeps at most one truly-pending transaction per user
+            // at a time, without touching ones from other payment methods or
+            // ones already completed/failed.
+            await Transaction.updateMany(
+                { userId, type: 'payment', paymentMethod, status: 'pending' },
+                { $set: { status: 'failed', description: 'Balance added via PayStack (superseded by a newer attempt)' } }
+            );
+
             // Create pending transaction
             const transaction = new Transaction({
                 userId,

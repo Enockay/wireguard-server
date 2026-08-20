@@ -291,6 +291,54 @@ function registerMikrotikRouterRoutes(app, getDbInitialized) {
         }
     });
 
+    // On-demand fetch of routerboard info (Model/Uptime/CPU/Firmware/Serial),
+    // scoped to routers the requesting user actually owns. Customer-facing
+    // equivalent of the admin-only POST /api/admin/routers/:id/refresh-info -
+    // lets a customer force a fresh check instead of waiting up to 5 minutes
+    // for the periodic background job.
+    app.post('/api/routers/:id/refresh-info', authenticateToken, async (req, res) => {
+        try {
+            const { id } = req.params;
+            const router = await MikrotikRouter.findOne({ _id: id, userId: req.user.userId })
+                .populate('wireguardClientId');
+            if (!router) {
+                return res.status(404).json({ success: false, error: 'Router not found' });
+            }
+            if (!router.wireguardClientId) {
+                return res.status(400).json({ success: false, error: 'Router has no linked WireGuard client' });
+            }
+
+            const { resolveInterfaceName } = require('../wg-core');
+            const { getRouterboardInfoSSH } = require('../services/mikrotik-api-service');
+            const { getConfig } = require('../config-cache');
+
+            const vpnIp = router.wireguardClientId.ip.split('/')[0];
+            const username = getConfig('mikrotikSystemUsername') || process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
+            const password = getConfig('mikrotikSystemPassword') || process.env.MIKROTIK_SYSTEM_PASSWORD || '';
+
+            const info = await getRouterboardInfoSSH(vpnIp, username, password, resolveInterfaceName(router.wireguardClientId));
+            await updateRouterStatus(router._id, !!info.reachable, info);
+
+            if (!info.success) {
+                return res.status(502).json({
+                    success: false,
+                    error: 'Could not reach router over SSH',
+                    details: info.error || null
+                });
+            }
+
+            const updated = await MikrotikRouter.findById(id);
+            res.json({ success: true, routerboardInfo: updated.routerboardInfo });
+        } catch (error) {
+            log('error', 'refresh_router_info_error', { error: error.message });
+            res.status(500).json({
+                success: false,
+                error: 'Failed to refresh routerboard info',
+                details: error.message
+            });
+        }
+    });
+
     // Renew a past-due (or trial-expired) router: charges the plan price from
     // the customer's wallet balance right now instead of waiting for the
     // daily billing job, and reconnects the router immediately on success.
