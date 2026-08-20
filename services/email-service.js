@@ -18,6 +18,35 @@ function getReplyToEmail() {
     const { getConfig } = require('../config-cache');
     return getConfig('emailReplyToEmail') || process.env.BREVO_REPLY_TO_EMAIL || 'support@blackie-networks.com';
 }
+// Admin-editable via Settings (serverEndpoint), same source routes/mikrotik-routers.js's
+// getPublicHost() uses - router access ports must reflect *this* deployment's own
+// domain, not a hardcoded one, otherwise a test/staging deployment's emails point
+// customers at production's hostname (and vice versa).
+function getPublicHost() {
+    const { getServerEndpoint } = require('../wg-core');
+    return getServerEndpoint().split(':')[0];
+}
+
+// Shared visual language for the router lifecycle emails below - a single
+// source of truth so both stay in sync rather than drifting apart.
+const EMAIL_STYLES = `
+    body { margin: 0; padding: 0; background-color: #eef1f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f2937; }
+    .container { max-width: 560px; margin: 32px auto; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }
+    .header { padding: 32px 32px 28px; text-align: center; color: #ffffff; }
+    .header h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+    .content { padding: 32px; }
+    .content h2 { margin: 0 0 16px; font-size: 18px; font-weight: 700; color: #111827; }
+    .content p { margin: 0 0 14px; font-size: 14px; line-height: 1.65; color: #4b5563; }
+    .card { background-color: #f9fafb; border: 1px solid #eef0f3; border-radius: 12px; padding: 18px 20px; margin: 18px 0; }
+    .card h3 { margin: 0 0 12px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #6b7280; }
+    .row { display: table; width: 100%; margin-bottom: 8px; font-size: 14px; }
+    .row:last-child { margin-bottom: 0; }
+    .row-label { display: table-cell; color: #6b7280; width: 40%; }
+    .row-value { display: table-cell; color: #111827; font-weight: 600; }
+    .badge { display: inline-block; font-family: 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; background-color: #eef2ff; color: #4338ca; padding: 3px 9px; border-radius: 6px; text-decoration: none; }
+    .steps { margin: 0; padding-left: 20px; font-size: 14px; line-height: 1.8; color: #4b5563; }
+    .footer { text-align: center; padding: 22px 32px 30px; color: #9ca3af; font-size: 12px; }
+`;
 
 /**
  * Send email using Brevo API
@@ -205,50 +234,45 @@ If you didn't create an account, please ignore this email.
  * Send router created notification email
  */
 async function sendRouterCreatedEmail(user, router) {
+    const host = getPublicHost();
     const htmlContent = `
         <!DOCTYPE html>
         <html>
         <head>
-            <style>
-                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-                .header { background-color: #2196F3; color: white; padding: 20px; text-align: center; }
-                .content { padding: 20px; background-color: #f9f9f9; }
-                .info-box { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #2196F3; }
-                .footer { text-align: center; padding: 20px; color: #666; font-size: 12px; }
-            </style>
+            <meta charset="utf-8">
+            <style>${EMAIL_STYLES}</style>
         </head>
         <body>
             <div class="container">
-                <div class="header">
-                    <h1>MikroTik Router Created</h1>
+                <div class="header" style="background: linear-gradient(135deg, #4f46e5, #4338ca);">
+                    <h1>Router Created</h1>
                 </div>
                 <div class="content">
-                    <h2>Your Router is Ready!</h2>
+                    <h2>Your Router is Ready</h2>
                     <p>Hello ${user.name},</p>
                     <p>Your MikroTik router <strong>${router.name}</strong> has been created successfully.</p>
-                    
-                    <div class="info-box">
-                        <h3>Router Details:</h3>
-                        <p><strong>Name:</strong> ${router.name}</p>
-                        <p><strong>Status:</strong> ${router.status}</p>
+
+                    <div class="card">
+                        <h3>Router Details</h3>
+                        <div class="row"><span class="row-label">Name</span><span class="row-value">${router.name}</span></div>
+                        <div class="row"><span class="row-label">Status</span><span class="row-value">${router.status}</span></div>
                     </div>
 
-                    <div class="info-box">
-                        <h3>Access Ports:</h3>
-                        <p><strong>Winbox:</strong> vpn.blackie-networks.com:${router.ports.winbox}</p>
-                        <p><strong>SSH:</strong> vpn.blackie-networks.com:${router.ports.ssh}</p>
-                        <p><strong>API:</strong> vpn.blackie-networks.com:${router.ports.api}</p>
+                    <div class="card">
+                        <h3>Access Ports</h3>
+                        <div class="row"><span class="row-label">Winbox</span><span class="row-value"><span class="badge">${host}:${router.ports.winbox}</span></span></div>
+                        <div class="row"><span class="row-label">SSH</span><span class="row-value"><span class="badge">${host}:${router.ports.ssh}</span></span></div>
+                        <div class="row"><span class="row-label">API</span><span class="row-value"><span class="badge">${host}:${router.ports.api}</span></span></div>
                     </div>
 
-                    <p><strong>Next Steps:</strong></p>
-                    <ol>
+                    <p style="margin-bottom: 8px;"><strong>Next steps</strong></p>
+                    <ol class="steps">
                         <li>Connect your MikroTik router to the VPN using the WireGuard configuration</li>
                         <li>Once connected, you can access it using the ports above</li>
-                        <li>You will receive another email when the router comes online</li>
+                        <li>You'll receive another email as soon as the router comes online</li>
                     </ol>
 
-                    <p>If you have any questions, please contact support.</p>
+                    <p style="margin-top: 18px;">Questions? Just reply to this email.</p>
                 </div>
                 <div class="footer">
                     <p>&copy; ${new Date().getFullYear()} Blackie Networks. All rights reserved.</p>
@@ -259,7 +283,7 @@ async function sendRouterCreatedEmail(user, router) {
     `;
 
     const textContent = `
-MikroTik Router Created
+Router Created
 
 Hello ${user.name},
 
@@ -270,16 +294,16 @@ Router Details:
 - Status: ${router.status}
 
 Access Ports:
-- Winbox: vpn.blackie-networks.com:${router.ports.winbox}
-- SSH: vpn.blackie-networks.com:${router.ports.ssh}
-- API: vpn.blackie-networks.com:${router.ports.api}
+- Winbox: ${host}:${router.ports.winbox}
+- SSH: ${host}:${router.ports.ssh}
+- API: ${host}:${router.ports.api}
 
 Next Steps:
 1. Connect your MikroTik router to the VPN using the WireGuard configuration
 2. Once connected, you can access it using the ports above
 3. You will receive another email when the router comes online
 
-If you have any questions, please contact support.
+If you have any questions, just reply to this email.
 
 © ${new Date().getFullYear()} Blackie Networks. All rights reserved.
     `;
@@ -296,44 +320,39 @@ If you have any questions, please contact support.
  * Send router online notification email
  */
 async function sendRouterOnlineEmail(user, router) {
+    const host = getPublicHost();
     const htmlContent = `
         <!DOCTYPE html>
         <html>
         <head>
-            <style>
-                body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-                .header { background-color: #4CAF50; color: white; padding: 20px; text-align: center; }
-                .content { padding: 20px; background-color: #f9f9f9; }
-                .info-box { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #4CAF50; }
-                .footer { text-align: center; padding: 20px; color: #666; font-size: 12px; }
-            </style>
+            <meta charset="utf-8">
+            <style>${EMAIL_STYLES}</style>
         </head>
         <body>
             <div class="container">
-                <div class="header">
-                    <h1>🎉 Router is Online!</h1>
+                <div class="header" style="background: linear-gradient(135deg, #22c55e, #16a34a);">
+                    <h1>&#127881; Router is Online</h1>
                 </div>
                 <div class="content">
                     <h2>Your Router is Now Connected</h2>
                     <p>Hello ${user.name},</p>
                     <p>Great news! Your MikroTik router <strong>${router.name}</strong> is now online and connected to the VPN.</p>
-                    
-                    <div class="info-box">
-                        <h3>Router Details:</h3>
-                        <p><strong>Name:</strong> ${router.name}</p>
-                        <p><strong>Status:</strong> ${router.status}</p>
-                        <p><strong>Connected At:</strong> ${new Date(router.lastSeen).toLocaleString()}</p>
+
+                    <div class="card">
+                        <h3>Router Details</h3>
+                        <div class="row"><span class="row-label">Name</span><span class="row-value">${router.name}</span></div>
+                        <div class="row"><span class="row-label">Status</span><span class="row-value">${router.status}</span></div>
+                        <div class="row"><span class="row-label">Connected at</span><span class="row-value">${new Date(router.lastSeen).toLocaleString()}</span></div>
                     </div>
 
-                    <div class="info-box">
-                        <h3>Access Your Router:</h3>
-                        <p><strong>Winbox:</strong> vpn.blackie-networks.com:${router.ports.winbox}</p>
-                        <p><strong>SSH:</strong> vpn.blackie-networks.com:${router.ports.ssh}</p>
-                        <p><strong>API:</strong> vpn.blackie-networks.com:${router.ports.api}</p>
+                    <div class="card">
+                        <h3>Access Your Router</h3>
+                        <div class="row"><span class="row-label">Winbox</span><span class="row-value"><span class="badge">${host}:${router.ports.winbox}</span></span></div>
+                        <div class="row"><span class="row-label">SSH</span><span class="row-value"><span class="badge">${host}:${router.ports.ssh}</span></span></div>
+                        <div class="row"><span class="row-label">API</span><span class="row-value"><span class="badge">${host}:${router.ports.api}</span></span></div>
                     </div>
 
-                    <p>You can now start using your router. If you need any assistance, please contact support.</p>
+                    <p style="margin-top: 18px;">You can now start using your router. Need a hand? Just reply to this email.</p>
                 </div>
                 <div class="footer">
                     <p>&copy; ${new Date().getFullYear()} Blackie Networks. All rights reserved.</p>
@@ -356,11 +375,11 @@ Router Details:
 - Connected At: ${new Date(router.lastSeen).toLocaleString()}
 
 Access Your Router:
-- Winbox: vpn.blackie-networks.com:${router.ports.winbox}
-- SSH: vpn.blackie-networks.com:${router.ports.ssh}
-- API: vpn.blackie-networks.com:${router.ports.api}
+- Winbox: ${host}:${router.ports.winbox}
+- SSH: ${host}:${router.ports.ssh}
+- API: ${host}:${router.ports.api}
 
-You can now start using your router. If you need any assistance, please contact support.
+You can now start using your router. If you need any assistance, just reply to this email.
 
 © ${new Date().getFullYear()} Blackie Networks. All rights reserved.
     `;

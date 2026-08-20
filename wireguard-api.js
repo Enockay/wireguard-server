@@ -431,10 +431,16 @@ function startRouterStatusMonitoring() {
                 try {
                     const vpnIp = router.wireguardClientId.ip.split('/')[0]; // Remove /32
                     
-                    // Check router by accessing it via VPN IP and getting routerboard info
-                    // Use system user credentials from environment variables
-                    const systemUsername = process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
-                    const systemPassword = process.env.MIKROTIK_SYSTEM_PASSWORD || '';
+                    // Check router by accessing it via VPN IP and getting routerboard info.
+                    // Admin-configured Settings take priority over env vars (same
+                    // fallback order used everywhere else, e.g. routes/clients.js) -
+                    // this previously read only from process.env, so credentials set
+                    // via the admin Settings UI were silently ignored here and every
+                    // router fell back to 'wgmonitor'/empty-password, which is why
+                    // routerboard info stayed unpopulated even after being configured.
+                    const { getConfig } = require("./config-cache");
+                    const systemUsername = getConfig('mikrotikSystemUsername') || process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
+                    const systemPassword = getConfig('mikrotikSystemPassword') || process.env.MIKROTIK_SYSTEM_PASSWORD || '';
                     
                     const activeCheck = await checkRouterActive(vpnIp, {
                         username: systemUsername,

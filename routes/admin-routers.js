@@ -145,6 +145,51 @@ function registerAdminRouterRoutes(app, getDbInitialized) {
         }
     });
 
+    // On-demand fetch of routerboard info (Model/Uptime/CPU/Firmware/Serial)
+    // over SSH, rather than waiting up to 5 minutes for the periodic
+    // background job (wireguard-api.js:checkRouterStatus).
+    app.post("/api/admin/routers/:id/refresh-info", authenticateToken, requireAdmin, async (req, res) => {
+        try {
+            const { id } = req.params;
+            const router = await MikrotikRouter.findById(id).populate('wireguardClientId');
+            if (!router) {
+                return res.status(404).json({ success: false, error: "Router not found" });
+            }
+            if (!router.wireguardClientId) {
+                return res.status(400).json({ success: false, error: "Router has no linked WireGuard client" });
+            }
+
+            const { resolveInterfaceName } = require("../wg-core");
+            const { getRouterboardInfoSSH } = require("../services/mikrotik-api-service");
+            const { getConfig } = require("../config-cache");
+            const { updateRouterStatus } = require("./mikrotik-routers");
+
+            const vpnIp = router.wireguardClientId.ip.split('/')[0];
+            const username = getConfig('mikrotikSystemUsername') || process.env.MIKROTIK_SYSTEM_USERNAME || 'wgmonitor';
+            const password = getConfig('mikrotikSystemPassword') || process.env.MIKROTIK_SYSTEM_PASSWORD || '';
+
+            const info = await getRouterboardInfoSSH(vpnIp, username, password, resolveInterfaceName(router.wireguardClientId));
+            await updateRouterStatus(router._id, !!info.reachable, info);
+
+            if (!info.success) {
+                return res.status(502).json({
+                    success: false,
+                    error: "Could not reach router over SSH",
+                    details: info.error || null
+                });
+            }
+
+            res.json({ success: true, routerboardInfo: (await MikrotikRouter.findById(id)).routerboardInfo });
+        } catch (error) {
+            log('error', 'admin_refresh_router_info_error', { error: error.message });
+            res.status(500).json({
+                success: false,
+                error: "Failed to refresh routerboard info",
+                details: error.message
+            });
+        }
+    });
+
     // Force-restart a router's TCP proxy (Winbox/SSH/API port forwarding)
     app.post("/api/admin/routers/:id/reconnect", authenticateToken, requireAdmin, async (req, res) => {
         try {
